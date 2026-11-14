@@ -17,3 +17,4 @@ __pycache__/
 *.curf
 *.golden
 /model/artifacts/
+/docs/results/
