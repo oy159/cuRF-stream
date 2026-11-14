@@ -57,6 +57,7 @@ target_compile_options(curf_warnings INTERFACE
 find_package(Threads REQUIRED)
 
 add_library(curf_core
+    src/engine/model.cpp
     src/reference/unpack.cpp
     src/runtime/host_ring.cpp
     src/source/synthetic_source.cpp
@@ -68,6 +69,8 @@ if(CURF_HAVE_CUDA)
     add_library(curf_cuda
         src/kernels/unpack.cu
         src/kernels/psd.cu
+        src/kernels/conv1d.cu
+        src/engine/engine.cpp
         src/runtime/pipeline.cpp)
     target_include_directories(curf_cuda PUBLIC include)
     target_link_libraries(curf_cuda PUBLIC curf_core CUDA::cudart CUDA::cufft PRIVATE curf_warnings)

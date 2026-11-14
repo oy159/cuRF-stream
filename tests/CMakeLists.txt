@@ -9,17 +9,24 @@ if(NOT Catch2_FOUND)
 endif()
 include(Catch)
 
+# Converted model + golden activations (model/convert.py); tests that need them skip when absent.
+set(CURF_MODEL_DIR "${PROJECT_SOURCE_DIR}/model/artifacts/run1/export" CACHE PATH "Directory with amc.curf / amc.golden")
+
 add_executable(curf_tests_cpu
     test_reference.cpp
     test_sources.cpp
-    test_host_ring.cpp)
+    test_host_ring.cpp
+    test_engine_model.cpp)
 target_link_libraries(curf_tests_cpu PRIVATE curf_core curf_warnings Catch2::Catch2WithMain)
+target_compile_definitions(curf_tests_cpu PRIVATE CURF_MODEL_DIR="${CURF_MODEL_DIR}")
 catch_discover_tests(curf_tests_cpu TEST_PREFIX "cpu.")
 
 if(CURF_HAVE_CUDA)
     add_executable(curf_tests_cuda
         test_unpack_cuda.cpp
-        test_pipeline_cuda.cpp)
+        test_pipeline_cuda.cpp
+        test_engine_cuda.cpp)
     target_link_libraries(curf_tests_cuda PRIVATE curf_cuda curf_warnings Catch2::Catch2WithMain)
-    catch_discover_tests(curf_tests_cuda TEST_PREFIX "cuda.")
+    target_compile_definitions(curf_tests_cuda PRIVATE CURF_MODEL_DIR="${CURF_MODEL_DIR}")
+    catch_discover_tests(curf_tests_cuda TEST_PREFIX "cuda." DISCOVERY_TIMEOUT 60)
 endif()

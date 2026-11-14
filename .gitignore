@@ -14,3 +14,6 @@ __pycache__/
 *.pt
 *.nsys-rep
 *.ncu-rep
+*.curf
+*.golden
+/model/artifacts/
