@@ -2,6 +2,7 @@
 
 #include "curf/cuda/memory.hpp"
 #include "curf/engine/kernels.hpp"
+#include "conv1d_internal.hpp"
 
 #include <mma.h>
 
@@ -317,6 +318,7 @@ namespace curf::engine {
             add_wmma<128, 64>(v);
             add_wmma<64, 128>(v);
             add_wmma<128, 128>(v);
+            detail::add_mma_variants(v);
             return v;
         }
 

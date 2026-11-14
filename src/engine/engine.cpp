@@ -139,9 +139,9 @@ namespace curf::engine {
                             if (!best || us < best_us) { best = &v; best_us = us; }
                         }
                         if (best && cfg.autotune) { cache[key] = {best->name, best_us}; cache_dirty = true; }
-                        const auto dot = prefix.find_last_of('.', prefix.empty() ? 0 : prefix.size() - 2);
-                        if (best || prefix.empty() || dot == std::string::npos) break;
-                        prefix.resize(dot + 1);
+                        if (best || prefix.empty()) break;
+                        const auto dot = prefix.size() < 2 ? std::string::npos : prefix.find_last_of('.', prefix.size() - 2);
+                        prefix.resize(dot == std::string::npos ? 0 : dot + 1); // ... -> "mma." -> "" (everything)
                     }
                     if (!best) throw std::runtime_error("engine: no conv variant matching '" + cfg.variant_prefix +
                                                         "' supports " + op.name);

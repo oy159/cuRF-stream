@@ -1,7 +1,7 @@
 // Engine benchmark: the conv1d optimisation ladder across batch buckets.
 //
 //   curf_bench_engine [--model DIR] [--steps naive,smem,wmma.f32.unfused,wmma.f32.fused,wmma.f16.fused,all]
-//                     [--buckets 1,8,32,128,512] [--ms 400] [--no-graph] [--ops]
+//                     [--buckets 1,8,32,128,512] [--ms 400] [--no-graph] [--ops] [--profile]
 //
 // Each step builds an engine whose conv ops are autotuned among variants with that name prefix
 // ("all" = whole registry), then replays the bucket's CUDA Graph for --ms milliseconds per bucket.
@@ -9,6 +9,8 @@
 
 #include "curf/cuda/memory.hpp"
 #include "curf/engine/engine.hpp"
+
+#include <cuda_profiler_api.h>
 
 #include <chrono>
 #include <cstdio>
@@ -62,10 +64,10 @@ namespace {
 
 int main(int argc, char **argv) {
     std::string dir = CURF_MODEL_DIR;
-    std::vector<std::string> steps{"naive", "smem", "wmma.f32.unfused", "wmma.f32.fused", "wmma.f16.fused", "all"};
+    std::vector<std::string> steps{"naive", "smem", "wmma.f32.unfused", "wmma.f32.fused", "wmma.f16.fused", "mma.f32", "mma.f16", "all"};
     std::vector<int> buckets{1, 8, 32, 128, 512};
     double ms = 400;
-    bool graph = true, ops = false;
+    bool graph = true, ops = false, profile = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() -> std::string {
@@ -78,6 +80,7 @@ int main(int argc, char **argv) {
         else if (a == "--ms") ms = std::stod(next());
         else if (a == "--no-graph") graph = false;
         else if (a == "--ops") ops = true;
+        else if (a == "--profile") profile = true; // one eager run of the largest bucket per step, for ncu --profile-from-start off
         else { std::fprintf(stderr, "unknown option %s\n", a.c_str()); return 2; }
     }
 
@@ -92,6 +95,15 @@ int main(int argc, char **argv) {
         cfg.cuda_graphs = graph;
         cfg.tune_iters = 20;
         Engine e(model, cfg);
+        if (profile) {
+            CURF_CUDA_CHECK(cudaStreamSynchronize(s));
+            CURF_CUDA_CHECK(cudaProfilerStart());
+            e.run_eager(buckets.back(), s);
+            CURF_CUDA_CHECK(cudaStreamSynchronize(s));
+            CURF_CUDA_CHECK(cudaProfilerStop());
+            std::printf("{\"step\":\"%s\",\"profiled_batch\":%d}\n", step.c_str(), buckets.back());
+            continue;
+        }
         for (int b : buckets) {
             const auto r = measure(e, b, ms, graph, s);
             std::printf("{\"step\":\"%s\",\"batch\":%d,\"graph\":%s,\"us_per_batch\":%.2f,\"windows_per_s\":%.0f,"

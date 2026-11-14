@@ -70,6 +70,7 @@ if(CURF_HAVE_CUDA)
         src/kernels/unpack.cu
         src/kernels/psd.cu
         src/kernels/conv1d.cu
+        src/kernels/conv1d_mma.cu
         src/engine/engine.cpp
         src/runtime/pipeline.cpp)
     target_include_directories(curf_cuda PUBLIC include)
