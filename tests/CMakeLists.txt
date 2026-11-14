@@ -25,7 +25,8 @@ if(CURF_HAVE_CUDA)
     add_executable(curf_tests_cuda
         test_unpack_cuda.cpp
         test_pipeline_cuda.cpp
-        test_engine_cuda.cpp)
+        test_engine_cuda.cpp
+        test_channelizer_cuda.cpp)
     target_link_libraries(curf_tests_cuda PRIVATE curf_cuda curf_warnings Catch2::Catch2WithMain)
     target_compile_definitions(curf_tests_cuda PRIVATE CURF_MODEL_DIR="${CURF_MODEL_DIR}")
     catch_discover_tests(curf_tests_cuda TEST_PREFIX "cuda." DISCOVERY_TIMEOUT 60)

@@ -15,3 +15,7 @@ if(CURF_HAVE_CUDA)
     target_compile_definitions(curf_bench_engine PRIVATE
         CURF_MODEL_DIR="${PROJECT_SOURCE_DIR}/model/artifacts/run1/export")
 endif()
+if(CURF_HAVE_CUDA)
+    add_executable(curf_bench_channelizer bench_channelizer.cpp)
+    target_link_libraries(curf_bench_channelizer PRIVATE curf_cuda curf_warnings)
+endif()

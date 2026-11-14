@@ -61,6 +61,7 @@ find_package(Threads REQUIRED)
 
 add_library(curf_core
     src/engine/model.cpp
+    src/reference/channelizer.cpp
     src/reference/unpack.cpp
     src/runtime/host_ring.cpp
     src/source/synthetic_source.cpp
@@ -72,6 +73,7 @@ if(CURF_HAVE_CUDA)
     add_library(curf_cuda
         src/kernels/unpack.cu
         src/kernels/psd.cu
+        src/kernels/channelizer.cu
         src/kernels/conv1d.cu
         src/kernels/conv1d_mma.cu
         src/kernels/block_fused.cu
