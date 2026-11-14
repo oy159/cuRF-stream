@@ -37,30 +37,36 @@ namespace curf::engine {
         // additionally has 2 halo rows (y1 positions l0 + BL and, via row 0, l0 - 1 is inside the main rows),
         // computed as one m16 x 32 "halo job" per 32 channels and dealt round-robin after the main jobs so the
         // warps stay balanced.
-        template <int CIN, int COUT, int S, int BL_>
+        // PIPE (variants "...l64p" / "l128p"): weight ring swizzled (no padding) and 3 stages deep with
+        // cp.async.wait_group 1, and register double buffering of fragments across the warp's (job, k16) steps
+        // of a k-tile. The padded 2-stage version spent 40-55% of its warp time in barrier + cp.async waits.
+        template <int CIN, int COUT, int S, int BL_, bool PIPE_ = false>
         struct BlockShape {
-            static constexpr int BL = BL_, BK = 32;
+            static constexpr bool PIPE = PIPE_;
+            static constexpr int BL = BL_, BK = 32, STAGES = PIPE ? 3 : 2;
             static constexpr int NC = COUT / 32, RP = BL / 32;                 // n32 chunks, m32 row pairs
             static constexpr int JOBS = RP * NC;                               // main jobs (both GEMMs)
             static constexpr int NW = JOBS < 4 ? 4 : (JOBS > 8 ? 8 : JOBS), NT = NW * 32;
             static constexpr int JM = (JOBS + NW - 1) / NW;                    // main jobs per warp
             static constexpr int NX = (BL + 1) * S + 3, LDX = CIN + 8;        // x rows: positions px0 ..
             static constexpr int NY = BL + 2, LDY = COUT + 8;                 // y1 rows: positions l0 - 1 ..
-            static constexpr int LDW = BK + 8;
+            static constexpr int LDW = PIPE ? BK : BK + 8;
             static constexpr int REGION = NX * LDX > NY * LDY ? NX * LDX : NY * LDY; // x, then y1, then out
-            static constexpr std::size_t SMEM = static_cast<std::size_t>(REGION + 2 * COUT * LDW) * sizeof(__half);
+            static constexpr std::size_t SMEM = static_cast<std::size_t>(REGION + STAGES * COUT * LDW) * sizeof(__half);
             static_assert(CIN % 32 == 0 && COUT % 32 == 0 && BL % 32 == 0, "tile shapes");
             static_assert(NC <= NW, "at most one halo job per warp");
-            static_assert(2 * COUT * LDW * 2 >= NW * COUT * 4, "pool scratch must fit in the weight ring");
+            static_assert(STAGES * COUT * LDW * 2 >= NW * COUT * 4, "pool scratch must fit in the weight ring");
         };
 
-        template <int CIN, int COUT, int S, int BL, bool SC, bool F16Acc>
-        __global__ void __launch_bounds__(BlockShape<CIN, COUT, S, BL>::NT) basic_block(BlockParams p) {
-            using B = BlockShape<CIN, COUT, S, BL>;
+        template <int CIN, int COUT, int S, int BL, bool SC, bool F16Acc, bool PIPE = false>
+        __global__ void __launch_bounds__(BlockShape<CIN, COUT, S, BL, PIPE>::NT) basic_block(BlockParams p) {
+            using B = BlockShape<CIN, COUT, S, BL, PIPE>;
+            constexpr int STAGES = B::STAGES;
             constexpr int NT = B::NT, NW = B::NW, NC = B::NC, JM = B::JM, LDX = B::LDX, LDY = B::LDY, LDW = B::LDW;
             extern __shared__ __align__(16) unsigned char smem[];
             __half *R = reinterpret_cast<__half *>(smem); // x tile -> y1 tile -> output staging
-            __half *Ws = R + B::REGION;                   // [2][COUT][LDW]
+            __half *Ws = R + B::REGION;                   // [STAGES][COUT][LDW]
+            auto widx = [](int n, int chunk) { return sidx<PIPE, LDW>(n, chunk); };
 
             const int tid = threadIdx.x, lane = tid % 32, warp = tid / 32;
             const int b = blockIdx.y, l0 = blockIdx.x * BL;
@@ -82,14 +88,17 @@ namespace curf::engine {
                 if (i < Tsc) { w = p.wsc; kp = p.kpadsc; k0 = i * 32; }
                 else if (i < Tsc + T1) { w = p.w1; kp = p.kpad1; k0 = (i - Tsc) * 32; }
                 else { w = p.w2; kp = p.kpad2; k0 = (i - Tsc - T1) * 32; }
-                __half *ws = Ws + (i & 1) * COUT * LDW;
+                __half *ws = Ws + (i % STAGES) * COUT * LDW;
                 for (int c = tid; c < COUT * 4; c += NT) {
                     const int n = c / 4, kc = (c % 4) * 8;
-                    cp_async16(smem_addr(ws + n * LDW + kc), w + static_cast<long long>(n) * kp + k0 + kc, true);
+                    cp_async16(smem_addr(ws + widx(n, c % 4)), w + static_cast<long long>(n) * kp + k0 + kc, true);
                 }
             };
-            load_w(0);
-            cp_async_commit();
+#pragma unroll
+            for (int st = 0; st < STAGES - 1; ++st) { // group 0 also carries the x tile
+                if (st < T) load_w(st);
+                cp_async_commit();
+            }
 
             using Acc = std::conditional_t<F16Acc, unsigned, float>;
             constexpr int AR = F16Acc ? 2 : 4;
@@ -119,11 +128,11 @@ namespace curf::engine {
                 for (int ks = 0; ks < 32; ks += 16) {
                     unsigned af[MI][4], bf[4][2];
 #pragma unroll
-                    for (int i = 0; i < MI; ++i) ldmatrix_x4(af[i], smem_addr(a_addr(r0 + i * 16 + a_r, k0 + ks + a_c)));
+                    for (int i = 0; i < MI; ++i) ldmatrix_x4(af[i], smem_addr(a_addr(r0 + i * 16 + a_r, ks + a_c)));
 #pragma unroll
                     for (int jj = 0; jj < 2; ++jj) {
                         unsigned r[4];
-                        ldmatrix_x4(r, smem_addr(ws + (nc * 32 + jj * 16 + b_r) * LDW + ks + b_c));
+                        ldmatrix_x4(r, smem_addr(ws + widx(nc * 32 + jj * 16 + b_r, (ks + b_c) >> 3)));
                         bf[2 * jj][0] = r[0];
                         bf[2 * jj][1] = r[1];
                         bf[2 * jj + 1][0] = r[2];
@@ -137,23 +146,84 @@ namespace curf::engine {
             };
             using M2 = std::integral_constant<int, 2>;
             using M1 = std::integral_constant<int, 1>;
-            auto main_jobs = [&](auto &acc, const __half *ws, int k0, auto a_addr) {
+            auto main_jobs = [&](auto &acc, const __half *ws, int k0, auto a_addr, bool with_halo) {
+                if constexpr (!PIPE) {
 #pragma unroll
-                for (int j = 0; j < JM; ++j) {
-                    const int idx = warp + j * NW;
-                    if (idx < B::JOBS) job(acc[j], M2{}, (idx / NC) * 32, idx % NC, ws, k0, a_addr);
+                    for (int j = 0; j < JM; ++j) {
+                        const int idx = warp + j * NW;
+                        if (idx < B::JOBS) job(acc[j], M2{}, (idx / NC) * 32, idx % NC, ws, k0, a_addr);
+                    }
+                    if (with_halo && my_halo < NC) job(halo, M1{}, BL, my_halo, ws, k0, a_addr);
+                } else {
+                    // Steps 2j, 2j+1 = the two k16 halves of main job j; the last two = the halo job (conv1).
+                    // The next valid step's fragments are loaded into the other buffer before this step's MMAs.
+                    constexpr int NS = JM * 2 + 2;
+                    unsigned fa[2][2][4], fb[2][4][2];
+                    auto valid = [&](int I) {
+                        return I < JM * 2 ? warp + (I / 2) * NW < B::JOBS : with_halo && my_halo < NC;
+                    };
+                    auto load = [&](auto ic) {
+                        constexpr int I = decltype(ic)::value, buf = I % 2, MI = I < JM * 2 ? 2 : 1, ks = (I % 2) * 16;
+                        int r0 = BL, nc = my_halo;
+                        if constexpr (I < JM * 2) {
+                            const int idx = warp + (I / 2) * NW;
+                            r0 = (idx / NC) * 32;
+                            nc = idx % NC;
+                        }
+#pragma unroll
+                        for (int i = 0; i < MI; ++i)
+                            ldmatrix_x4(fa[buf][i], smem_addr(a_addr(r0 + i * 16 + a_r, ks + a_c)));
+#pragma unroll
+                        for (int jj = 0; jj < 2; ++jj) {
+                            unsigned r[4];
+                            ldmatrix_x4(r, smem_addr(ws + widx(nc * 32 + jj * 16 + b_r, (ks + b_c) >> 3)));
+                            fb[buf][2 * jj][0] = r[0];
+                            fb[buf][2 * jj][1] = r[1];
+                            fb[buf][2 * jj + 1][0] = r[2];
+                            fb[buf][2 * jj + 1][1] = r[3];
+                        }
+                    };
+                    static_for<NS>([&](auto ic) {
+                        constexpr int I = decltype(ic)::value, buf = I % 2;
+                        if (!valid(I)) return;
+                        if constexpr (I == 0) load(ic);
+                        else if (!valid(I - 1)) load(ic);
+                        if constexpr (I + 1 < NS)
+                            if (valid(I + 1)) load(std::integral_constant<int, I + 1>{});
+                        auto run = [&](auto &a, auto mi_c) {
+#pragma unroll
+                            for (int i = 0; i < decltype(mi_c)::value; ++i)
+#pragma unroll
+                                for (int j = 0; j < 4; ++j) mma(a[i][j], fa[buf][i], fb[buf][j]);
+                        };
+                        if constexpr (I < JM * 2) run(acc[I / 2], M2{});
+                        else run(halo, M1{});
+                    });
                 }
             };
 
-            // conv1 A: y1 row rr (position l0 - 1 + rr), tap t -> x tile row rr*S + t
-            auto a_conv1 = [&](int rr, int kk) {
-                rr = rr < B::NY ? rr : B::NY - 1; // rows past the halo are discarded
-                return R + (rr * S + kk / CIN) * LDX + kk % CIN;
+            // A operand addresses, a(row, koff) with koff = k offset inside the 32-wide k-tile. Since CIN and COUT
+            // are multiples of 32, a k-tile never straddles a tap: the tap and the channel base are per-tile
+            // constants, hoisted out of the per-ldmatrix arithmetic (ncu: the implicit-im2col index math per
+            // fragment load showed up as fixed-latency "wait" stalls comparable to the MMA work).
+            //   conv1:    y1 row rr (position l0 - 1 + rr), tap t -> x tile row rr*S + t
+            //   shortcut: out row o reads x position S*(l0+o) -> x tile row S*o + S + 1
+            //   conv2:    out row o, tap t -> y1 row o + t
+            auto a_conv1_at = [&](int k0) {
+                const __half *base = R + (k0 / CIN) * LDX + k0 % CIN;
+                return [base](int rr, int koff) {
+                    rr = rr < B::NY ? rr : B::NY - 1; // rows past the halo are discarded
+                    return base + rr * (S * LDX) + koff;
+                };
             };
-            // shortcut A: out row o reads x position S*(l0+o) -> x tile row S*o + S + 1
-            auto a_sc = [&](int o, int kk) { return R + (S * o + S + 1) * LDX + kk; };
-            // conv2 A: out row o, tap t -> y1 row o + t
-            auto a_conv2 = [&](int o, int kk) { return R + (o + kk / COUT) * LDY + kk % COUT; };
+            auto a_sc_at = [&](int k0) {
+                const __half *base = R + (S + 1) * LDX + k0;
+                return [base](int o, int koff) { return base + o * (S * LDX) + koff; };
+            };
+            auto a_conv2_at = [&](int k0) {
+                const __half *base = R + (k0 / COUT) * LDY + k0 % COUT;
+                return [base](int o, int koff) { return base + o * LDY + koff; };
+            };
 
             // y1 = relu(acc + b1), zero outside [0, lout) (conv2's padding), fp16 into the y1 tile
             auto store_y1 = [&](const auto &acc_ij, int rr, int c, int h) {
@@ -170,17 +240,16 @@ namespace curf::engine {
             };
 
             for (int i = 0; i < T; ++i) {
-                cp_async_wait<0>();
-                __syncthreads();
-                if (i + 1 < T) load_w(i + 1);
+                cp_async_wait<STAGES - 2>(); // tile i has landed
+                __syncthreads();             // and everyone is done with the slot refilled next
+                if (i + STAGES - 1 < T) load_w(i + STAGES - 1);
                 cp_async_commit();
-                const __half *ws = Ws + (i & 1) * COUT * LDW;
+                const __half *ws = Ws + (i % STAGES) * COUT * LDW;
                 if (i < Tsc) {
-                    main_jobs(acc2, ws, i * 32, a_sc);
+                    main_jobs(acc2, ws, i * 32, a_sc_at(i * 32), false);
                 } else if (i < Tsc + T1) {
                     const int k0 = (i - Tsc) * 32;
-                    main_jobs(acc1, ws, k0, a_conv1);
-                    if (my_halo < NC) job(halo, M1{}, BL, my_halo, ws, k0, a_conv1);
+                    main_jobs(acc1, ws, k0, a_conv1_at(k0), true);
                     if (i == Tsc + T1 - 1) {
                         __syncthreads(); // everyone is done with the x tile; y1 overwrites it
 #pragma unroll
@@ -204,7 +273,7 @@ namespace curf::engine {
                                     store_y1(halo[0][ni], BL + lane / 4 + h * 8, my_halo * 32 + ni * 8 + (lane % 4) * 2, h);
                     }
                 } else {
-                    main_jobs(acc2, ws, (i - Tsc - T1) * 32, a_conv2);
+                    main_jobs(acc2, ws, (i - Tsc - T1) * 32, a_conv2_at((i - Tsc - T1) * 32), false);
                 }
             }
             cp_async_wait<0>();
@@ -263,18 +332,18 @@ namespace curf::engine {
             }
         }
 
-        template <int CIN, int COUT, int S, int BL, bool SC, bool F16Acc>
+        template <int CIN, int COUT, int S, int BL, bool SC, bool F16Acc, bool PIPE>
         void launch_block(const BlockParams &p, cudaStream_t s) {
-            using B = BlockShape<CIN, COUT, S, BL>;
+            using B = BlockShape<CIN, COUT, S, BL, PIPE>;
             static const bool configured = [] {
-                CURF_CUDA_CHECK(cudaFuncSetAttribute(basic_block<CIN, COUT, S, BL, SC, F16Acc>,
+                CURF_CUDA_CHECK(cudaFuncSetAttribute(basic_block<CIN, COUT, S, BL, SC, F16Acc, PIPE>,
                                                      cudaFuncAttributeMaxDynamicSharedMemorySize,
                                                      static_cast<int>(B::SMEM)));
                 return true;
             }();
             (void)configured;
             const dim3 grid(static_cast<unsigned>((p.lout + BL - 1) / BL), static_cast<unsigned>(p.batch));
-            basic_block<CIN, COUT, S, BL, SC, F16Acc><<<grid, B::NT, B::SMEM, s>>>(p);
+            basic_block<CIN, COUT, S, BL, SC, F16Acc, PIPE><<<grid, B::NT, B::SMEM, s>>>(p);
             CURF_CUDA_CHECK(cudaGetLastError());
         }
 
@@ -286,10 +355,15 @@ namespace curf::engine {
 
         template <int CIN, int COUT, int S, bool SC> void add(std::vector<BlockVariant> &v) {
             const std::string shape = std::to_string(CIN) + "x" + std::to_string(COUT) + "s" + std::to_string(S);
-            v.push_back({"block.f16.l128." + shape, &sup_block<CIN, COUT, S, SC>, &launch_block<CIN, COUT, S, 128, SC, true>});
-            v.push_back({"block.f16.l64." + shape, &sup_block<CIN, COUT, S, SC>, &launch_block<CIN, COUT, S, 64, SC, true>});
-            v.push_back({"block.f32.l128." + shape, &sup_block<CIN, COUT, S, SC>, &launch_block<CIN, COUT, S, 128, SC, false>});
-            v.push_back({"block.f32.l64." + shape, &sup_block<CIN, COUT, S, SC>, &launch_block<CIN, COUT, S, 64, SC, false>});
+            auto sup = &sup_block<CIN, COUT, S, SC>;
+            v.push_back({"block.f16.l128p." + shape, sup, &launch_block<CIN, COUT, S, 128, SC, true, true>});
+            v.push_back({"block.f16.l64p." + shape, sup, &launch_block<CIN, COUT, S, 64, SC, true, true>});
+            v.push_back({"block.f16.l128." + shape, sup, &launch_block<CIN, COUT, S, 128, SC, true, false>});
+            v.push_back({"block.f16.l64." + shape, sup, &launch_block<CIN, COUT, S, 64, SC, true, false>});
+            v.push_back({"block.f32.l128p." + shape, sup, &launch_block<CIN, COUT, S, 128, SC, false, true>});
+            v.push_back({"block.f32.l64p." + shape, sup, &launch_block<CIN, COUT, S, 64, SC, false, true>});
+            v.push_back({"block.f32.l128." + shape, sup, &launch_block<CIN, COUT, S, 128, SC, false, false>});
+            v.push_back({"block.f32.l64." + shape, sup, &launch_block<CIN, COUT, S, 64, SC, false, false>});
         }
 
         std::vector<BlockVariant> make_block_registry() {

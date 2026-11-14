@@ -82,6 +82,7 @@ int main(int argc, char **argv) {
     std::vector<int> buckets{1, 8, 32, 128, 512};
     double ms = 400;
     bool graph = true, ops = false, profile = false;
+    std::string block_prefix; // restrict fused-block variants (e.g. "block.f16.l64p.")
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() -> std::string {
@@ -94,6 +95,7 @@ int main(int argc, char **argv) {
         else if (a == "--ms") ms = std::stod(next());
         else if (a == "--no-graph") graph = false;
         else if (a == "--ops") ops = true;
+        else if (a == "--block-prefix") block_prefix = next();
         else if (a == "--profile") profile = true; // one eager run of the largest bucket per step, for ncu --profile-from-start off
         else { std::fprintf(stderr, "unknown option %s\n", a.c_str()); return 2; }
     }
@@ -110,6 +112,7 @@ int main(int argc, char **argv) {
         auto has = [&](const char *f) { return std::find(tok.begin() + 1, tok.end(), f) != tok.end(); };
         cfg.fuse_gap = has("gap");
         cfg.fuse_blocks = has("block");
+        cfg.block_prefix = block_prefix;
         // Library kernels (cudnn, cutlass.*) only compete when the step is a library step or says +lib, so the
         // engine's own numbers never quietly include a library kernel.
         if (!has("stem")) cfg.exclude_prefixes.push_back("direct");

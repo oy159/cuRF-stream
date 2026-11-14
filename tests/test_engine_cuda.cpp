@@ -90,7 +90,8 @@ TEST_CASE("fused BasicBlocks and fused global pooling match the golden", "[cuda]
     if (!d) SKIP("no converted model in " + kDir.string());
     const auto &g = d->golden;
     const int n = static_cast<int>(g.n_layer), c = static_cast<int>(g.classes);
-    for (const std::string block : {"block.f16.l128", "block.f16.l64", "block.f32.l128", "block.f32.l64"}) {
+    for (const std::string block : {"block.f16.l128p.", "block.f16.l64p.", "block.f32.l128p.", "block.f32.l64p.",
+                                     "block.f16.l128.", "block.f16.l64.", "block.f32.l128.", "block.f32.l64."}) {
         for (const bool gap : {false, true}) {
             EngineConfig cfg;
             cfg.buckets = {n};

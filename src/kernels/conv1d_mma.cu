@@ -25,16 +25,6 @@ namespace curf::engine::detail {
 
     namespace {
 
-        // Shared-memory tile layout of a [rows][32 halves] k-tile, in units of halves.
-        //   padded   (SWZ = false): row stride 40 halves (80 B, conflict-free for ldmatrix, 25% wasted)
-        //   swizzled (SWZ = true):  row stride 32 halves, 16-byte chunk c of row r stored at c ^ ((r >> 1) & 3);
-        //                           any 8 consecutive rows at one logical chunk hit 8 distinct bank groups
-        // Swizzling was added after ncu showed the padded 3-stage 128x128 ring (61 KB) left one CTA per SM
-        // (occupancy 8%), while CUTLASS's swizzled ring (48 KB) fits two.
-        template <bool SWZ, int LDS> __device__ __forceinline__ int sidx(int row, int chunk) {
-            return SWZ ? row * 32 + ((chunk ^ ((row >> 1) & 3)) << 3) : row * LDS + (chunk << 3);
-        }
-
         template <int BM, int BN, int WM, int STAGES, int WN_ = 32, bool SWZ_ = false>
         struct MmaShape {
             static constexpr bool SWZ = SWZ_;

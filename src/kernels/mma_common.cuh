@@ -3,6 +3,8 @@
 
 #include <cuda_fp16.h>
 
+#include <utility>
+
 namespace curf::engine::detail {
 
     __device__ __forceinline__ unsigned smem_addr(const void *p) {
@@ -37,6 +39,22 @@ namespace curf::engine::detail {
         asm volatile("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"
                      : "+r"(c[0]), "+r"(c[1])
                      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+    }
+
+    // Shared-memory tile layout of a [rows][32 halves] k-tile, in units of halves.
+    //   padded   (SWZ = false): row stride 40 halves (80 B, conflict-free for ldmatrix, 25% wasted)
+    //   swizzled (SWZ = true):  row stride 32 halves, 16-byte chunk c of row r stored at c ^ ((r >> 1) & 3);
+    //               any 8 consecutive rows at one logical chunk hit 8 distinct bank groups
+    // Swizzling was added after ncu showed the padded 3-stage 128x128 ring (61 KB) left one CTA per SM
+    // (occupancy 8%), while CUTLASS's swizzled ring (48 KB) fits two.
+    template <bool SWZ, int LDS> __device__ __forceinline__ int sidx(int row, int chunk) {
+        return SWZ ? row * 32 + ((chunk ^ ((row >> 1) & 3)) << 3) : row * LDS + (chunk << 3);
+    }
+
+    // Compile-time loop: f(std::integral_constant<int, I>{}) for I = 0 .. N-1 (keeps register-array indices static).
+    template <int N, class F> __device__ __forceinline__ void static_for(F &&f) {
+        [&]<int... I>(std::integer_sequence<int, I...>) { (f(std::integral_constant<int, I>{}), ...); }(
+            std::make_integer_sequence<int, N>{});
     }
 
     // Two accumulator values of one row (columns 2t, 2t+1) as floats; h selects row g or g + 8.
