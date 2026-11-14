@@ -1,0 +1,61 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": { "major": 3, "minor": 24, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Unix Makefiles",
+      "binaryDir": "${sourceDir}/build/${presetName}"
+    },
+    {
+      "name": "cpu-debug",
+      "displayName": "CPU only, Debug (macOS / any host)",
+      "inherits": "base",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug", "CURF_CUDA": "OFF" }
+    },
+    {
+      "name": "cpu-release",
+      "displayName": "CPU only, Release",
+      "inherits": "base",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release", "CURF_CUDA": "OFF" }
+    },
+    {
+      "name": "cuda-base",
+      "hidden": true,
+      "inherits": "base",
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Linux" },
+      "cacheVariables": {
+        "CURF_CUDA": "ON",
+        "CMAKE_CUDA_COMPILER": "/usr/local/cuda/bin/nvcc",
+        "CMAKE_CUDA_ARCHITECTURES": "86",
+        "CURF_TENSORRT": "ON",
+        "TensorRT_ROOT": "$env{TENSORRT_ROOT}"
+      }
+    },
+    {
+      "name": "cuda-debug",
+      "displayName": "CUDA + TensorRT, Debug (Linux, sm_86)",
+      "inherits": "cuda-base",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
+    },
+    {
+      "name": "cuda-release",
+      "displayName": "CUDA + TensorRT, Release (Linux, sm_86)",
+      "inherits": "cuda-base",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+    }
+  ],
+  "buildPresets": [
+    { "name": "cpu-debug", "configurePreset": "cpu-debug", "jobs": 8 },
+    { "name": "cpu-release", "configurePreset": "cpu-release", "jobs": 8 },
+    { "name": "cuda-debug", "configurePreset": "cuda-debug", "jobs": 12 },
+    { "name": "cuda-release", "configurePreset": "cuda-release", "jobs": 12 }
+  ],
+  "testPresets": [
+    { "name": "cpu-debug", "configurePreset": "cpu-debug", "output": { "outputOnFailure": true } },
+    { "name": "cpu-release", "configurePreset": "cpu-release", "output": { "outputOnFailure": true } },
+    { "name": "cuda-debug", "configurePreset": "cuda-debug", "output": { "outputOnFailure": true } },
+    { "name": "cuda-release", "configurePreset": "cuda-release", "output": { "outputOnFailure": true } }
+  ]
+}

@@ -1,0 +1,16 @@
+/build/
+/cmake-build-*/
+/.idea/
+/.vscode/
+.DS_Store
+__pycache__/
+*.pyc
+/tools/remote.env
+# captures, engines, model artifacts
+*.raw
+*.plan
+*.engine
+*.onnx
+*.pt
+*.nsys-rep
+*.ncu-rep
