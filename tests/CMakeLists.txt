@@ -11,13 +11,15 @@ include(Catch)
 
 add_executable(curf_tests_cpu
     test_reference.cpp
-    test_sources.cpp)
+    test_sources.cpp
+    test_host_ring.cpp)
 target_link_libraries(curf_tests_cpu PRIVATE curf_core curf_warnings Catch2::Catch2WithMain)
 catch_discover_tests(curf_tests_cpu TEST_PREFIX "cpu.")
 
 if(CURF_HAVE_CUDA)
     add_executable(curf_tests_cuda
-        test_unpack_cuda.cpp)
+        test_unpack_cuda.cpp
+        test_pipeline_cuda.cpp)
     target_link_libraries(curf_tests_cuda PRIVATE curf_cuda curf_warnings Catch2::Catch2WithMain)
     catch_discover_tests(curf_tests_cuda TEST_PREFIX "cuda.")
 endif()

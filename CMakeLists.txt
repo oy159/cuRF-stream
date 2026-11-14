@@ -54,18 +54,28 @@ target_compile_options(curf_warnings INTERFACE
     $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall,-Wextra --expt-relaxed-constexpr -lineinfo>)
 
 # CPU core: source interfaces, synthetic/file sources, reference implementations.
+find_package(Threads REQUIRED)
+
 add_library(curf_core
     src/reference/unpack.cpp
+    src/runtime/host_ring.cpp
     src/source/synthetic_source.cpp
     src/source/file_source.cpp)
 target_include_directories(curf_core PUBLIC include)
-target_link_libraries(curf_core PRIVATE curf_warnings)
+target_link_libraries(curf_core PUBLIC Threads::Threads PRIVATE curf_warnings)
 
 if(CURF_HAVE_CUDA)
     add_library(curf_cuda
-        src/kernels/unpack.cu)
+        src/kernels/unpack.cu
+        src/kernels/psd.cu
+        src/runtime/pipeline.cpp)
     target_include_directories(curf_cuda PUBLIC include)
-    target_link_libraries(curf_cuda PUBLIC curf_core CUDA::cudart PRIVATE curf_warnings)
+    target_link_libraries(curf_cuda PUBLIC curf_core CUDA::cudart CUDA::cufft PRIVATE curf_warnings)
+    if(TARGET CUDA::nvtx3)
+        target_link_libraries(curf_cuda PRIVATE CUDA::nvtx3)
+    else()
+        target_link_libraries(curf_cuda PRIVATE ${CMAKE_DL_LIBS}) # header-only NVTX3 uses dlopen
+    endif()
     target_compile_definitions(curf_cuda PUBLIC CURF_HAVE_CUDA=1)
 endif()
 
