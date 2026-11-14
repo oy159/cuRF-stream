@@ -45,3 +45,17 @@
 | conv_mma<128,128,64,2,1> | 268.6 | 59.3 | 69.6 | 69.6 | 44.3 | 65.9 | 60.1 | 35.8 | 32.5 | 76.0 | 40.0 | long_sb=11 barrier=9 |
 | conv_mma<128,128,64,2,1> | 511.8 | 62.4 | 69.8 | 54.1 | 44.6 | 69.8 | 63.0 | 53.1 | 32.5 | 76.0 | 40.0 | long_sb=20 barrier=9 |
 | gap_linear_kernel | 112.6 | 32.0 | 80.3 | 80.3 | 45.2 | 38.2 | 0.0 | 17.3 | 76.6 | 40.0 | 0.5 | long_sb=56 lg_thr=23 |
+
+## Step 8 as tuned in a hot GPU state (direct stem, stage1 + stage2.0 fused, stage2.1 + stage3 left unfused by the in-context decision, GAP fused)
+
+| kernel | us | SM% | Mem% | DRAM% | L1% | L2% | TC% | DRAM_MB | occ% | regs | smemKB | top stalls (% of active) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| conv_direct<f> | 202.2 | 63.8 | 53.3 | 53.3 | 48.2 | 23.6 | 0.0 | 20.7 | 48.1 | 69.0 | 5.8 | long_sb=27 barrier=7 |
+| void unnamed>::basic_block<32, 32, 1, 128, 0, 1>(BlockParams | 378.6 | 46.6 | 57.0 | 47.4 | 44.0 | 57.0 | 45.1 | 34.4 | 32.3 | 123.0 | 15.8 | long_sb=17 barrier=14 |
+| void unnamed>::basic_block<32, 64, 2, 64, 1, 1>(BlockParams) | 522.8 | 54.7 | 71.7 | 33.3 | 48.5 | 71.7 | 54.7 | 33.3 | 32.7 | 119.0 | 21.4 | barrier=13 long_sb=12 |
+| conv_mma<128,64,32,2,1> | 287.3 | 56.1 | 80.2 | 60.6 | 62.7 | 80.2 | 57.0 | 33.4 | 48.5 | 62.0 | 32.0 | barrier=16 long_sb=12 |
+| conv_mma<128,64,32,2,1> | 329.0 | 48.5 | 81.1 | 79.7 | 56.6 | 81.1 | 49.2 | 50.2 | 48.0 | 62.0 | 32.0 | long_sb=27 barrier=12 |
+| conv_mma<128,128,64,2,0> | 163.2 | 32.6 | 79.6 | 79.6 | 45.7 | 51.9 | 33.7 | 24.9 | 32.2 | 124.0 | 44.0 | long_sb=15 barrier=12 |
+| conv_mma<128,128,64,2,1> | 273.6 | 58.4 | 66.8 | 66.8 | 43.7 | 64.9 | 59.0 | 35.0 | 32.5 | 74.0 | 44.0 | barrier=11 long_sb=10 |
+| conv_mma<128,128,64,2,1> | 517.7 | 61.7 | 61.2 | 35.2 | 44.0 | 61.2 | 62.1 | 34.9 | 32.6 | 74.0 | 44.0 | long_sb=17 barrier=10 |
+| linear_from_pool_kernel | 40.0 | 22.4 | 85.6 | 4.0 | 92.4 | 2.4 | 0.0 | 0.3 | 42.5 | 40.0 | 0.5 | mio=24 lg_thr=18 |

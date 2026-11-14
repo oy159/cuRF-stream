@@ -26,6 +26,11 @@ namespace curf::engine {
         std::vector<int> buckets{1, 8, 32, 128, 512};
         std::string variant_prefix;       // only conv variants whose name starts with this ("" = all); for ops
                                           // nothing matches, the prefix is cut back one dotted component
+        std::vector<std::string> exclude_prefixes; // conv variants never considered (e.g. "direct")
+        bool fuse_blocks = true;          // BasicBlock (conv1 + conv2 + shortcut) -> one kernel, per bucket, when
+                                          // a block variant fits and (with autotune) is faster than the convs
+        std::string block_prefix;         // block variants considered ("" = all)
+        bool fuse_gap = true;             // last conv / block -> pooled sums, head reads those
         bool autotune = true;             // false: first supported variant in registry order
         int tune_iters = 20;
         bool cuda_graphs = true;
@@ -35,9 +40,19 @@ namespace curf::engine {
 
     struct OpChoice {
         int bucket = 0;
-        std::string op, variant; // variant empty for non-conv ops
+        std::string op, variant; // op: step name ("block:<conv2>" for fused blocks); variant empty for heads
         float us = 0;            // measured time of the chosen variant (0 when not tuned)
         double flops = 0;
+    };
+
+    // Per bucket and BasicBlock: whole-network time with this block fused vs run as separate convs
+    // (the other blocks as decided so far).
+    struct FusionDecision {
+        int bucket = 0;
+        std::string block;          // conv2 op name
+        std::string fused_variant;  // best block variant
+        float fused_us = 0, unfused_us = 0; // whole network, per batch
+        bool fused = false;
     };
 
     class Engine {
@@ -61,6 +76,12 @@ namespace curf::engine {
         // Copy any tensor of the last run to the host as fp32 [batch][length][channels] (synchronous).
         // With reuse_memory=true intermediate tensors may already have been overwritten.
         std::vector<float> read_tensor(std::uint32_t tensor, int batch) const;
+
+        // False for tensors that only exist inside fused kernels (read_tensor throws for them).
+        bool materialized(std::uint32_t tensor) const;
+        std::size_t steps(int batch) const; // kernel launches per run of batch's bucket (not counting the pool memset)
+        std::size_t steps() const { return steps(max_batch()); }
+        const std::vector<FusionDecision> &fusion_decisions() const;
 
         const MemoryPlan &memory_plan() const;
         std::size_t device_bytes() const;

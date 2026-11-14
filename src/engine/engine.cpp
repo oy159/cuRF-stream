@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <fstream>
+#include <functional>
 #include <map>
 #include <sstream>
 #include <stdexcept>
@@ -12,18 +13,47 @@ namespace curf::engine {
 
     using cuda::DeviceBuffer;
 
+    namespace {
+
+        constexpr std::size_t kNone = ~std::size_t{0};
+
+        bool starts_with(const std::string &s, const std::string &p) { return s.rfind(p, 0) == 0; }
+
+        // A BasicBlock that may run as one kernel: conv1 (a), conv2 (b, with the residual), shortcut (c).
+        struct Group {
+            std::size_t a = kNone, b = kNone, c = kNone;
+        };
+
+        // One kernel launch of a bucket's execution plan.
+        struct Step {
+            enum class Kind { conv, gap_linear, linear_from_pool, block } kind = Kind::conv;
+            std::size_t op = 0;        // conv / head op; block: its conv2
+            std::size_t group = kNone; // block only
+        };
+
+    } // namespace
+
     struct Engine::Impl {
         Model model;
         EngineConfig cfg;
         MemoryPlan plan;
+        std::vector<Group> groups;
+        std::vector<std::size_t> group_of;      // op -> group (kNone if none)
+        std::size_t pool_op = kNone;            // conv whose output is pooled (fuse_gap), or kNone
+        std::size_t head_op = kNone;            // the gap_linear op
+        std::vector<std::vector<Step>> steps;   // [bucket]
+        std::vector<bool> materialized;
         DeviceBuffer<std::byte> arena, weights;
-        DeviceBuffer<float> input, logits;
+        DeviceBuffer<float> input, logits, pool;
         mutable DeviceBuffer<float> scratch; // read_tensor conversions
         cudaStream_t stream = nullptr;       // private stream for tuning and capture
         std::vector<int> buckets;
-        std::vector<std::vector<const ConvVariant *>> chosen; // [bucket][op]
-        std::vector<cudaGraphExec_t> graphs;                   // [bucket]
+        std::vector<std::vector<const ConvVariant *>> conv_choice;   // [bucket][op]
+        std::vector<std::vector<float>> conv_us;                     // [bucket][op]
+        std::vector<std::vector<const BlockVariant *>> block_choice; // [bucket][group]
+        std::vector<cudaGraphExec_t> graphs;                         // [bucket]
         std::vector<OpChoice> choices;
+        std::vector<FusionDecision> decisions;
         std::string gpu;
 
         const TensorDesc &tensor(std::uint32_t t) const { return model.tensors[t]; }
@@ -31,17 +61,22 @@ namespace curf::engine {
         void *ptr(std::uint32_t t) const {
             if (t == model.input) return input.get();
             if (t == model.output) return logits.get();
+            if (!materialized[t] || plan.offset.empty()) return nullptr; // fusion pass runs before planning
             return arena.get() + plan.offset[t];
         }
+        template <class T> const T *wptr(std::uint64_t off) const { return reinterpret_cast<const T *>(weights.get() + off); }
+        std::size_t pool_channels() const { return head_op == kNone || pool_op == kNone ? 0 : model.ops[head_op].cin; }
 
-        ConvParams conv_params(const OpDesc &op, int batch) const {
+        ConvParams conv_params(std::size_t i, int batch) const {
+            const auto &op = model.ops[i];
             ConvParams p;
             p.x = ptr(op.in);
             p.x_f32 = op.in == model.input;
-            p.w = reinterpret_cast<const __half *>(weights.get() + op.w_off);
-            p.bias = reinterpret_cast<const float *>(weights.get() + op.b_off);
+            p.w = wptr<__half>(op.w_off);
+            p.bias = wptr<float>(op.b_off);
             p.res = op.res == kNoTensor ? nullptr : static_cast<const __half *>(ptr(op.res));
             p.y = static_cast<__half *>(ptr(op.out));
+            p.pool = i == pool_op ? (pool.get() ? pool.get() : reinterpret_cast<float *>(16)) : nullptr; // non-null marks "pooled"
             p.batch = batch;
             p.lin = static_cast<int>(tensor(op.in).length);
             p.lout = static_cast<int>(tensor(op.out).length);
@@ -55,38 +90,152 @@ namespace curf::engine {
             return p;
         }
 
-        void launch_op(std::size_t i, int bucket_index, int batch, cudaStream_t s) const {
-            const auto &op = model.ops[i];
-            if (op.kind == OpKind::conv) {
-                launch_conv(*chosen[bucket_index][i], conv_params(op, batch), s);
-            } else {
-                launch_gap_linear(static_cast<const __half *>(ptr(op.in)),
-                                  reinterpret_cast<const float *>(weights.get() + op.w_off),
-                                  reinterpret_cast<const float *>(weights.get() + op.b_off),
-                                  static_cast<float *>(ptr(op.out)), batch, static_cast<int>(tensor(op.in).length),
-                                  static_cast<int>(op.cin), static_cast<int>(op.cout), s);
+        BlockParams block_params(std::size_t g, int batch) const {
+            const auto &grp = groups[g];
+            const auto &a = model.ops[grp.a], &b = model.ops[grp.b];
+            BlockParams p;
+            p.x = static_cast<const __half *>(ptr(a.in));
+            p.y = static_cast<__half *>(ptr(b.out));
+            p.pool = grp.b == pool_op ? pool.get() : nullptr;
+            p.w1 = wptr<__half>(a.w_off);
+            p.b1 = wptr<float>(a.b_off);
+            p.w2 = wptr<__half>(b.w_off);
+            p.b2 = wptr<float>(b.b_off);
+            if (grp.c != kNone) {
+                const auto &c = model.ops[grp.c];
+                p.wsc = wptr<__half>(c.w_off);
+                p.bsc = wptr<float>(c.b_off);
+                p.kpadsc = static_cast<int>(c.kpad);
+            }
+            p.batch = batch;
+            p.lin = static_cast<int>(tensor(a.in).length);
+            p.lout = static_cast<int>(tensor(b.out).length);
+            p.cin = static_cast<int>(a.cin);
+            p.cout = static_cast<int>(b.cout);
+            p.stride = static_cast<int>(a.stride);
+            p.kpad1 = static_cast<int>(a.kpad);
+            p.kpad2 = static_cast<int>(b.kpad);
+            return p;
+        }
+
+        bool allowed(const ConvVariant &v) const {
+            for (const auto &x : cfg.exclude_prefixes)
+                if (starts_with(v.name, x)) return false;
+            return true;
+        }
+
+        // ------------------------------------------------------------ fusion candidates (shape-only)
+        void find_fusions() {
+            const auto nt = model.tensors.size(), no = model.ops.size();
+            std::vector<int> consumers(nt, 0);
+            std::vector<std::size_t> producer(nt, kNone);
+            for (std::size_t i = 0; i < no; ++i) {
+                const auto &op = model.ops[i];
+                ++consumers[op.in];
+                if (op.res != kNoTensor) ++consumers[op.res];
+                producer[op.out] = i;
+            }
+            group_of.assign(no, kNone);
+            auto is_conv = [&](std::size_t i, std::uint32_t k, std::uint32_t pad) {
+                return i != kNone && model.ops[i].kind == OpKind::conv && model.ops[i].k == k && model.ops[i].pad == pad;
+            };
+            // GAP: the head's input is produced by a conv that nothing else reads
+            for (std::size_t i = 0; i < no; ++i) {
+                if (model.ops[i].kind != OpKind::gap_linear) continue;
+                head_op = i;
+                const auto t = model.ops[i].in;
+                if (!cfg.fuse_gap || consumers[t] != 1 || producer[t] == kNone) break;
+                const std::size_t pi = producer[t];
+                pool_op = pi; // tentatively; must be poolable as a conv (blocks always are)
+                const auto p = conv_params(pi, 1);
+                bool any = false;
+                for (const auto &v : conv_variants()) any = any || (v.pool && allowed(v) && v.supported(p));
+                if (!any) pool_op = kNone;
+                break;
+            }
+            if (!cfg.fuse_blocks) return;
+            for (std::size_t ib = 0; ib < no; ++ib) {
+                const auto &b = model.ops[ib];
+                if (!is_conv(ib, 3, 1) || b.stride != 1 || !b.relu || b.res == kNoTensor) continue;
+                const std::size_t ia = producer[b.in];
+                if (!is_conv(ia, 3, 1) || consumers[b.in] != 1) continue;
+                const auto &a = model.ops[ia];
+                if (!a.relu || a.res != kNoTensor || a.in == model.input || a.cout != b.cin) continue;
+                Group g{ia, ib, kNone};
+                if (b.res != a.in) {
+                    const std::size_t ic = producer[b.res];
+                    if (!is_conv(ic, 1, 0) || consumers[b.res] != 1) continue;
+                    const auto &c = model.ops[ic];
+                    if (c.in != a.in || c.stride != a.stride || c.relu || c.res != kNoTensor) continue;
+                    g.c = ic;
+                } else if (a.stride != 1) {
+                    continue;
+                }
+                groups.push_back(g);
+                const auto bp = block_params(groups.size() - 1, 1);
+                bool any = false;
+                for (const auto &v : block_variants()) any = any || (starts_with(v.name, cfg.block_prefix) && v.supported(bp));
+                if (!any) { groups.pop_back(); continue; }
+                group_of[ia] = group_of[ib] = groups.size() - 1;
+                if (g.c != kNone) group_of[g.c] = groups.size() - 1;
             }
         }
 
-        void run_eager(int bucket_index, int batch, cudaStream_t s) const {
-            for (std::size_t i = 0; i < model.ops.size(); ++i) launch_op(i, bucket_index, batch, s);
+        // ------------------------------------------------------------ execution
+        void launch_step(const Step &st, std::size_t bi, int batch, cudaStream_t s) const {
+            const auto &op = model.ops[st.op];
+            switch (st.kind) {
+                case Step::Kind::conv: launch_conv(*conv_choice[bi][st.op], conv_params(st.op, batch), s); break;
+                case Step::Kind::block: block_choice[bi][st.group]->launch(block_params(st.group, batch), s); break;
+                case Step::Kind::gap_linear:
+                    launch_gap_linear(static_cast<const __half *>(ptr(op.in)), wptr<float>(op.w_off), wptr<float>(op.b_off),
+                                      static_cast<float *>(ptr(op.out)), batch, static_cast<int>(tensor(op.in).length),
+                                      static_cast<int>(op.cin), static_cast<int>(op.cout), s);
+                    break;
+                case Step::Kind::linear_from_pool:
+                    launch_linear_from_pool(pool.get(), wptr<float>(op.w_off), wptr<float>(op.b_off),
+                                            static_cast<float *>(ptr(op.out)), batch, static_cast<int>(op.cin),
+                                            static_cast<int>(op.cout), 1.f / static_cast<float>(tensor(op.in).length), s);
+                    break;
+            }
         }
 
-        std::string op_key(const OpDesc &op, int batch) const {
+        void run_eager(std::size_t bi, int batch, cudaStream_t s) const {
+            if (const auto pc = pool_channels())
+                CURF_CUDA_CHECK(cudaMemsetAsync(pool.get(), 0, static_cast<std::size_t>(batch) * pc * sizeof(float), s));
+            for (const auto &st : steps[bi]) launch_step(st, bi, batch, s);
+        }
+
+        // ------------------------------------------------------------ kernel selection
+        std::string conv_key(std::size_t i, int batch) const {
+            const auto &op = model.ops[i];
             std::ostringstream k;
-            k << gpu << '|' << (cfg.variant_prefix.empty() ? "*" : cfg.variant_prefix) << '|' << op.cin << ','
-              << op.cout << ',' << op.k << ',' << op.stride << ',' << op.pad << ',' << tensor(op.in).length << ','
-              << (op.res != kNoTensor) << op.relu << (op.in == model.input) << '|' << batch;
-            return k.str();
+            k << gpu << '|' << cfg.variant_prefix << '|';
+            for (const auto &x : cfg.exclude_prefixes) k << '-' << x;
+            k << '|' << op.cin << ',' << op.cout << ',' << op.k << ',' << op.stride << ',' << op.pad << ','
+              << tensor(op.in).length << ',' << (op.res != kNoTensor) << op.relu << (op.in == model.input)
+              << (i == pool_op) << '|' << batch;
+            auto s = k.str();
+            std::replace(s.begin(), s.end(), ' ', '_');
+            return s;
+        }
+        std::string block_key(std::size_t g, int batch) const {
+            const auto p = block_params(g, batch);
+            std::ostringstream k;
+            k << gpu << "|B" << cfg.block_prefix << '|' << p.cin << ',' << p.cout << ',' << p.stride << ','
+              << (p.wsc != nullptr) << ',' << p.lin << ',' << (groups[g].b == pool_op) << '|' << batch;
+            auto s = k.str();
+            std::replace(s.begin(), s.end(), ' ', '_');
+            return s;
         }
 
-        float time_variant(const ConvVariant &v, const ConvParams &p) const {
+        float time_us(const std::function<void()> &launch) const {
             cudaEvent_t a, b;
             CURF_CUDA_CHECK(cudaEventCreate(&a));
             CURF_CUDA_CHECK(cudaEventCreate(&b));
-            for (int i = 0; i < 3; ++i) launch_conv(v, p, stream);
+            for (int i = 0; i < 3; ++i) launch();
             CURF_CUDA_CHECK(cudaEventRecord(a, stream));
-            for (int i = 0; i < cfg.tune_iters; ++i) launch_conv(v, p, stream);
+            for (int i = 0; i < cfg.tune_iters; ++i) launch();
             CURF_CUDA_CHECK(cudaEventRecord(b, stream));
             CURF_CUDA_CHECK(cudaEventSynchronize(b));
             float ms = 0;
@@ -106,71 +255,199 @@ namespace curf::engine {
             return c;
         }
 
+        const ConvVariant *pick_conv(const ConvParams &p, float &best_us) const {
+            const ConvVariant *best = nullptr;
+            // Most specific prefix first: "wmma.f32.fused.64x64" falls back to "wmma.f32.fused." ... "" for ops
+            // that tile cannot handle (e.g. cout = 32).
+            for (std::string prefix = cfg.variant_prefix;;) {
+                for (const auto &v : conv_variants()) {
+                    if (!starts_with(v.name, prefix) || !allowed(v) || !v.supported(p) || (p.pool && !v.pool)) continue;
+                    if (!cfg.autotune) { best = &v; break; }
+                    const float us = time_us([&] { launch_conv(v, p, stream); });
+                    if (!best || us < best_us) { best = &v; best_us = us; }
+                }
+                if (best || prefix.empty()) return best;
+                const auto dot = prefix.size() < 2 ? std::string::npos : prefix.find_last_of('.', prefix.size() - 2);
+                prefix.resize(dot == std::string::npos ? 0 : dot + 1); // ... -> "mma." -> "" (everything)
+            }
+        }
+
+        const BlockVariant *pick_block(const BlockParams &p, float &best_us) const {
+            const BlockVariant *best = nullptr;
+            for (const auto &v : block_variants()) {
+                if (!starts_with(v.name, cfg.block_prefix) || !v.supported(p)) continue;
+                if (!cfg.autotune) { best = &v; break; }
+                const float us = time_us([&] { v.launch(p, stream); });
+                if (!best || us < best_us) { best = &v; best_us = us; }
+            }
+            return best;
+        }
+
+        std::vector<Step> make_steps(std::size_t bi, const std::vector<bool> &fused) const {
+            (void)bi;
+            std::vector<Step> out;
+            for (std::size_t i = 0; i < model.ops.size(); ++i) {
+                const auto g = group_of[i];
+                if (g != kNone && fused[g]) {
+                    if (i == groups[g].b) out.push_back({Step::Kind::block, i, g}); // runs where its conv2 was
+                } else if (model.ops[i].kind == OpKind::conv) {
+                    out.push_back({Step::Kind::conv, i});
+                } else {
+                    out.push_back({pool_op != kNone ? Step::Kind::linear_from_pool : Step::Kind::gap_linear, i});
+                }
+            }
+            return out;
+        }
+
+        // Tune every conv (as if unfused) and every block candidate per bucket, then decide fusion per bucket.
+        // Needs memory planned with every candidate tensor materialised.
         void select_kernels() {
             auto cache = load_cache();
-            bool cache_dirty = false;
-            chosen.assign(buckets.size(), std::vector<const ConvVariant *>(model.ops.size(), nullptr));
+            bool dirty = false;
+            const auto no = model.ops.size();
+            conv_choice.assign(buckets.size(), std::vector<const ConvVariant *>(no, nullptr));
+            conv_us.assign(buckets.size(), std::vector<float>(no, 0.f));
+            block_choice.assign(buckets.size(), std::vector<const BlockVariant *>(groups.size(), nullptr));
+            steps.assign(buckets.size(), {});
+            auto cached = [&](const std::string &key, auto find, auto pick, float &us) {
+                using V = decltype(pick(us));
+                V v = nullptr;
+                if (const auto hit = cache.find(key); cfg.autotune && hit != cache.end()) {
+                    v = find(hit->second.first);
+                    us = hit->second.second;
+                }
+                if (!v && (v = pick(us)) && cfg.autotune) { cache[key] = {v->name, us}; dirty = true; }
+                return v;
+            };
             for (std::size_t bi = 0; bi < buckets.size(); ++bi) {
                 const int batch = buckets[bi];
-                for (std::size_t i = 0; i < model.ops.size(); ++i) {
-                    const auto &op = model.ops[i];
-                    OpChoice oc{batch, op.name, "", 0.f, 0.0};
-                    if (op.kind != OpKind::conv) {
+                for (std::size_t i = 0; i < no; ++i) {
+                    if (model.ops[i].kind != OpKind::conv) continue;
+                    const auto p = conv_params(i, batch);
+                    float us = 0;
+                    const ConvVariant *v = cached(conv_key(i, batch), [](const std::string &n) { return find_conv_variant(n); },
+                                                  [&](float &u) { return pick_conv(p, u); }, us);
+                    if (!v) throw std::runtime_error("engine: no conv variant for " + model.ops[i].name);
+                    conv_choice[bi][i] = v;
+                    conv_us[bi][i] = us;
+                }
+                std::vector<bool> fused(groups.size(), false);
+                std::vector<float> block_us(groups.size(), 0.f);
+                for (std::size_t g = 0; g < groups.size(); ++g) {
+                    const auto p = block_params(g, batch);
+                    const BlockVariant *v = cached(
+                        block_key(g, batch),
+                        [](const std::string &n) -> const BlockVariant * {
+                            for (const auto &x : block_variants())
+                                if (x.name == n) return &x;
+                            return nullptr;
+                        },
+                        [&](float &u) { return pick_block(p, u); }, block_us[g]);
+                    block_choice[bi][g] = v;
+                    fused[g] = v != nullptr;
+                }
+                // Fusion decided in context: toggle one block at a time and time the whole network, alternating
+                // the two plans for three rounds (best of each). Per-kernel timings in isolation mislead here: an
+                // unfused conv re-launched on the same buffers finds its input in L2, which the real sequence
+                // does not give it, and the balance shifts with the laptop GPU's clocks as it heats up.
+                for (std::size_t g = 0; g < groups.size(); ++g) {
+                    const auto &grp = groups[g];
+                    FusionDecision d{batch, model.ops[grp.b].name, block_choice[bi][g] ? block_choice[bi][g]->name : "",
+                                     0.f, 0.f, false};
+                    if (block_choice[bi][g] && cfg.autotune) {
+                        float f = 1e30f, u = 1e30f;
+                        for (int r = 0; r < 3; ++r)
+                            for (const bool on : {true, false}) {
+                                fused[g] = on;
+                                steps[bi] = make_steps(bi, fused);
+                                const float t = time_us([&] { run_eager(bi, batch, stream); });
+                                (on ? f : u) = std::min(on ? f : u, t);
+                            }
+                        fused[g] = f < u;
+                        d.fused_us = f;
+                        d.unfused_us = u;
+                    }
+                    d.fused = fused[g];
+                    decisions.push_back(d);
+                }
+                steps[bi] = make_steps(bi, fused);
+                for (const auto &st : steps[bi]) {
+                    const auto &op = model.ops[st.op];
+                    OpChoice oc{batch, op.name + (st.op == pool_op ? "+gap" : ""), "", 0.f, 0.0};
+                    if (st.kind == Step::Kind::block) {
+                        oc.op = "block:" + oc.op;
+                        oc.variant = block_choice[bi][st.group]->name;
+                        oc.us = block_us[st.group];
+                        oc.flops = block_params(st.group, batch).flops();
+                    } else if (st.kind == Step::Kind::conv) {
+                        oc.variant = conv_choice[bi][st.op]->name;
+                        oc.us = conv_us[bi][st.op];
+                        oc.flops = conv_params(st.op, batch).flops();
+                    } else {
                         oc.flops = 2.0 * batch * op.cin * op.cout;
-                        choices.push_back(oc);
-                        continue;
                     }
-                    const auto p = conv_params(op, batch);
-                    oc.flops = p.flops();
-                    const auto key = op_key(op, batch);
-                    const ConvVariant *best = nullptr;
-                    float best_us = 0;
-                    if (auto it = cache.find(key); cfg.autotune && it != cache.end()) {
-                        best = find_conv_variant(it->second.first);
-                        best_us = it->second.second;
-                    }
-                    // Most specific prefix first: "wmma.f32.fused.64x64" falls back to "wmma.f32.fused."
-                    // for ops that tile cannot handle (e.g. cout = 32).
-                    for (std::string prefix = cfg.variant_prefix; !best;) {
-                        for (const auto &v : conv_variants()) {
-                            if (v.name.rfind(prefix, 0) != 0 || !v.supported(p)) continue;
-                            if (!cfg.autotune) { best = &v; break; }
-                            const float us = time_variant(v, p);
-                            if (!best || us < best_us) { best = &v; best_us = us; }
-                        }
-                        if (best && cfg.autotune) { cache[key] = {best->name, best_us}; cache_dirty = true; }
-                        if (best || prefix.empty()) break;
-                        const auto dot = prefix.size() < 2 ? std::string::npos : prefix.find_last_of('.', prefix.size() - 2);
-                        prefix.resize(dot == std::string::npos ? 0 : dot + 1); // ... -> "mma." -> "" (everything)
-                    }
-                    if (!best) throw std::runtime_error("engine: no conv variant matching '" + cfg.variant_prefix +
-                                                        "' supports " + op.name);
-                    chosen[bi][i] = best;
-                    oc.variant = best->name;
-                    oc.us = best_us;
                     choices.push_back(oc);
                 }
             }
-            if (cache_dirty && !cfg.tune_cache.empty()) {
+            if (dirty && !cfg.tune_cache.empty()) {
                 std::ofstream f(cfg.tune_cache);
                 for (const auto &[k, v] : cache) f << k << ' ' << v.first << ' ' << v.second << '\n';
             }
         }
 
+        // Tensors some bucket's plan reads or writes in memory.
+        std::vector<bool> needed_tensors() const {
+            std::vector<bool> need(model.tensors.size(), false);
+            auto mark_op = [&](std::size_t i) {
+                const auto &op = model.ops[i];
+                need[op.in] = true;
+                if (op.res != kNoTensor) need[op.res] = true;
+                if (i != pool_op) need[op.out] = true;
+            };
+            for (const auto &plan_steps : steps)
+                for (const auto &st : plan_steps) {
+                    if (st.kind == Step::Kind::block) {
+                        const auto &g = groups[st.group];
+                        need[model.ops[g.a].in] = true;
+                        if (g.b != pool_op) need[model.ops[g.b].out] = true;
+                    } else if (st.kind == Step::Kind::linear_from_pool) {
+                        need[model.ops[st.op].out] = true;
+                    } else {
+                        mark_op(st.op);
+                    }
+                }
+            need[model.input] = need[model.output] = true;
+            return need;
+        }
+
+        void allocate_arena() {
+            const auto maxb = static_cast<std::size_t>(buckets.back());
+            plan = plan_memory(model, maxb, sizeof(__half), cfg.reuse_memory, &materialized);
+            arena = DeviceBuffer<std::byte>(plan.arena_bytes);
+            if (arena.bytes()) CURF_CUDA_CHECK(cudaMemset(arena.get(), 0, arena.bytes()));
+        }
+
         void capture_graphs() {
             graphs.assign(buckets.size(), nullptr);
             for (std::size_t bi = 0; bi < buckets.size(); ++bi) {
-                // Warm up outside capture (module loading, static launch config).
-                run_eager(static_cast<int>(bi), buckets[bi], stream);
+                // Warm up outside capture (module loading, smem attributes, static launch config).
+                run_eager(bi, buckets[bi], stream);
                 CURF_CUDA_CHECK(cudaStreamSynchronize(stream));
                 if (!cfg.cuda_graphs) continue;
                 cudaGraph_t g = nullptr;
                 CURF_CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
-                run_eager(static_cast<int>(bi), buckets[bi], stream);
+                run_eager(bi, buckets[bi], stream);
                 CURF_CUDA_CHECK(cudaStreamEndCapture(stream, &g));
                 CURF_CUDA_CHECK(cudaGraphInstantiate(&graphs[bi], g, 0));
                 CURF_CUDA_CHECK(cudaGraphDestroy(g));
             }
+        }
+
+        std::size_t bucket_index(int batch) const {
+            if (batch <= 0 || batch > buckets.back())
+                throw std::out_of_range("engine: batch " + std::to_string(batch) + " outside 1.." +
+                                        std::to_string(buckets.back()));
+            return static_cast<std::size_t>(std::lower_bound(buckets.begin(), buckets.end(), batch) - buckets.begin());
         }
     };
 
@@ -196,20 +473,28 @@ namespace curf::engine {
         CURF_CUDA_CHECK(cudaGetDevice(&dev));
         CURF_CUDA_CHECK(cudaGetDeviceProperties(&prop, dev));
         m.gpu = prop.name;
-        std::replace(m.gpu.begin(), m.gpu.end(), ' ', '_');
 
-        const auto maxb = static_cast<std::size_t>(m.buckets.back());
-        m.plan = plan_memory(m.model, maxb, sizeof(__half), m.cfg.reuse_memory);
-        m.arena = DeviceBuffer<std::byte>(m.plan.arena_bytes);
         m.weights = DeviceBuffer<std::byte>(m.model.blob.size());
         CURF_CUDA_CHECK(cudaMemcpy(m.weights.get(), m.model.blob.data(), m.model.blob.size(), cudaMemcpyHostToDevice));
+
+        // Fusion candidates only depend on shapes, so they are found before activations exist (null pointers).
+        m.materialized.assign(m.model.tensors.size(), true);
+        m.find_fusions();
+
+        const auto maxb = static_cast<std::size_t>(m.buckets.back());
         m.input = DeviceBuffer<float>(maxb * m.model.tensors[m.model.input].elems_per_window());
         m.logits = DeviceBuffer<float>(maxb * m.model.tensors[m.model.output].elems_per_window());
+        if (const auto pc = m.pool_channels()) m.pool = DeviceBuffer<float>(maxb * pc);
         CURF_CUDA_CHECK(cudaMemset(m.input.get(), 0, m.input.bytes()));
-        CURF_CUDA_CHECK(cudaMemset(m.arena.get(), 0, m.arena.bytes()));
         CURF_CUDA_CHECK(cudaStreamCreateWithFlags(&m.stream, cudaStreamNonBlocking));
 
+        // Tune with everything a plan might need in memory (pooled tensor excluded), decide fusion per bucket,
+        // then re-plan the arena for what the chosen plans actually use.
+        if (m.pool_op != kNone) m.materialized[m.model.ops[m.pool_op].out] = false;
+        m.allocate_arena();
         m.select_kernels();
+        m.materialized = m.needed_tensors();
+        m.allocate_arena();
         m.capture_graphs();
     }
 
@@ -227,36 +512,32 @@ namespace curf::engine {
     const float *Engine::logits() const { return impl_->logits.get(); }
     const MemoryPlan &Engine::memory_plan() const { return impl_->plan; }
     const std::vector<OpChoice> &Engine::choices() const { return impl_->choices; }
+    const std::vector<FusionDecision> &Engine::fusion_decisions() const { return impl_->decisions; }
+    bool Engine::materialized(std::uint32_t t) const { return impl_->materialized.at(t); }
+    std::size_t Engine::steps(int batch) const { return impl_->steps[impl_->bucket_index(batch)].size(); }
 
     std::size_t Engine::device_bytes() const {
-        return impl_->arena.bytes() + impl_->weights.bytes() + impl_->input.bytes() + impl_->logits.bytes();
+        return impl_->arena.bytes() + impl_->weights.bytes() + impl_->input.bytes() + impl_->logits.bytes() +
+               impl_->pool.bytes();
     }
 
-    int Engine::bucket_for(int batch) const {
-        const auto &b = impl_->buckets;
-        if (batch <= 0 || batch > b.back())
-            throw std::out_of_range("engine: batch " + std::to_string(batch) + " outside 1.." + std::to_string(b.back()));
-        return *std::lower_bound(b.begin(), b.end(), batch);
-    }
+    int Engine::bucket_for(int batch) const { return impl_->buckets[impl_->bucket_index(batch)]; }
 
     void Engine::run(int batch, cudaStream_t stream) {
-        const int bucket = bucket_for(batch);
-        const auto bi = static_cast<std::size_t>(
-            std::lower_bound(impl_->buckets.begin(), impl_->buckets.end(), bucket) - impl_->buckets.begin());
+        const auto bi = impl_->bucket_index(batch);
         if (impl_->cfg.cuda_graphs) CURF_CUDA_CHECK(cudaGraphLaunch(impl_->graphs[bi], stream));
-        else impl_->run_eager(static_cast<int>(bi), bucket, stream);
+        else impl_->run_eager(bi, impl_->buckets[bi], stream);
     }
 
     void Engine::run_eager(int batch, cudaStream_t stream) {
-        const int bucket = bucket_for(batch);
-        const auto bi = static_cast<std::size_t>(
-            std::lower_bound(impl_->buckets.begin(), impl_->buckets.end(), bucket) - impl_->buckets.begin());
-        impl_->run_eager(static_cast<int>(bi), bucket, stream);
+        const auto bi = impl_->bucket_index(batch);
+        impl_->run_eager(bi, impl_->buckets[bi], stream);
     }
 
     std::vector<float> Engine::read_tensor(std::uint32_t t, int batch) const {
         const auto &m = *impl_;
         if (t >= m.model.tensors.size()) throw std::out_of_range("engine: tensor index");
+        if (!m.materialized[t]) throw std::logic_error("engine: tensor " + std::to_string(t) + " only exists inside a fused kernel");
         if (batch <= 0 || batch > max_batch()) throw std::out_of_range("engine: batch");
         const std::size_t n = static_cast<std::size_t>(batch) * m.model.tensors[t].elems_per_window();
         std::vector<float> out(n);

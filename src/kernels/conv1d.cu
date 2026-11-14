@@ -3,6 +3,7 @@
 #include "curf/cuda/memory.hpp"
 #include "curf/engine/kernels.hpp"
 #include "conv1d_internal.hpp"
+#include "mma_common.cuh"
 
 #include <mma.h>
 
@@ -244,6 +245,78 @@ namespace curf::engine {
             }
         }
 
+        // ------------------------------------------------------------------ 7. direct conv (small cin)
+        // For the stem (cin = 2, k = 7, fp32 input): K = 14 would waste 56% of a 32-wide MMA k-tile and the
+        // layer is memory bound anyway (reads 8 KB, writes 32 KB per window). One block = TL output positions
+        // of one sample, all channels; the input segment and the transposed weights sit in shared memory.
+        // Each thread computes 4 positions x 8 channels, so one pair of float4 weight loads feeds 32 FMAs
+        // (a first version did 1 x 8 and was shared-memory bound: L1 94%, slower than the WMMA path).
+        // Positions are interleaved (pos = pg + q * TL/4) so a warp's 16-byte stores cover whole rows.
+        constexpr int kDirectTL = 256, kDirectQ = 4;
+
+        template <class TIn>
+        __global__ void __launch_bounds__(256) conv_direct(ConvParams p) {
+            constexpr int TL = kDirectTL, Q = kDirectQ, PG = TL / Q;
+            extern __shared__ float sm[];
+            const int K = p.k * p.cin;
+            const int rows = (TL - 1) * p.stride + p.k;
+            float *xs = sm;                              // [rows][cin]
+            float *ws = sm + ((rows * p.cin + 3) & ~3);  // [K][cout], 16-byte aligned for float4 reads
+            const auto *x = static_cast<const TIn *>(p.x);
+            const int b = blockIdx.y, l0 = blockIdx.x * TL;
+            const int p0 = l0 * p.stride - p.pad;
+            for (int i = threadIdx.x; i < rows * p.cin; i += blockDim.x) {
+                const int r = i / p.cin, ci = i - r * p.cin, pos = p0 + r;
+                xs[i] = pos >= 0 && pos < p.lin ? to_f(x[(static_cast<long long>(b) * p.lin + pos) * p.cin + ci]) : 0.f;
+            }
+            for (int i = threadIdx.x; i < K * p.cout; i += blockDim.x) {
+                const int kk = i / p.cout, n = i - kk * p.cout;
+                ws[i] = __half2float(p.w[static_cast<long long>(n) * p.kpad + kk]);
+            }
+            __syncthreads();
+            const int groups = p.cout / 8;
+            const int xstep = PG * p.stride * p.cin; // xs offset between the thread's positions
+            for (int item = threadIdx.x; item < PG * groups; item += blockDim.x) {
+                const int pg = item / groups, n = (item - pg * groups) * 8;
+                float acc[Q][8];
+#pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    const float bv = p.bias[n + e];
+#pragma unroll
+                    for (int q = 0; q < Q; ++q) acc[q][e] = bv;
+                }
+                const float *xr = xs + pg * p.stride * p.cin;
+                for (int kk = 0; kk < K; ++kk) {
+                    const float4 w0 = *reinterpret_cast<const float4 *>(ws + kk * p.cout + n);
+                    const float4 w1 = *reinterpret_cast<const float4 *>(ws + kk * p.cout + n + 4);
+#pragma unroll
+                    for (int q = 0; q < Q; ++q) {
+                        const float xv = xr[q * xstep + kk]; // row (pos*stride + t), channel ci: contiguous in kk
+                        acc[q][0] += xv * w0.x; acc[q][1] += xv * w0.y; acc[q][2] += xv * w0.z; acc[q][3] += xv * w0.w;
+                        acc[q][4] += xv * w1.x; acc[q][5] += xv * w1.y; acc[q][6] += xv * w1.z; acc[q][7] += xv * w1.w;
+                    }
+                }
+#pragma unroll
+                for (int q = 0; q < Q; ++q) {
+                    const int l = l0 + pg + q * PG;
+                    if (l >= p.lout) continue;
+                    const long long m = static_cast<long long>(b) * p.lout + l;
+                    __half2 o[4];
+#pragma unroll
+                    for (int e = 0; e < 4; ++e) o[e] = __floats2half2_rn(acc[q][2 * e], acc[q][2 * e + 1]);
+                    uint4 v = *reinterpret_cast<uint4 *>(o);
+                    if (p.res) v = detail::add_relu8(v, *reinterpret_cast<const uint4 *>(p.res + m * p.cout + n), p.relu);
+                    else if (p.relu) v = detail::add_relu8(v, make_uint4(0, 0, 0, 0), true);
+                    *reinterpret_cast<uint4 *>(p.y + m * p.cout + n) = v;
+                }
+            }
+        }
+
+        std::size_t direct_smem(const ConvParams &p) {
+            return (static_cast<std::size_t>(kDirectTL - 1) * p.stride + p.k) * p.cin * sizeof(float) + 16 +
+                   static_cast<std::size_t>(p.k) * p.cin * p.cout * sizeof(float);
+        }
+
         // ------------------------------------------------------------------ separate epilogue
         __global__ void conv_epilogue_kernel(ConvParams p) {
             const long long total2 = static_cast<long long>(p.batch) * p.lout * p.cout / 2;
@@ -290,6 +363,16 @@ namespace curf::engine {
             if (p.x_f32) conv_smem<float, Fused><<<grid, 256, 0, s>>>(p);
             else conv_smem<__half, Fused><<<grid, 256, 0, s>>>(p);
         }
+        void launch_direct(const ConvParams &p, cudaStream_t s) {
+            const dim3 grid(static_cast<unsigned>((p.lout + kDirectTL - 1) / kDirectTL), static_cast<unsigned>(p.batch));
+            if (p.x_f32) conv_direct<float><<<grid, 256, direct_smem(p), s>>>(p);
+            else conv_direct<__half><<<grid, 256, direct_smem(p), s>>>(p);
+        }
+        // Direct conv only pays off for a handful of input channels.
+        bool sup_direct(const ConvParams &p) {
+            return p.cin <= 8 && p.cout % 8 == 0 && direct_smem(p) <= 48 * 1024;
+        }
+
         template <int BM, int BN, bool Fused, class AccT> void launch_wmma(const ConvParams &p, cudaStream_t s) {
             const dim3 grid(static_cast<unsigned>((p.m() + BM - 1) / BM), static_cast<unsigned>(p.cout / BN));
             constexpr int nt = BM / 32 * BN / 32 * 32;
@@ -319,6 +402,7 @@ namespace curf::engine {
             add_wmma<64, 128>(v);
             add_wmma<128, 128>(v);
             detail::add_mma_variants(v);
+            v.push_back({"direct", true, &sup_direct, &launch_direct});
             return v;
         }
 
@@ -333,6 +417,19 @@ namespace curf::engine {
                 for (int l = 0; l < length; ++l) s += __half2float(xb[l * cin + c]);
                 mean[c] = s / static_cast<float>(length);
             }
+            __syncthreads();
+            for (int n = threadIdx.x; n < cout; n += blockDim.x) {
+                float s = bias[n];
+                for (int c = 0; c < cin; ++c) s += w[n * cin + c] * mean[c];
+                y[b * cout + n] = s;
+            }
+        }
+
+        __global__ void linear_from_pool_kernel(const float *pool, const float *w, const float *bias, float *y, int cin,
+                                                int cout, float inv_len) {
+            extern __shared__ float mean[];
+            const int b = blockIdx.x;
+            for (int c = threadIdx.x; c < cin; c += blockDim.x) mean[c] = pool[b * cin + c] * inv_len;
             __syncthreads();
             for (int n = threadIdx.x; n < cout; n += blockDim.x) {
                 float s = bias[n];
@@ -374,6 +471,13 @@ namespace curf::engine {
                            int cout, cudaStream_t s) {
         gap_linear_kernel<<<batch, 128, static_cast<std::size_t>(cin) * sizeof(float), s>>>(x, w, bias, y, length, cin,
                                                                                           cout);
+        CURF_CUDA_CHECK(cudaGetLastError());
+    }
+
+    void launch_linear_from_pool(const float *pool, const float *w, const float *bias, float *y, int batch, int cin,
+                                 int cout, float inv_len, cudaStream_t s) {
+        linear_from_pool_kernel<<<batch, 128, static_cast<std::size_t>(cin) * sizeof(float), s>>>(pool, w, bias, y, cin,
+                                                                                                cout, inv_len);
         CURF_CUDA_CHECK(cudaGetLastError());
     }
 

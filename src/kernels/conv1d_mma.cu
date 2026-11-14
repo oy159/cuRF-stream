@@ -14,6 +14,7 @@
 // cout % BN == 0, kpad % 32 == 0. The fp32-input stem (cin = 2) stays on the WMMA path.
 
 #include "conv1d_internal.hpp"
+#include "mma_common.cuh"
 
 #include "curf/cuda/memory.hpp"
 
@@ -23,48 +24,6 @@
 namespace curf::engine::detail {
 
     namespace {
-
-        __device__ __forceinline__ unsigned smem_addr(const void *p) {
-            return static_cast<unsigned>(__cvta_generic_to_shared(p));
-        }
-
-        // 16-byte async copy; src_bytes = 0 zero-fills the destination (padding / out of range).
-        __device__ __forceinline__ void cp_async16(unsigned dst, const void *src, bool valid) {
-            asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(dst), "l"(src), "r"(valid ? 16 : 0));
-        }
-        // Same, but allocating in L1: the k taps of a conv re-read the same input rows, so activations
-        // should stay in L1 (.cg sends every tap back to L2 - measured L2 throughput 65-86%).
-        __device__ __forceinline__ void cp_async16_ca(unsigned dst, const void *src, bool valid) {
-            asm volatile("cp.async.ca.shared.global [%0], [%1], 16, %2;\n" ::"r"(dst), "l"(src), "r"(valid ? 16 : 0));
-        }
-        __device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::); }
-        template <int N> __device__ __forceinline__ void cp_async_wait() {
-            asm volatile("cp.async.wait_group %0;\n" ::"n"(N));
-        }
-
-        __device__ __forceinline__ void ldmatrix_x4(unsigned (&r)[4], unsigned addr) {
-            asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-                         : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
-                         : "r"(addr));
-        }
-
-        __device__ __forceinline__ void mma(float (&c)[4], const unsigned (&a)[4], const unsigned (&b)[2]) {
-            asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
-                         "{%0,%1,%2,%3};\n"
-                         : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-                         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
-        }
-        __device__ __forceinline__ void mma(unsigned (&c)[2], const unsigned (&a)[4], const unsigned (&b)[2]) {
-            asm volatile("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"
-                         : "+r"(c[0]), "+r"(c[1])
-                         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
-        }
-
-        // Two accumulator values of one row (columns 2t, 2t+1) as floats.
-        __device__ __forceinline__ float2 acc_pair(const float (&c)[4], int h) { return make_float2(c[2 * h], c[2 * h + 1]); }
-        __device__ __forceinline__ float2 acc_pair(const unsigned (&c)[2], int h) {
-            return __half22float2(*reinterpret_cast<const __half2 *>(&c[h]));
-        }
 
         template <int BM, int BN, int WM, int STAGES>
         struct MmaShape {
@@ -216,24 +175,13 @@ namespace curf::engine::detail {
                 const long long m = m0 + r;
                 if (m >= M) continue;
                 uint4 v = *reinterpret_cast<const uint4 *>(Cs + r * S::LDC + col);
-                if (p.res) {
-                    const uint4 rv = *reinterpret_cast<const uint4 *>(p.res + m * p.cout + n0 + col);
-                    auto *vh = reinterpret_cast<__half2 *>(&v);
-                    const auto *rh = reinterpret_cast<const __half2 *>(&rv);
-#pragma unroll
-                    for (int e = 0; e < 4; ++e) {
-                        float2 f = __half22float2(vh[e]);
-                        const float2 g = __half22float2(rh[e]);
-                        f.x += g.x;
-                        f.y += g.y;
-                        if (p.relu) {
-                            f.x = fmaxf(f.x, 0.f);
-                            f.y = fmaxf(f.y, 0.f);
-                        }
-                        vh[e] = __floats2half2_rn(f.x, f.y);
-                    }
-                }
-                *reinterpret_cast<uint4 *>(p.y + m * p.cout + n0 + col) = v;
+                if (p.res) v = add_relu8(v, *reinterpret_cast<const uint4 *>(p.res + m * p.cout + n0 + col), p.relu);
+                if (p.pool) *reinterpret_cast<uint4 *>(Cs + r * S::LDC + col) = v; // finished values, pooled below
+                else *reinterpret_cast<uint4 *>(p.y + m * p.cout + n0 + col) = v;
+            }
+            if (p.pool) { // fused global average pool: this conv's output is never written
+                __syncthreads();
+                pool_tile<BM, BN, NT>(Cs, S::LDC, m0, M, p.lout, p.cout, n0, p.pool, tid);
             }
         }
 
@@ -258,8 +206,8 @@ namespace curf::engine::detail {
         template <int BM, int BN, int WM, int STAGES> void add(std::vector<ConvVariant> &v) {
             const std::string tile = std::to_string(BM) + "x" + std::to_string(BN) + ".w" + std::to_string(WM) + ".s" +
                                      std::to_string(STAGES);
-            v.push_back({"mma.f32." + tile, true, &sup_mma<BN>, &launch_mma<BM, BN, WM, STAGES, false>});
-            v.push_back({"mma.f16." + tile, true, &sup_mma<BN>, &launch_mma<BM, BN, WM, STAGES, true>});
+            v.push_back({"mma.f32." + tile, true, &sup_mma<BN>, &launch_mma<BM, BN, WM, STAGES, false>, true});
+            v.push_back({"mma.f16." + tile, true, &sup_mma<BN>, &launch_mma<BM, BN, WM, STAGES, true>, true});
         }
 
     } // namespace

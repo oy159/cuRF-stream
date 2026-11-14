@@ -64,7 +64,9 @@ namespace curf::engine {
     };
 
     // bytes_per_elem: storage size of an activation element (2 for fp16). reuse=false gives every
-    // tensor its own region (for layer-by-layer debugging).
-    MemoryPlan plan_memory(const Model &model, std::size_t max_batch, std::size_t bytes_per_elem, bool reuse);
+    // tensor its own region (for layer-by-layer debugging). materialized (optional, per tensor): tensors
+    // marked false live only inside fused kernels and get no memory.
+    MemoryPlan plan_memory(const Model &model, std::size_t max_batch, std::size_t bytes_per_elem, bool reuse,
+                           const std::vector<bool> *materialized = nullptr);
 
 } // namespace curf::engine

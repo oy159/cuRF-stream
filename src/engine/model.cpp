@@ -145,7 +145,8 @@ namespace curf::engine {
         return g;
     }
 
-    MemoryPlan plan_memory(const Model &m, std::size_t max_batch, std::size_t bytes_per_elem, bool reuse) {
+    MemoryPlan plan_memory(const Model &m, std::size_t max_batch, std::size_t bytes_per_elem, bool reuse,
+                           const std::vector<bool> *materialized) {
         constexpr std::size_t kAlign = 256;
         const auto nt = m.tensors.size();
         MemoryPlan plan;
@@ -163,6 +164,7 @@ namespace curf::engine {
         std::vector<Item> items;
         for (std::size_t t = 0; t < nt; ++t) {
             if (t == m.input || t == m.output) continue;
+            if (materialized && !(*materialized)[t]) continue;
             const auto b = (m.tensors[t].elems_per_window() * max_batch * bytes_per_elem + kAlign - 1) / kAlign * kAlign;
             items.push_back({t, b});
             plan.no_reuse_bytes += b;

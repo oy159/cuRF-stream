@@ -3,8 +3,10 @@
 //   curf_bench_engine [--model DIR] [--steps naive,smem,wmma.f32.unfused,wmma.f32.fused,wmma.f16.fused,all]
 //                     [--buckets 1,8,32,128,512] [--ms 400] [--no-graph] [--ops] [--profile]
 //
-// Each step builds an engine whose conv ops are autotuned among variants with that name prefix
-// ("all" = whole registry), then replays the bucket's CUDA Graph for --ms milliseconds per bucket.
+// A step is PREFIX[+gap][+stem][+block]: conv ops are autotuned among variants with that name prefix
+// ("all" = whole registry); +gap fuses global pooling into the last layer, +stem allows the direct stem
+// kernel, +block fuses each BasicBlock into one kernel. The bucket's CUDA Graph is replayed for --ms
+// milliseconds per bucket.
 // One JSON line per (step, bucket); with --ops also one per (step, op) at the largest bucket.
 
 #include "curf/cuda/memory.hpp"
@@ -12,6 +14,7 @@
 
 #include <cuda_profiler_api.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -28,6 +31,13 @@ namespace {
         std::vector<std::string> out;
         std::stringstream ss(s);
         for (std::string x; std::getline(ss, x, ',');) out.push_back(x);
+        return out;
+    }
+
+    std::vector<std::string> split_plus(const std::string &s) {
+        std::vector<std::string> out;
+        std::stringstream ss(s);
+        for (std::string x; std::getline(ss, x, '+');) out.push_back(x);
         return out;
     }
 
@@ -64,7 +74,9 @@ namespace {
 
 int main(int argc, char **argv) {
     std::string dir = CURF_MODEL_DIR;
-    std::vector<std::string> steps{"naive", "smem", "wmma.f32.unfused", "wmma.f32.fused", "wmma.f16.fused", "mma.f32", "mma.f16", "all"};
+    std::vector<std::string> steps{"naive",       "smem",           "wmma.f32.unfused",     "wmma.f32.fused",
+                                   "wmma.f16.fused", "mma.f32",     "mma.f16",              "mma.f16+gap",
+                                   "mma.f16+gap+stem", "mma.f16+gap+stem+block", "all+gap+stem+block"};
     std::vector<int> buckets{1, 8, 32, 128, 512};
     double ms = 400;
     bool graph = true, ops = false, profile = false;
@@ -91,7 +103,12 @@ int main(int argc, char **argv) {
     for (const auto &step : steps) {
         EngineConfig cfg;
         cfg.buckets = buckets;
-        cfg.variant_prefix = step == "all" ? "" : step;
+        const auto tok = split_plus(step);
+        cfg.variant_prefix = tok[0] == "all" ? "" : tok[0];
+        auto has = [&](const char *f) { return std::find(tok.begin() + 1, tok.end(), f) != tok.end(); };
+        cfg.fuse_gap = has("gap");
+        cfg.fuse_blocks = has("block");
+        if (!has("stem")) cfg.exclude_prefixes = {"direct"};
         cfg.cuda_graphs = graph;
         cfg.tune_iters = 20;
         Engine e(model, cfg);
@@ -107,11 +124,16 @@ int main(int argc, char **argv) {
         for (int b : buckets) {
             const auto r = measure(e, b, ms, graph, s);
             std::printf("{\"step\":\"%s\",\"batch\":%d,\"graph\":%s,\"us_per_batch\":%.2f,\"windows_per_s\":%.0f,"
-                        "\"tflops\":%.3f,\"arena_MiB\":%.2f}\n",
+                        "\"tflops\":%.3f,\"arena_MiB\":%.2f,\"kernels\":%zu}\n",
                         step.c_str(), b, graph ? "true" : "false", r.us_per_batch, r.windows_per_s,
-                        r.windows_per_s * flops / 1e12, static_cast<double>(e.memory_plan().arena_bytes) / 1048576.0);
+                        r.windows_per_s * flops / 1e12, static_cast<double>(e.memory_plan().arena_bytes) / 1048576.0, e.steps());
         }
         if (ops) {
+            for (const auto &d : e.fusion_decisions())
+                std::printf("  {\"step\":\"%s\",\"batch\":%d,\"fusion\":\"%s\",\"variant\":\"%s\",\"fused_us\":%.2f,"
+                            "\"unfused_us\":%.2f,\"fused\":%s}\n",
+                            step.c_str(), d.bucket, d.block.c_str(), d.fused_variant.c_str(), d.fused_us, d.unfused_us,
+                            d.fused ? "true" : "false");
             for (const auto &c : e.choices()) {
                 if (c.bucket != buckets.back()) continue;
                 std::printf("  {\"step\":\"%s\",\"batch\":%d,\"op\":\"%s\",\"variant\":\"%s\",\"us\":%.2f,\"tflops\":%.3f}\n",

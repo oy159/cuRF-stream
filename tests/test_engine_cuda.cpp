@@ -63,6 +63,8 @@ TEST_CASE("every conv variant matches the fp32 golden layer by layer", "[cuda][e
         cfg.autotune = false;
         cfg.cuda_graphs = false;
         cfg.reuse_memory = false;
+        cfg.fuse_blocks = false; // every tensor materialised, so every layer can be compared
+        cfg.fuse_gap = false;
         Engine e(d->model, cfg);
         upload(e, d->golden, 0, n);
         e.run(n, nullptr);
@@ -80,6 +82,48 @@ TEST_CASE("every conv variant matches the fp32 golden layer by layer", "[cuda][e
             CHECK(err < tol);
         }
         std::printf("  %-24s worst layer rel err %.2e\n", v.name.c_str(), worst);
+    }
+}
+
+TEST_CASE("fused BasicBlocks and fused global pooling match the golden", "[cuda][engine][fusion]") {
+    const auto *d = data();
+    if (!d) SKIP("no converted model in " + kDir.string());
+    const auto &g = d->golden;
+    const int n = static_cast<int>(g.n_layer), c = static_cast<int>(g.classes);
+    for (const std::string block : {"block.f16.l128", "block.f16.l64", "block.f32.l128", "block.f32.l64"}) {
+        for (const bool gap : {false, true}) {
+            EngineConfig cfg;
+            cfg.buckets = {n};
+            cfg.variant_prefix = "mma.f16";
+            cfg.block_prefix = block;
+            cfg.fuse_gap = gap;
+            cfg.autotune = false;
+            cfg.cuda_graphs = false;
+            cfg.reuse_memory = false;
+            Engine e(d->model, cfg);
+            // stem + 4 BasicBlocks + head
+            CHECK(e.steps() == 6);
+            upload(e, g, 0, n);
+            e.run(n, nullptr);
+            CURF_CUDA_CHECK(cudaDeviceSynchronize());
+            const double tol = 3e-2;
+            int checked = 0;
+            for (std::uint32_t t = 0; t < d->model.tensors.size(); ++t) {
+                if (t == d->model.input || !e.materialized(t)) continue;
+                const auto got = e.read_tensor(t, n);
+                const double err = rel_err(got, g.activations[t].data(), got.size());
+                INFO(block << (gap ? "+gap" : "") << " tensor " << t << " (" << d->model.tensors[t].name << ") rel err " << err);
+                CHECK(err < tol);
+                ++checked;
+            }
+            CHECK(checked == (gap ? 5 : 6)); // stem out, 4 block outputs (last one pooled when gap), logits
+            const auto logits = e.read_tensor(d->model.output, n);
+            int agree = 0;
+            for (int i = 0; i < n; ++i) agree += argmax(&logits[i * c], c) == argmax(&g.logits[i * c], c);
+            std::printf("  %s%s: %zu steps, logits rel err %.2e, top-1 %d/%d\n", block.c_str(), gap ? "+gap" : "",
+                        e.steps(), rel_err(logits, g.activations[d->model.output].data(), logits.size()), agree, n);
+            CHECK(agree >= n - 1);
+        }
     }
 }
 
