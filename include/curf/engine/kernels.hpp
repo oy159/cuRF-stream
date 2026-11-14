@@ -87,5 +87,6 @@ namespace curf::engine {
 
     // Utility for tests / debugging: fp16 -> fp32 copy on the device.
     void launch_half_to_float(const __half *src, float *dst, std::size_t n, cudaStream_t s);
+    void launch_float_to_half(const float *src, __half *dst, std::size_t n, cudaStream_t s);
 
 } // namespace curf::engine

@@ -10,4 +10,8 @@ namespace curf::engine::detail {
     // Ladder step 5: cp.async multi-stage pipeline + ldmatrix + mma.sync (conv1d_mma.cu).
     void add_mma_variants(std::vector<ConvVariant> &v);
 
+    // Library baselines registered as ordinary conv variants (only when built with them).
+    void add_cudnn_variants(std::vector<ConvVariant> &v);   // baseline_cudnn.cpp, CURF_HAVE_CUDNN
+    void add_cutlass_variants(std::vector<ConvVariant> &v); // baseline_cutlass.cu, CURF_HAVE_CUTLASS
+
 } // namespace curf::engine::detail

@@ -3,9 +3,10 @@
 //   curf_bench_engine [--model DIR] [--steps naive,smem,wmma.f32.unfused,wmma.f32.fused,wmma.f16.fused,all]
 //                     [--buckets 1,8,32,128,512] [--ms 400] [--no-graph] [--ops] [--profile]
 //
-// A step is PREFIX[+gap][+stem][+block]: conv ops are autotuned among variants with that name prefix
+// A step is PREFIX[+gap][+stem][+block][+lib]: conv ops are autotuned among variants with that name prefix
 // ("all" = whole registry); +gap fuses global pooling into the last layer, +stem allows the direct stem
-// kernel, +block fuses each BasicBlock into one kernel. The bucket's CUDA Graph is replayed for --ms
+// kernel, +block fuses each BasicBlock into one kernel, +lib lets cuDNN / CUTLASS variants compete too
+// (a "cudnn" or "cutlass" step uses that library wherever it supports the layer). The bucket's CUDA Graph is replayed for --ms
 // milliseconds per bucket.
 // One JSON line per (step, bucket); with --ops also one per (step, op) at the largest bucket.
 
@@ -76,7 +77,8 @@ int main(int argc, char **argv) {
     std::string dir = CURF_MODEL_DIR;
     std::vector<std::string> steps{"naive",       "smem",           "wmma.f32.unfused",     "wmma.f32.fused",
                                    "wmma.f16.fused", "mma.f32",     "mma.f16",              "mma.f16+gap",
-                                   "mma.f16+gap+stem", "mma.f16+gap+stem+block", "all+gap+stem+block"};
+                                   "mma.f16+gap+stem", "mma.f16+gap+stem+block", "all+gap+stem+block",
+                                   "cudnn",       "cutlass",        "all+gap+stem+block+lib"};
     std::vector<int> buckets{1, 8, 32, 128, 512};
     double ms = 400;
     bool graph = true, ops = false, profile = false;
@@ -108,7 +110,12 @@ int main(int argc, char **argv) {
         auto has = [&](const char *f) { return std::find(tok.begin() + 1, tok.end(), f) != tok.end(); };
         cfg.fuse_gap = has("gap");
         cfg.fuse_blocks = has("block");
-        if (!has("stem")) cfg.exclude_prefixes = {"direct"};
+        // Library kernels (cudnn, cutlass.*) only compete when the step is a library step or says +lib, so the
+        // engine's own numbers never quietly include a library kernel.
+        if (!has("stem")) cfg.exclude_prefixes.push_back("direct");
+        if (!has("lib"))
+            for (const char *lib : {"cudnn", "cutlass"})
+                if (tok[0].rfind(lib, 0) != 0) cfg.exclude_prefixes.push_back(lib);
         cfg.cuda_graphs = graph;
         cfg.tune_iters = 20;
         Engine e(model, cfg);

@@ -403,6 +403,12 @@ namespace curf::engine {
             add_wmma<128, 128>(v);
             detail::add_mma_variants(v);
             v.push_back({"direct", true, &sup_direct, &launch_direct});
+#ifdef CURF_HAVE_CUDNN
+            detail::add_cudnn_variants(v);
+#endif
+#ifdef CURF_HAVE_CUTLASS
+            detail::add_cutlass_variants(v);
+#endif
             return v;
         }
 
@@ -436,6 +442,12 @@ namespace curf::engine {
                 for (int c = 0; c < cin; ++c) s += w[n * cin + c] * mean[c];
                 y[b * cout + n] = s;
             }
+        }
+
+        __global__ void float_to_half_kernel(const float *src, __half *dst, std::size_t n) {
+            for (std::size_t i = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x; i < n;
+                 i += static_cast<std::size_t>(gridDim.x) * blockDim.x)
+                dst[i] = __float2half(src[i]);
         }
 
         __global__ void half_to_float_kernel(const __half *src, float *dst, std::size_t n) {
@@ -478,6 +490,11 @@ namespace curf::engine {
                                  int cout, float inv_len, cudaStream_t s) {
         linear_from_pool_kernel<<<batch, 128, static_cast<std::size_t>(cin) * sizeof(float), s>>>(pool, w, bias, y, cin,
                                                                                                 cout, inv_len);
+        CURF_CUDA_CHECK(cudaGetLastError());
+    }
+
+    void launch_float_to_half(const float *src, __half *dst, std::size_t n, cudaStream_t s) {
+        float_to_half_kernel<<<static_cast<unsigned>(std::min<std::size_t>((n + 255) / 256, 1024)), 256, 0, s>>>(src, dst, n);
         CURF_CUDA_CHECK(cudaGetLastError());
     }
 
