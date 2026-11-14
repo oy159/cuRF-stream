@@ -51,6 +51,7 @@ namespace curf::engine {
             static constexpr std::size_t SMEM = static_cast<std::size_t>(REGION + 2 * COUT * LDW) * sizeof(__half);
             static_assert(CIN % 32 == 0 && COUT % 32 == 0 && BL % 32 == 0, "tile shapes");
             static_assert(NC <= NW, "at most one halo job per warp");
+            static_assert(2 * COUT * LDW * 2 >= NW * COUT * 4, "pool scratch must fit in the weight ring");
         };
 
         template <int CIN, int COUT, int S, int BL, bool SC, bool F16Acc>
@@ -256,7 +257,9 @@ namespace curf::engine {
             }
             if (p.pool) {
                 __syncthreads();
-                pool_tile<BL, COUT, NT>(R, LDY, m_base + l0, m_base + p.lout, p.lout, COUT, 0, p.pool, tid);
+                // the weight ring is idle now: reuse it as the pool scratch
+                pool_tile<BL, COUT, NT>(R, LDY, m_base + l0, m_base + p.lout, p.lout, COUT, 0, p.pool, tid,
+                                        reinterpret_cast<float *>(Ws));
             }
         }
 

@@ -50,9 +50,12 @@ namespace curf::engine::detail {
     // (fp32, zeroed beforehand). Only shared-memory reads in the loop: the residual must have been added
     // by a coalesced pass before (a first version read it here, 2 bytes per thread per row from global
     // memory, and was slower than not fusing at all).
+    // part: shared scratch of (NT / 32) * COLS floats. It is carved out of the caller's (idle) dynamic shared
+    // memory: a static __shared__ array here cost every kernel 2 KB even when not pooling, which pushed the
+    // 48 KB 128x128 3-stage tile from two CTAs per SM to one.
     template <int ROWS, int COLS, int NT>
     __device__ __forceinline__ void pool_tile(const __half *Cs, int ldc, long long m0, long long M, int lout, int ld,
-                                              int n0, float *pool, int tid) {
+                                              int n0, float *pool, int tid, float *part) {
         static_assert(NT % COLS == 0 && ROWS % (NT / COLS) == 0, "pool_tile thread mapping");
         // Fast path (the usual case, lout a multiple of the tile height): the whole tile belongs to one
         // sample. Each thread sums 8 columns over a strided set of rows with 16-byte reads, warps reduce
@@ -62,7 +65,7 @@ namespace curf::engine::detail {
         if (m0 / lout == last / lout) { // uniform across the CTA
             constexpr int CG = COLS / 8, G = NT / CG, NWARP = NT / 32;
             static_assert(NT % CG == 0 && CG <= 32 && 32 % CG == 0, "pool_tile vector mapping");
-            __shared__ float part[NWARP][COLS];
+
             const int c8 = (tid % CG) * 8, nrows = static_cast<int>(last - m0 + 1);
             float acc[8] = {};
             for (int r = tid / CG; r < nrows; r += G) {
@@ -81,13 +84,13 @@ namespace curf::engine::detail {
                 for (int e = 0; e < 8; ++e) acc[e] += __shfl_xor_sync(0xffffffffu, acc[e], off);
             if (tid % 32 < CG)
 #pragma unroll
-                for (int e = 0; e < 8; ++e) part[tid / 32][c8 + e] = acc[e];
+                for (int e = 0; e < 8; ++e) part[(tid / 32) * COLS + c8 + e] = acc[e];
             __syncthreads();
             const long long b = m0 / lout;
             for (int i = tid; i < COLS; i += NT) {
                 float sum = 0.f;
 #pragma unroll
-                for (int w = 0; w < NWARP; ++w) sum += part[w][i];
+                for (int w = 0; w < NWARP; ++w) sum += part[w * COLS + i];
                 atomicAdd(pool + b * ld + n0 + i, sum);
             }
             return;

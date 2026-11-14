@@ -7,7 +7,7 @@
 //     16-byte column of every k-tile, so (batch, position) is computed once and (tap, channel) is
 //     advanced incrementally; no integer division per tile
 //   - ldmatrix.x4 fragment loads from padded rows (80-byte stride, conflict-free) and raw
-//     mma.sync.m16n8k16 with a larger per-warp tile (up to 64x32), so more MMAs per fragment load
+//     mma.sync.m16n8k16 with a larger per-warp tile (up to 64x64), so more MMAs per fragment load
 //   - fused epilogue straight from the accumulator registers (bias + residual + ReLU, half2 stores)
 //
 // Requirements: fp16 input with cin % 8 == 0 (16-byte cp.async chunks never straddle a tap),
@@ -25,23 +25,35 @@ namespace curf::engine::detail {
 
     namespace {
 
-        template <int BM, int BN, int WM, int STAGES>
+        // Shared-memory tile layout of a [rows][32 halves] k-tile, in units of halves.
+        //   padded   (SWZ = false): row stride 40 halves (80 B, conflict-free for ldmatrix, 25% wasted)
+        //   swizzled (SWZ = true):  row stride 32 halves, 16-byte chunk c of row r stored at c ^ ((r >> 1) & 3);
+        //                           any 8 consecutive rows at one logical chunk hit 8 distinct bank groups
+        // Swizzling was added after ncu showed the padded 3-stage 128x128 ring (61 KB) left one CTA per SM
+        // (occupancy 8%), while CUTLASS's swizzled ring (48 KB) fits two.
+        template <bool SWZ, int LDS> __device__ __forceinline__ int sidx(int row, int chunk) {
+            return SWZ ? row * 32 + ((chunk ^ ((row >> 1) & 3)) << 3) : row * LDS + (chunk << 3);
+        }
+
+        template <int BM, int BN, int WM, int STAGES, int WN_ = 32, bool SWZ_ = false>
         struct MmaShape {
-            static constexpr int BK = 32, LDS = BK + 8, WN = 32;
+            static constexpr bool SWZ = SWZ_;
+            static constexpr int BK = 32, LDS = SWZ ? BK : BK + 8, WN = WN_;
             static constexpr int WARPS_M = BM / WM, WARPS_N = BN / WN, NT = WARPS_M * WARPS_N * 32;
             static constexpr int MI = WM / 16, NI = WN / 8;
             static constexpr int A_PER = BM * (BK / 8) / NT, B_PER = BN * (BK / 8) / NT;
             static constexpr int LDC = BN + 8; // epilogue staging tile [BM][LDC] halves, reuses the ring
             static constexpr std::size_t PIPE = static_cast<std::size_t>(STAGES) * (BM + BN) * LDS * sizeof(__half);
             static constexpr std::size_t STAGE_C = static_cast<std::size_t>(BM) * LDC * sizeof(__half);
-            static constexpr std::size_t SMEM = PIPE > STAGE_C ? PIPE : STAGE_C;
+            static constexpr std::size_t POOL = STAGE_C + static_cast<std::size_t>(NT / 32) * BN * sizeof(float); // + pool scratch
+            static constexpr std::size_t SMEM = PIPE > POOL ? PIPE : POOL;
             static_assert(BM * (BK / 8) % NT == 0 && BN * (BK / 8) % NT == 0, "tile loads must divide evenly");
             static_assert(A_PER >= 1 && B_PER >= 1);
         };
 
-        template <int BM, int BN, int WM, int STAGES, bool F16Acc>
-        __global__ void __launch_bounds__(MmaShape<BM, BN, WM, STAGES>::NT) conv_mma(ConvParams p) {
-            using S = MmaShape<BM, BN, WM, STAGES>;
+        template <int BM, int BN, int WM, int STAGES, bool F16Acc, int WN = 32, bool SWZ = false>
+        __global__ void __launch_bounds__(MmaShape<BM, BN, WM, STAGES, WN, SWZ>::NT) conv_mma(ConvParams p) {
+            using S = MmaShape<BM, BN, WM, STAGES, WN, SWZ>;
             constexpr int BK = S::BK, LDS = S::LDS, NT = S::NT, MI = S::MI, NI = S::NI;
             extern __shared__ __align__(16) unsigned char smem[];
             __half *As = reinterpret_cast<__half *>(smem);   // [STAGES][BM][LDS]
@@ -82,11 +94,11 @@ namespace curf::engine::detail {
                     const int pos = a_pos0[i] + tap;
                     const bool ok = tap < p.k && pos >= 0 && pos < p.lin;
                     const __half *src = ok ? a_row[i] + static_cast<long long>(pos) * p.cin + ci : x;
-                    cp_async16_ca(smem_addr(as + (tid / 4 + i * (NT / 4)) * LDS + kc), src, ok);
+                    cp_async16_ca(smem_addr(as + sidx<SWZ, LDS>(tid / 4 + i * (NT / 4), tid % 4)), src, ok);
                 }
 #pragma unroll
                 for (int i = 0; i < S::B_PER; ++i)
-                    cp_async16(smem_addr(bs + (tid / 4 + i * (NT / 4)) * LDS + kc), w_row + i * w_step + k0, true);
+                    cp_async16(smem_addr(bs + sidx<SWZ, LDS>(tid / 4 + i * (NT / 4), tid % 4)), w_row + i * w_step + k0, true);
                 ci += BK;
                 while (ci >= p.cin) { ci -= p.cin; ++tap; }
             };
@@ -111,32 +123,63 @@ namespace curf::engine::detail {
             const int a_r = (lane % 8) + ((lane / 8) % 2) * 8, a_c = (lane / 16) * 8;
             const int b_r = (lane % 8) + (lane / 16) * 8, b_c = ((lane / 8) % 2) * 8;
 
-            for (int kt = 0; kt < KT; ++kt) {
-                cp_async_wait<STAGES - 2>();
-                __syncthreads();
-                if (const int nk = kt + STAGES - 1; nk < KT) load_tile(nk % STAGES, nk * BK);
-                cp_async_commit();
+            // Register double buffering of the fragments: while the MMAs of one k16 step run, the ldmatrix of
+            // the next one (in this k-tile, or the first of the next k-tile right after the barrier) is in
+            // flight. A first version loaded and consumed back to back and reached 60% tensor-pipe
+            // utilisation where CUTLASS reached 85% on the same layer and occupancy.
+            unsigned af[2][MI][4], bf[2][NI][2];
+            auto load_frags = [&](int buf, int stage, int ks) {
+                const __half *as = As + stage * BM * LDS;
+                const __half *bs = Bs + stage * BN * LDS;
+#pragma unroll
+                for (int i = 0; i < MI; ++i)
+                    ldmatrix_x4(af[buf][i], smem_addr(as + sidx<SWZ, LDS>(wm * WM + i * 16 + a_r, (ks + a_c) >> 3)));
+#pragma unroll
+                for (int j = 0; j < NI / 2; ++j) {
+                    unsigned r[4];
+                    ldmatrix_x4(r, smem_addr(bs + sidx<SWZ, LDS>(wn * WN + j * 16 + b_r, (ks + b_c) >> 3)));
+                    bf[buf][2 * j][0] = r[0];
+                    bf[buf][2 * j][1] = r[1];
+                    bf[buf][2 * j + 1][0] = r[2];
+                    bf[buf][2 * j + 1][1] = r[3];
+                }
+            };
+            auto mma_all = [&](int buf) {
+#pragma unroll
+                for (int i = 0; i < MI; ++i)
+#pragma unroll
+                    for (int j = 0; j < NI; ++j) mma(acc[i][j], af[buf][i], bf[buf][j]);
+            };
 
-                const __half *as = As + (kt % STAGES) * BM * LDS + (wm * WM) * LDS;
-                const __half *bs = Bs + (kt % STAGES) * BN * LDS + (wn * 32) * LDS;
+            if constexpr (SWZ) {
+                // (swizzled variants) double-buffered fragments, see above
+                cp_async_wait<STAGES - 2>(); // tile 0 has landed
+                __syncthreads();
+                load_frags(0, 0, 0);
+                for (int kt = 0; kt < KT; ++kt) {
+                    // The slot refilled here held tile kt - 1, fully read into registers before the last barrier.
+                    if (const int nk = kt + STAGES - 1; nk < KT) load_tile(nk % STAGES, nk * BK);
+                    cp_async_commit();
+                    load_frags(1, kt % STAGES, 16);
+                    mma_all(0);
+                    cp_async_wait<STAGES - 2>(); // tile kt + 1 has landed
+                    __syncthreads();
+                    if (kt + 1 < KT) load_frags(0, (kt + 1) % STAGES, 0);
+                    mma_all(1);
+                }
+            } else {
+                // (padded variants) the original loop: load fragments and consume them back to back. Kept
+                // because it is faster on single-k-tile layers (1x1 conv with K = 32: 141 vs 186 us).
+                for (int kt = 0; kt < KT; ++kt) {
+                    cp_async_wait<STAGES - 2>();
+                    __syncthreads();
+                    if (const int nk = kt + STAGES - 1; nk < KT) load_tile(nk % STAGES, nk * BK);
+                    cp_async_commit();
 #pragma unroll
-                for (int ks = 0; ks < BK; ks += 16) {
-                    unsigned af[MI][4], bf[NI][2];
-#pragma unroll
-                    for (int i = 0; i < MI; ++i) ldmatrix_x4(af[i], smem_addr(as + (i * 16 + a_r) * LDS + ks + a_c));
-#pragma unroll
-                    for (int j = 0; j < NI / 2; ++j) {
-                        unsigned r[4];
-                        ldmatrix_x4(r, smem_addr(bs + (j * 16 + b_r) * LDS + ks + b_c));
-                        bf[2 * j][0] = r[0];
-                        bf[2 * j][1] = r[1];
-                        bf[2 * j + 1][0] = r[2];
-                        bf[2 * j + 1][1] = r[3];
+                    for (int ks = 0; ks < BK; ks += 16) {
+                        load_frags(0, kt % STAGES, ks);
+                        mma_all(0);
                     }
-#pragma unroll
-                    for (int i = 0; i < MI; ++i)
-#pragma unroll
-                        for (int j = 0; j < NI; ++j) mma(acc[i][j], af[i], bf[j]);
                 }
             }
             cp_async_wait<0>();
@@ -148,7 +191,7 @@ namespace curf::engine::detail {
             const bool relu_now = p.relu && p.res == nullptr;
 #pragma unroll
             for (int j = 0; j < NI; ++j) {
-                const int c = wn * 32 + j * 8 + (lane % 4) * 2;
+                const int c = wn * WN + j * 8 + (lane % 4) * 2;
                 const float2 bias = *reinterpret_cast<const float2 *>(p.bias + n0 + c);
 #pragma unroll
                 for (int i = 0; i < MI; ++i) {
@@ -181,33 +224,35 @@ namespace curf::engine::detail {
             }
             if (p.pool) { // fused global average pool: this conv's output is never written
                 __syncthreads();
-                pool_tile<BM, BN, NT>(Cs, S::LDC, m0, M, p.lout, p.cout, n0, p.pool, tid);
+                pool_tile<BM, BN, NT>(Cs, S::LDC, m0, M, p.lout, p.cout, n0, p.pool, tid,
+                                      reinterpret_cast<float *>(smem + S::STAGE_C));
             }
         }
 
-        template <int BM, int BN, int WM, int STAGES, bool F16Acc>
+        template <int BM, int BN, int WM, int STAGES, bool F16Acc, int WN = 32, bool SWZ = false>
         void launch_mma(const ConvParams &p, cudaStream_t s) {
-            using S = MmaShape<BM, BN, WM, STAGES>;
+            using S = MmaShape<BM, BN, WM, STAGES, WN, SWZ>;
             static const bool configured = [] {
-                CURF_CUDA_CHECK(cudaFuncSetAttribute(conv_mma<BM, BN, WM, STAGES, F16Acc>,
+                CURF_CUDA_CHECK(cudaFuncSetAttribute(conv_mma<BM, BN, WM, STAGES, F16Acc, WN, SWZ>,
                                                      cudaFuncAttributeMaxDynamicSharedMemorySize,
                                                      static_cast<int>(S::SMEM)));
                 return true;
             }();
             (void)configured;
             const dim3 grid(static_cast<unsigned>((p.m() + BM - 1) / BM), static_cast<unsigned>(p.cout / BN));
-            conv_mma<BM, BN, WM, STAGES, F16Acc><<<grid, S::NT, S::SMEM, s>>>(p);
+            conv_mma<BM, BN, WM, STAGES, F16Acc, WN, SWZ><<<grid, S::NT, S::SMEM, s>>>(p);
         }
 
         template <int BN> bool sup_mma(const ConvParams &p) {
             return !p.x_f32 && p.cin % 8 == 0 && p.cout % BN == 0 && p.kpad % 32 == 0;
         }
 
-        template <int BM, int BN, int WM, int STAGES> void add(std::vector<ConvVariant> &v) {
-            const std::string tile = std::to_string(BM) + "x" + std::to_string(BN) + ".w" + std::to_string(WM) + ".s" +
-                                     std::to_string(STAGES);
-            v.push_back({"mma.f32." + tile, true, &sup_mma<BN>, &launch_mma<BM, BN, WM, STAGES, false>, true});
-            v.push_back({"mma.f16." + tile, true, &sup_mma<BN>, &launch_mma<BM, BN, WM, STAGES, true>, true});
+        template <int BM, int BN, int WM, int STAGES, int WN = 32, bool SWZ = false> void add(std::vector<ConvVariant> &v) {
+            const std::string tile = std::to_string(BM) + "x" + std::to_string(BN) + ".w" + std::to_string(WM) +
+                                     (WN == 32 ? "" : "x" + std::to_string(WN)) + ".s" + std::to_string(STAGES) +
+                                     (SWZ ? ".z" : "");
+            v.push_back({"mma.f32." + tile, true, &sup_mma<BN>, &launch_mma<BM, BN, WM, STAGES, false, WN, SWZ>, true});
+            v.push_back({"mma.f16." + tile, true, &sup_mma<BN>, &launch_mma<BM, BN, WM, STAGES, true, WN, SWZ>, true});
         }
 
     } // namespace
@@ -227,6 +272,22 @@ namespace curf::engine::detail {
         add<128, 128, 64, 3>(v);
         add<128, 128, 64, 4>(v);
         add<256, 64, 64, 3>(v);
+        // 64x64 warp tiles (MI = 4, NI = 8: 32 MMAs per k16 step, each A fragment reused 8x and each B
+        // fragment 4x). Added after the CUTLASS baseline beat the 64x32 tiles by 18% on stage3 conv2
+        // (128 -> 128 channels, K = 384): its 128x128 CTA tile runs 64x64 warps.
+        add<128, 128, 64, 3, 64>(v);
+        add<128, 128, 64, 2, 64>(v);
+        add<128, 64, 64, 3, 64>(v);
+        // swizzled (unpadded) shared memory: same tiles, 20% less smem, more CTAs per SM
+        add<128, 128, 64, 3, 64, true>(v);
+        add<128, 128, 64, 4, 64, true>(v);
+        add<128, 128, 64, 3, 32, true>(v);
+        add<128, 64, 64, 3, 64, true>(v);
+        add<128, 64, 32, 3, 32, true>(v);
+        add<128, 64, 64, 4, 32, true>(v);
+        add<64, 64, 32, 3, 32, true>(v);
+        add<64, 128, 32, 3, 32, true>(v);
+        add<128, 32, 32, 3, 32, true>(v);
     }
 
 } // namespace curf::engine::detail

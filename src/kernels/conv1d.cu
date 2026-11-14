@@ -252,11 +252,13 @@ namespace curf::engine {
         // Each thread computes 4 positions x 8 channels, so one pair of float4 weight loads feeds 32 FMAs
         // (a first version did 1 x 8 and was shared-memory bound: L1 94%, slower than the WMMA path).
         // Positions are interleaved (pos = pg + q * TL/4) so a warp's 16-byte stores cover whole rows.
-        constexpr int kDirectTL = 256, kDirectQ = 4;
-
-        template <class TIn>
-        __global__ void __launch_bounds__(256) conv_direct(ConvParams p) {
-            constexpr int TL = kDirectTL, Q = kDirectQ, PG = TL / Q;
+        // Tile (TL positions), positions per thread (Q) and a minimum of resident blocks per SM (register cap)
+        // are template parameters: the first version (TL 256, Q 4, 69 registers, 3 blocks / SM) reached only
+        // 53% of DRAM bandwidth because each block's load -> compute -> store runs serially and too few blocks
+        // were resident to overlap them.
+        template <class TIn, int TL, int Q, int MINB>
+        __global__ void __launch_bounds__(256, MINB) conv_direct(ConvParams p) {
+            constexpr int PG = TL / Q;
             extern __shared__ float sm[];
             const int K = p.k * p.cin;
             const int rows = (TL - 1) * p.stride + p.k;
@@ -312,8 +314,8 @@ namespace curf::engine {
             }
         }
 
-        std::size_t direct_smem(const ConvParams &p) {
-            return (static_cast<std::size_t>(kDirectTL - 1) * p.stride + p.k) * p.cin * sizeof(float) + 16 +
+        std::size_t direct_smem(const ConvParams &p, int TL = 512) {
+            return (static_cast<std::size_t>(TL - 1) * p.stride + p.k) * p.cin * sizeof(float) + 16 +
                    static_cast<std::size_t>(p.k) * p.cin * p.cout * sizeof(float);
         }
 
@@ -363,10 +365,10 @@ namespace curf::engine {
             if (p.x_f32) conv_smem<float, Fused><<<grid, 256, 0, s>>>(p);
             else conv_smem<__half, Fused><<<grid, 256, 0, s>>>(p);
         }
-        void launch_direct(const ConvParams &p, cudaStream_t s) {
-            const dim3 grid(static_cast<unsigned>((p.lout + kDirectTL - 1) / kDirectTL), static_cast<unsigned>(p.batch));
-            if (p.x_f32) conv_direct<float><<<grid, 256, direct_smem(p), s>>>(p);
-            else conv_direct<__half><<<grid, 256, direct_smem(p), s>>>(p);
+        template <int TL, int Q, int MINB> void launch_direct(const ConvParams &p, cudaStream_t s) {
+            const dim3 grid(static_cast<unsigned>((p.lout + TL - 1) / TL), static_cast<unsigned>(p.batch));
+            if (p.x_f32) conv_direct<float, TL, Q, MINB><<<grid, 256, direct_smem(p, TL), s>>>(p);
+            else conv_direct<__half, TL, Q, MINB><<<grid, 256, direct_smem(p, TL), s>>>(p);
         }
         // Direct conv only pays off for a handful of input channels.
         bool sup_direct(const ConvParams &p) {
@@ -402,7 +404,11 @@ namespace curf::engine {
             add_wmma<64, 128>(v);
             add_wmma<128, 128>(v);
             detail::add_mma_variants(v);
-            v.push_back({"direct", true, &sup_direct, &launch_direct});
+            v.push_back({"direct.t256q4", true, &sup_direct, &launch_direct<256, 4, 3>});
+            v.push_back({"direct.t256q4b4", true, &sup_direct, &launch_direct<256, 4, 4>});
+            v.push_back({"direct.t128q2b6", true, &sup_direct, &launch_direct<128, 2, 6>});
+            v.push_back({"direct.t256q2b6", true, &sup_direct, &launch_direct<256, 2, 6>});
+            v.push_back({"direct.t512q4b4", true, &sup_direct, &launch_direct<512, 4, 4>});
 #ifdef CURF_HAVE_CUDNN
             detail::add_cudnn_variants(v);
 #endif
