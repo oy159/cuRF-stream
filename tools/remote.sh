@@ -22,7 +22,7 @@ SSH_OPTS=(${CURF_SSH_OPTS:-})
 ssh "${SSH_OPTS[@]}" "$CURF_REMOTE" "mkdir -p $CURF_REMOTE_DIR"
 rsync -az --delete \
     --exclude '/build/' --exclude '/cmake-build-*/' --exclude '/.git/' --exclude '/.idea/' \
-    --exclude '/tools/remote.env' --exclude '__pycache__/' \
+    --exclude '/tools/remote.env' --exclude '__pycache__/' --exclude '/model/artifacts/' \
     -e "ssh ${SSH_OPTS[*]}" "$root/" "$CURF_REMOTE:$CURF_REMOTE_DIR/"
 
 # The remote login shell may be zsh; run everything under bash explicitly.
