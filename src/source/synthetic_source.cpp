@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <complex>
 #include <numbers>
 #include <random>
 #include <stdexcept>
@@ -30,13 +31,22 @@ namespace curf {
             for (std::size_t t = 0; t < tones.size(); ++t)
                 step[t] = two_pi * snapped_frequency(tones[t].frequency_hz) / f.sample_rate;
 
+            // Tones by phasor recursion (one complex multiply per tone and sample), re-anchored exactly every
+            // 1024 samples from an integer product so rounding cannot accumulate over long periods. Hundreds
+            // of tones over a 2^20-sample period would otherwise be ~10^9 sin/cos calls.
+            constexpr std::size_t kAnchor = 1024;
+            std::vector<std::complex<double>> z(tones.size()), rot(tones.size());
+            for (std::size_t t = 0; t < tones.size(); ++t) rot[t] = std::polar(1.0, step[t]);
             for (std::size_t k = 0; k < config_.period_frames; ++k) {
+                if (k % kAnchor == 0)
+                    for (std::size_t t = 0; t < tones.size(); ++t)
+                        z[t] = std::polar(tones[t].amplitude,
+                                          std::fmod(step[t] * static_cast<double>(k), two_pi) + tones[t].phase);
                 double re = noise(rng), im = noise(rng);
                 for (std::size_t t = 0; t < tones.size(); ++t) {
-                    // Phase from an integer product keeps precision over long periods.
-                    const double phase = std::fmod(step[t] * static_cast<double>(k), two_pi);
-                    re += tones[t].amplitude * std::cos(phase);
-                    im += tones[t].amplitude * std::sin(phase);
+                    re += z[t].real();
+                    im += z[t].imag();
+                    z[t] *= rot[t];
                 }
                 ref::pack_sample({static_cast<float>(re), static_cast<float>(im)}, f.wire,
                                  period_.data() + (k * f.channels + c) * sb);

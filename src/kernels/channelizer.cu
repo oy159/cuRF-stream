@@ -48,7 +48,7 @@ namespace curf::cuda {
         // mostly from L1.
         template <int P>
         __global__ void fold_kernel(Src src, const float *__restrict__ h, float2 *__restrict__ out, unsigned M, unsigned D,
-                                    unsigned frames, unsigned fpb, unsigned long long frame0) {
+                                    unsigned frames, unsigned fpb, unsigned long long frame0, long long stride) {
             const unsigned s = blockIdx.y;
             const unsigned n0 = blockIdx.x * fpb;
             for (unsigned m = threadIdx.x; m < M; m += blockDim.x) {
@@ -65,7 +65,7 @@ namespace curf::cuda {
                         acc.y = fmaf(hr[p], v.y, acc.y);
                     }
                     const unsigned mo = ((frame0 + n) & 1ull) ? ((m + M / 2) & (M - 1)) : m;
-                    out[(static_cast<long long>(s) * frames + n) * M + mo] = acc;
+                    out[static_cast<long long>(s) * stride + static_cast<long long>(n) * M + mo] = acc;
                 }
             }
         }
@@ -76,7 +76,8 @@ namespace curf::cuda {
         // frames that use it, plus 64-bit index arithmetic per tap.
         template <int P>
         __global__ void fold_smem_kernel(Src src, const float *__restrict__ h, float2 *__restrict__ out, unsigned M,
-                                         unsigned D, unsigned frames, unsigned fpb, unsigned long long frame0) {
+                                         unsigned D, unsigned frames, unsigned fpb, unsigned long long frame0,
+                                         long long stride) {
             extern __shared__ float2 xs[];
             const unsigned s = blockIdx.y, n0 = blockIdx.x * fpb, L = static_cast<unsigned>(P) * M;
             const unsigned nf = min(fpb, frames - n0);
@@ -99,7 +100,7 @@ namespace curf::cuda {
                     }
                     const unsigned n = n0 + f;
                     const unsigned mo = ((frame0 + n) & 1ull) ? ((m + M / 2) & (M - 1)) : m;
-                    out[(static_cast<long long>(s) * frames + n) * M + mo] = acc;
+                    out[static_cast<long long>(s) * stride + static_cast<long long>(n) * M + mo] = acc;
                 }
             }
         }
@@ -140,6 +141,7 @@ namespace curf::cuda {
 
     Channelizer::~Channelizer() {
         if (plan_) cufftDestroy(plan_);
+        if (plan_stream_) cufftDestroy(plan_stream_);
         cudaFree(d_h_);
         cudaFree(d_hist_);
     }
@@ -155,7 +157,11 @@ namespace curf::cuda {
         return frames * (4.0 * static_cast<double>(cfg_.taps()) + 5.0 * M * std::log2(M));
     }
 
-    void Channelizer::fold(const void *in, bool wire, WireFormat format, cf32 *d_out, cudaStream_t stream) {
+    void Channelizer::fold(const void *in, bool wire, WireFormat format, cf32 *d_out, cudaStream_t stream,
+                           std::size_t stride) {
+        if (stride == 0) stride = frames_ * cfg_.channels;
+        if (stride < frames_ * cfg_.channels) throw std::invalid_argument("Channelizer: output stride too small");
+        const auto ld = static_cast<long long>(stride);
         const unsigned M = cfg_.channels, D = cfg_.decimation(), L = static_cast<unsigned>(cfg_.taps());
         Src src{wire ? nullptr : static_cast<const float2 *>(in), wire ? static_cast<const std::uint8_t *>(in) : nullptr,
                 format, static_cast<unsigned>(wire_sample_bytes(format)), streams_,
@@ -166,15 +172,15 @@ namespace curf::cuda {
         const auto frames = static_cast<unsigned>(frames_);
         if (variant_ == FoldVariant::direct) {
             switch (cfg_.taps_per_phase) {
-                case 4: fold_kernel<4><<<grid, threads, 0, stream>>>(src, d_h_, out, M, D, frames, kFramesPerBlock, frames_done_); break;
-                case 8: fold_kernel<8><<<grid, threads, 0, stream>>>(src, d_h_, out, M, D, frames, kFramesPerBlock, frames_done_); break;
-                default: fold_kernel<16><<<grid, threads, 0, stream>>>(src, d_h_, out, M, D, frames, kFramesPerBlock, frames_done_); break;
+                case 4: fold_kernel<4><<<grid, threads, 0, stream>>>(src, d_h_, out, M, D, frames, kFramesPerBlock, frames_done_, ld); break;
+                case 8: fold_kernel<8><<<grid, threads, 0, stream>>>(src, d_h_, out, M, D, frames, kFramesPerBlock, frames_done_, ld); break;
+                default: fold_kernel<16><<<grid, threads, 0, stream>>>(src, d_h_, out, M, D, frames, kFramesPerBlock, frames_done_, ld); break;
             }
         } else {
             const std::size_t smem = ((kFramesPerBlock - 1) * D + L) * sizeof(float2);
             auto launch = [&](auto kernel) {
                 CURF_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem)));
-                kernel<<<grid, threads, smem, stream>>>(src, d_h_, out, M, D, frames, kFramesPerBlock, frames_done_);
+                kernel<<<grid, threads, smem, stream>>>(src, d_h_, out, M, D, frames, kFramesPerBlock, frames_done_, ld);
             };
             switch (cfg_.taps_per_phase) {
                 case 4: launch(fold_smem_kernel<4>); break;
@@ -185,19 +191,34 @@ namespace curf::cuda {
         CURF_CUDA_CHECK(cudaGetLastError());
         history_kernel<<<dim3((L + 255) / 256, streams_), 256, 0, stream>>>(src, reinterpret_cast<float2 *>(d_hist_), L);
         CURF_CUDA_CHECK(cudaGetLastError());
-        cufft_check(cufftSetStream(plan_, stream), "cufftSetStream");
-        cufft_check(cufftExecC2C(plan_, reinterpret_cast<cufftComplex *>(d_out), reinterpret_cast<cufftComplex *>(d_out),
-                                 CUFFT_INVERSE),
-                    "cufftExecC2C");
+        if (stride == frames_ * cfg_.channels) {
+            cufft_check(cufftSetStream(plan_, stream), "cufftSetStream");
+            cufft_check(cufftExecC2C(plan_, reinterpret_cast<cufftComplex *>(d_out),
+                                     reinterpret_cast<cufftComplex *>(d_out), CUFFT_INVERSE),
+                        "cufftExecC2C");
+        } else {
+            if (!plan_stream_) {
+                int n[1] = {static_cast<int>(M)};
+                cufft_check(cufftPlanMany(&plan_stream_, 1, n, nullptr, 1, static_cast<int>(M), nullptr, 1,
+                                          static_cast<int>(M), CUFFT_C2C, static_cast<int>(frames_)),
+                            "cufftPlanMany");
+            }
+            cufft_check(cufftSetStream(plan_stream_, stream), "cufftSetStream");
+            for (std::uint32_t s = 0; s < streams_; ++s) {
+                auto *p = reinterpret_cast<cufftComplex *>(d_out + s * stride);
+                cufft_check(cufftExecC2C(plan_stream_, p, p, CUFFT_INVERSE), "cufftExecC2C");
+            }
+        }
         frames_done_ += frames_;
     }
 
-    void Channelizer::run(const cf32 *d_planar, cf32 *d_out, cudaStream_t stream) {
-        fold(d_planar, false, WireFormat::packed12, d_out, stream);
+    void Channelizer::run(const cf32 *d_planar, cf32 *d_out, cudaStream_t stream, std::size_t stride) {
+        fold(d_planar, false, WireFormat::packed12, d_out, stream, stride);
     }
 
-    void Channelizer::run_wire(const std::uint8_t *d_wire, WireFormat format, cf32 *d_out, cudaStream_t stream) {
-        fold(d_wire, true, format, d_out, stream);
+    void Channelizer::run_wire(const std::uint8_t *d_wire, WireFormat format, cf32 *d_out, cudaStream_t stream,
+                               std::size_t stride) {
+        fold(d_wire, true, format, d_out, stream, stride);
     }
 
 } // namespace curf::cuda

@@ -64,6 +64,7 @@ add_library(curf_core
     src/reference/channelizer.cpp
     src/reference/unpack.cpp
     src/runtime/host_ring.cpp
+    src/runtime/producer.cpp
     src/source/synthetic_source.cpp
     src/source/file_source.cpp)
 target_include_directories(curf_core PUBLIC include)
@@ -74,11 +75,13 @@ if(CURF_HAVE_CUDA)
         src/kernels/unpack.cu
         src/kernels/psd.cu
         src/kernels/channelizer.cu
+        src/kernels/windows.cu
         src/kernels/conv1d.cu
         src/kernels/conv1d_mma.cu
         src/kernels/block_fused.cu
         src/engine/engine.cpp
-        src/runtime/pipeline.cpp)
+        src/runtime/pipeline.cpp
+        src/runtime/classifier.cu)
     target_include_directories(curf_cuda PUBLIC include)
     target_link_libraries(curf_cuda PUBLIC curf_core CUDA::cudart CUDA::cufft PRIVATE curf_warnings)
     if(TARGET CUDA::nvtx3)

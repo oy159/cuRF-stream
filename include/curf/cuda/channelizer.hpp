@@ -35,8 +35,11 @@ namespace curf::cuda {
         Channelizer(const Channelizer &) = delete;
         Channelizer &operator=(const Channelizer &) = delete;
 
-        void run(const cf32 *d_planar, cf32 *d_out, cudaStream_t stream);
-        void run_wire(const std::uint8_t *d_wire, WireFormat format, cf32 *d_out, cudaStream_t stream);
+        // out_stream_stride: elements between streams in d_out (0 = frames() * M, i.e. contiguous). A larger
+        // stride lets consecutive blocks fill consecutive frame ranges of a [streams][window][M] buffer.
+        void run(const cf32 *d_planar, cf32 *d_out, cudaStream_t stream, std::size_t out_stream_stride = 0);
+        void run_wire(const std::uint8_t *d_wire, WireFormat format, cf32 *d_out, cudaStream_t stream,
+                      std::size_t out_stream_stride = 0);
         void reset(); // zero history (stream restarts at sample 0)
         void set_variant(FoldVariant v) noexcept { variant_ = v; }
 
@@ -48,7 +51,7 @@ namespace curf::cuda {
         double flops() const noexcept;
 
     private:
-        void fold(const void *in, bool wire, WireFormat format, cf32 *d_out, cudaStream_t stream);
+        void fold(const void *in, bool wire, WireFormat format, cf32 *d_out, cudaStream_t stream, std::size_t stride);
 
         ChannelizerConfig cfg_;
         std::uint32_t streams_;
@@ -57,7 +60,8 @@ namespace curf::cuda {
         cf32 *d_hist_ = nullptr;   // [streams][L] last L samples of the previous block
         std::uint64_t frames_done_ = 0;
         FoldVariant variant_ = FoldVariant::best;
-        cufftHandle plan_ = 0;
+        cufftHandle plan_ = 0;        // all streams in one batch (contiguous output)
+        cufftHandle plan_stream_ = 0; // one stream's frames (strided output), created on first use
     };
 
 } // namespace curf::cuda

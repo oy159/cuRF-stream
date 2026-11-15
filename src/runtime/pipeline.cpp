@@ -3,6 +3,7 @@
 #include "curf/cuda/memory.hpp"
 #include "curf/cuda/psd.hpp"
 #include "curf/runtime/host_ring.hpp"
+#include "curf/runtime/producer.hpp"
 
 #include <nvtx3/nvToolsExt.h>
 
@@ -110,57 +111,10 @@ namespace curf::cuda {
             ctx.push_back(std::make_unique<Context>(block_bytes, samples, psd.psd_elems()));
 
         // ------------------------------------------------------------ producer
-        std::atomic<bool> stop{false}, producer_done{false};
-        std::atomic<std::uint64_t> dropped{0};
-        std::exception_ptr producer_error;
-        std::thread producer([&] {
-            std::vector<std::uint8_t> trash(cfg.drop_when_full ? block_bytes : 0);
-            try {
-                source.start();
-                while (!stop.load(std::memory_order_relaxed)) {
-                    HostSlot *slot = cfg.drop_when_full ? ring.try_begin_write()
-                                                        : ring.begin_write(std::chrono::milliseconds(10));
-                    if (!slot) {
-                        if (!cfg.drop_when_full) continue; // back-pressure: wait for the GPU
-                        // Ring full: discard input, as a hardware FIFO overflow would.
-                        const auto r = source.read(trash, 100);
-                        if (r.status == ReadStatus::end_of_stream) break;
-                        dropped.fetch_add(r.frames, std::memory_order_relaxed);
-                        continue;
-                    }
-                    NvtxRange range("fill slot");
-                    std::size_t got = 0;
-                    bool first = true, eos = false;
-                    while (got < cfg.block_frames && !stop.load(std::memory_order_relaxed)) {
-                        const auto r = source.read({slot->data + got * fb, (cfg.block_frames - got) * fb}, 100);
-                        if (r.status == ReadStatus::end_of_stream) {
-                            eos = true;
-                            break;
-                        }
-                        if (r.status != ReadStatus::ok) continue;
-                        if (first) {
-                            slot->first_sample = r.first_sample;
-                            slot->discontinuity = r.discontinuity;
-                            first = false;
-                        } else if (r.discontinuity) {
-                            slot->discontinuity = true;
-                        }
-                        got += r.frames;
-                    }
-                    if (got < cfg.block_frames) { // EOS or stop mid-block: drop the partial block
-                        if (eos) break;
-                        continue;
-                    }
-                    slot->frames = got;
-                    ring.commit_write();
-                }
-                source.stop();
-            } catch (...) {
-                producer_error = std::current_exception();
-            }
-            producer_done.store(true, std::memory_order_release);
-            ring.notify_all();
-        });
+        ProducerControl pc;
+        std::thread producer = start_producer(source, ring, cfg.block_frames, fb, cfg.drop_when_full, pc);
+        auto &stop = pc.stop;
+        auto &producer_done = pc.done;
 
         // ------------------------------------------------------------ consumer
         std::vector<double> lat, h2d, gpu;
@@ -245,21 +199,13 @@ namespace curf::cuda {
         }
         st.wall_s = elapsed();
 
-        stop.store(true);
-        ring.notify_all();
-        // Unblock a back-pressured producer: release everything still held.
         cudaDeviceSynchronize();
-        while (ring.in_flight() > 0) ring.release_oldest();
-        while (ring.try_next_submit()) {
-            ring.mark_submitted();
-            ring.release_oldest();
-        }
-        producer.join();
+        stop_producer(ring, pc, producer); // also unblocks a back-pressured producer
         if (cfg.register_ring) cudaHostUnregister(ring.base());
         if (error) std::rethrow_exception(error);
-        if (producer_error) std::rethrow_exception(producer_error);
+        if (pc.error) std::rethrow_exception(pc.error);
 
-        st.dropped_frames = dropped.load();
+        st.dropped_frames = pc.dropped.load();
         st.wire_GBps = static_cast<double>(st.frames * fb) / st.wall_s / 1e9;
         st.msps_per_channel = static_cast<double>(st.frames) / st.wall_s / 1e6;
         st.x_realtime = st.msps_per_channel * 1e6 / fmt.sample_rate;

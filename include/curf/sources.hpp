@@ -13,6 +13,7 @@ namespace curf {
     struct Tone {
         double frequency_hz = 1e6; // baseband offset, may be negative
         double amplitude = 0.5;    // full scale = 1.0
+        double phase = 0.0;        // radians at sample 0
     };
 
     struct SyntheticConfig {
