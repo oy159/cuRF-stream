@@ -186,6 +186,20 @@ TEST_CASE("a calibrated noise shape whitens a front end whose noise rises toward
     CHECK(read_active(ws) == flat);
 }
 
+TEST_CASE("the DC guard hides the LO leakage channel only", "[cuda][windows]") {
+    const std::set<std::uint32_t> loud{0, 1, 300}; // 0: LO leakage, 1 and 300: signals (neighbours at equal level)
+    const auto sc = make_scene(3, loud);
+    cuda::DeviceBuffer<cf32> win(sc.win.size());
+    CURF_CUDA_CHECK(cudaMemcpy(win.get(), sc.win.data(), win.bytes(), cudaMemcpyHostToDevice));
+    cuda::WindowStage ws(S, M, W);
+    cuda::DetectConfig cfg;
+    ws.detect(win.get(), cfg, nullptr);
+    CHECK(read_active(ws) == std::vector<std::uint32_t>{0, 1, 300});
+    cfg.dc_guard = 1;
+    ws.detect(win.get(), cfg, nullptr);
+    CHECK(read_active(ws) == std::vector<std::uint32_t>{1, 300});
+}
+
 TEST_CASE("gather transposes and normalises active windows, in chunks", "[cuda][windows]") {
     std::set<std::uint32_t> loud;
     for (std::uint32_t i = 0; i < 70; ++i) loud.insert((i * 37) % (S * M)); // 70 scattered channels

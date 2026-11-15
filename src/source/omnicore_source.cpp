@@ -19,6 +19,10 @@ namespace curf {
     } // namespace
 
     OmniCoreSource::OmniCoreSource(OmniCoreConfig config) : config_(std::move(config)) {
+        if (config_.rx_mask) {
+            if (config_.rx_mask > 3) throw std::invalid_argument("OmniCoreSource: rx_mask 1, 2 or 3");
+            config_.channels = config_.rx_mask == 3 ? 2 : 1;
+        }
         if (config_.channels != 1 && config_.channels != 2) throw std::invalid_argument("OmniCoreSource: 1 or 2 channels");
         if (config_.iq_bits != 12 && config_.iq_bits != 8) throw std::invalid_argument("OmniCoreSource: iq_bits 12 or 8");
         const bool tx = !config_.tx_file.empty();
@@ -47,7 +51,7 @@ namespace curf {
             och_config c{};
             och_default_config(&c);
             c.sample_rate = static_cast<std::uint32_t>(std::llround(config_.sample_rate));
-            c.rx_mask = config_.channels == 2 ? 3u : 1u;
+            c.rx_mask = config_.rx_mask ? config_.rx_mask : config_.channels == 2 ? 3u : 1u;
             c.rx_frequency = config_.frequency_hz;
             // AD9361 analog bandwidth: 200 kHz..56 MHz; default as wide as the sample rate allows
             c.rx_bandwidth = config_.bandwidth_hz ? config_.bandwidth_hz : std::min<std::uint32_t>(c.sample_rate, 56'000'000);
@@ -76,6 +80,7 @@ namespace curf {
                 name_ += fir.enabled ? ", RX FIR on (dec " + std::to_string(fir.factor) + ", " + std::to_string(fir.tap_count) + " taps)"
                                      : ", RX FIR off";
 
+            name_ += c.rx_mask == 3 ? ", RX1+RX2" : c.rx_mask == 2 ? ", RX2" : ", RX1";
             format_.wire = config_.iq_bits == 8 ? WireFormat::signed8 : WireFormat::packed12;
             format_.channels = config_.channels;
             format_.sample_rate = applied.sample_rate; // the rate the clock chain actually runs at

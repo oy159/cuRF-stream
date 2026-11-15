@@ -40,6 +40,9 @@ namespace curf::cuda {
         // front ends lose the band edges (AD9361: 56 MHz analog filter, ADC noise shaping rising towards
         // +- fs/2). 1 = every channel.
         float band = 1.f;
+        // Channels within this many of DC are never reported (relative / absolute modes): a zero-IF receiver's
+        // residual LO leakage sits in channel 0 and drifts with gain and temperature. 0 = none, 1 = channel 0.
+        std::uint32_t dc_guard = 0;
         Compaction compaction = Compaction::ballot;
     };
 

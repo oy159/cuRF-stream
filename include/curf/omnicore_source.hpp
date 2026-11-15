@@ -26,6 +26,7 @@ namespace curf {
         std::string serial;              // empty: the only connected board
         double sample_rate = 61.44e6;    // per channel
         std::uint32_t channels = 2;      // 1: RX1, 2: RX1 + RX2
+        std::uint32_t rx_mask = 0;       // explicit RX selection: 1 RX1, 2 RX2, 3 both (0: from channels)
         std::uint64_t frequency_hz = 2'400'000'000;
         std::uint32_t bandwidth_hz = 0;  // 0: min(sample rate, 56 MHz) (AD9361 analog filter limit)
         double gain_db[2] = {30, 30};    // manual gain (agc = 0)

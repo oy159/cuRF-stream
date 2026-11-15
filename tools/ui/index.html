@@ -122,7 +122,7 @@ function build() {
   for (let s = 0; s < meta.streams; s++) {
     const el = document.createElement("section");
     el.className = "stream";
-    el.innerHTML = `<div class="plots"><h2><span>RX${s + 1}</span><span class="info"></span></h2>
+    el.innerHTML = `<div class="plots"><h2><span>RX${(meta.rx || [])[s] || s + 1}</span><span class="info"></span></h2>
         <canvas class="axis"></canvas><canvas class="labels"></canvas><canvas class="wf"></canvas><canvas class="cls"></canvas>
         <div class="sel"></div></div>
       <div class="list"><h3><span>信号列表</span><span class="n"></span></h3><div class="rows"></div></div>`;

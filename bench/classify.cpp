@@ -9,9 +9,10 @@
 //
 //                 [--ui-out PATH] [--ui-every N]   (display feed, see tools/ui_server.py)
 //                 [--noise-shape F] [--calibrate-noise F]  (front-end noise shape: use / measure with no signal)
+//                 [--dc-guard N]  (channels at DC never reported; omnicore default 1)
 //                 [--neighbor-db 6] [--band-mhz B]  (detection: leakage rejection; only report +- B/2 around the
 //                                                    centre - default the whole band, 52 MHz for omnicore)
-//   omnicore:     [--serial S] [--freq HZ] [--gain DB] [--agc 0..3] [--iq-bits 12|8] [--bandwidth HZ]
+//   omnicore:     [--rx 1|2|1,2] [--serial S] [--freq HZ] [--gain DB] [--agc 0..3] [--iq-bits 12|8] [--bandwidth HZ]
 //                 [--tx-file SC16 --tx-atten DB]  (loopback: send the file on TX1 in a loop; DB >= 40)
 //                 (--streams / --rate as for the other sources; drop mode is implied: hardware cannot wait)
 //
@@ -53,7 +54,9 @@ int main(int argc, char **argv) {
     [[maybe_unused]] double freq = 2.4e9, gain = 30, bandwidth = 0;
     [[maybe_unused]] std::uint32_t agc = 0, iq_bits = 12;
     double band_mhz = -1; // usable band for detection; default: all (omnicore: 52 MHz, see below)
+    int dc_guard = -1;    // channels at DC never reported; default 0 (omnicore: 1, the LO leakage channel)
     std::string calibrate_path, shape_path; // noise shape: write (no signal at the input) / use
+    [[maybe_unused]] std::uint32_t rx_mask = 0; // omnicore --rx 1 | 2 | 1,2 (default: from --streams)
     [[maybe_unused]] std::string tx_file;
     [[maybe_unused]] double tx_atten = 89.75;
     bool int8 = false;
@@ -84,6 +87,7 @@ int main(int argc, char **argv) {
         } else if (a == "--threshold-db") cfg.detect.threshold_db = std::stof(next());
         else if (a == "--neighbor-db") cfg.detect.neighbor_reject_db = std::stof(next());
         else if (a == "--band-mhz") band_mhz = std::stod(next());
+        else if (a == "--dc-guard") dc_guard = std::stoi(next());
         else if (a == "--abs-power") cfg.detect.absolute_power = std::stof(next());
         else if (a == "--compaction") cfg.detect.compaction = next() == "cub" ? cuda::Compaction::cub : cuda::Compaction::ballot;
         else if (a == "--seconds") cfg.seconds = std::stod(next());
@@ -106,6 +110,7 @@ int main(int argc, char **argv) {
         else if (a == "--tx-file") tx_file = next();
         else if (a == "--tx-atten") tx_atten = std::stod(next());
         else if (a == "--calibrate-noise") calibrate_path = next();
+        else if (a == "--rx") { const auto v = next(); rx_mask = v == "2" ? 2u : v == "1,2" || v == "12" ? 3u : 1u; }
         else if (a == "--noise-shape") shape_path = next();
         else if (a == "--model") model_dir = next();
         else if (a == "--print") print = std::stoull(next());
@@ -135,6 +140,7 @@ int main(int argc, char **argv) {
         oc.serial = serial;
         oc.sample_rate = fmt.sample_rate;
         oc.channels = fmt.channels;
+        oc.rx_mask = rx_mask;
         oc.frequency_hz = static_cast<std::uint64_t>(std::llround(freq));
         oc.bandwidth_hz = static_cast<std::uint32_t>(std::llround(bandwidth));
         oc.gain_db[0] = oc.gain_db[1] = gain;
@@ -153,6 +159,7 @@ int main(int argc, char **argv) {
         // AD9361: 56 MHz analog filter and ADC noise shaping towards +- fs/2 (the loopback's edge channels read
         // up to 13 dB over the centre floor): detect within +- 26 MHz unless told otherwise
         if (band_mhz < 0) band_mhz = std::min(52e6, fmt.sample_rate) / 1e6;
+        if (dc_guard < 0) dc_guard = 1;
 #else
         std::fprintf(stderr, "built without OmniCore (configure with -DCURF_OMNICORE=ON)\n");
         return 2;
@@ -177,6 +184,7 @@ int main(int argc, char **argv) {
     }
 
     if (band_mhz > 0) cfg.detect.band = static_cast<float>(std::min(1.0, band_mhz * 1e6 / fmt.sample_rate));
+    if (dc_guard > 0) cfg.detect.dc_guard = static_cast<std::uint32_t>(dc_guard);
     if (!shape_path.empty()) {
         std::FILE *f = std::fopen(shape_path.c_str(), "rb");
         if (!f) { std::fprintf(stderr, "cannot open %s\n", shape_path.c_str()); return 2; }
@@ -200,9 +208,11 @@ int main(int argc, char **argv) {
     std::vector<float> ui_vote(std::size_t{S} * M * ncls, 0.f); // [S][M][classes] summed probabilities
     std::vector<std::uint8_t> ui_hits(std::size_t{S} * M, 0);
     if (ui) {
-        std::fprintf(ui, "{\"meta\":{\"streams\":%u,\"channels\":%u,\"rate\":%.17g,\"freq\":%.17g,\"window\":%u,\"every\":%llu,\"source\":\"%s\"}}\n",
+        // physical receiver of each stream, for the panel titles (omnicore --rx 2: the only stream is RX2)
+        const std::string rx = rx_mask == 2 ? "[2]" : S == 2 ? "[1,2]" : "[1]";
+        std::fprintf(ui, "{\"meta\":{\"streams\":%u,\"channels\":%u,\"rate\":%.17g,\"freq\":%.17g,\"window\":%u,\"every\":%llu,\"source\":\"%s\",\"rx\":%s}}\n",
                      S, M, fmt.sample_rate, source == "omnicore" ? freq : 0.0, cfg.window,
-                     static_cast<unsigned long long>(ui_every), source.c_str());
+                     static_cast<unsigned long long>(ui_every), source.c_str(), rx.c_str());
     }
     // Noise-shape calibration: per channel, the median power over (up to the first 4096) windows, divided by
     // the median over the stream's in-band channels. Run with no signal at the input.

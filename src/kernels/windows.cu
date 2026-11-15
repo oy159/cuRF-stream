@@ -42,8 +42,9 @@ namespace curf::cuda {
             const float *sh = shape ? shape + static_cast<std::size_t>(s) * M : nullptr;
             // usable band: channels within h of DC (channel k >= M/2 is at negative frequency M - k)
             const unsigned h = min(M / 2, static_cast<unsigned>(fmaxf(cfg.band, 0.f) * static_cast<float>(M) / 2.f));
-            const unsigned usable = h >= M / 2 ? M : 2 * h + 1;
-            auto in_band = [=](unsigned i) { return min(i, M - i) <= h; };
+            const unsigned dc = min(cfg.dc_guard, h + 1); // channels 0 .. dc-1 away from DC are excluded
+            const unsigned usable = (h >= M / 2 ? M : 2 * h + 1) - (dc ? 2 * dc - 1 : 0);
+            auto in_band = [=](unsigned i) { const unsigned d = min(i, M - i); return d <= h && d >= dc; };
             for (unsigned i = threadIdx.x; i < M; i += blockDim.x) { // power = mean over the window
                 float e = 0.f;
                 for (unsigned z = 0; z < kPowerSplits; ++z) e += part[(static_cast<std::size_t>(z) * S + s) * M + i];
