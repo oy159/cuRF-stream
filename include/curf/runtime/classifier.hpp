@@ -32,6 +32,7 @@ namespace curf {
         std::size_t block_frames = std::size_t{1} << 17; // samples per stream per ring slot
         std::uint32_t window = 1024;                   // frames per classifier window (the model's input length)
         cuda::DetectConfig detect;
+        std::vector<float> noise_shape;                // [streams][channels] or [channels]; see WindowStage
         engine::EngineConfig engine;                   // buckets: the largest one is the chunk size
         std::size_t ring_slots = 16;
         std::size_t depth = 4;                         // blocks in flight (H2D / channelizer)

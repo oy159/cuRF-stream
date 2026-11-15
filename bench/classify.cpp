@@ -8,6 +8,7 @@
 //                 [--fp32-input]   (INT8: gather fp32 windows; default fp16, which the fused stem rounds to anyway)
 //
 //                 [--ui-out PATH] [--ui-every N]   (display feed, see tools/ui_server.py)
+//                 [--noise-shape F] [--calibrate-noise F]  (front-end noise shape: use / measure with no signal)
 //                 [--neighbor-db 6] [--band-mhz B]  (detection: leakage rejection; only report +- B/2 around the
 //                                                    centre - default the whole band, 52 MHz for omnicore)
 //   omnicore:     [--serial S] [--freq HZ] [--gain DB] [--agc 0..3] [--iq-bits 12|8] [--bandwidth HZ]
@@ -52,6 +53,7 @@ int main(int argc, char **argv) {
     [[maybe_unused]] double freq = 2.4e9, gain = 30, bandwidth = 0;
     [[maybe_unused]] std::uint32_t agc = 0, iq_bits = 12;
     double band_mhz = -1; // usable band for detection; default: all (omnicore: 52 MHz, see below)
+    std::string calibrate_path, shape_path; // noise shape: write (no signal at the input) / use
     [[maybe_unused]] std::string tx_file;
     [[maybe_unused]] double tx_atten = 89.75;
     bool int8 = false;
@@ -103,6 +105,8 @@ int main(int argc, char **argv) {
         else if (a == "--iq-bits") iq_bits = static_cast<std::uint32_t>(std::stoul(next()));
         else if (a == "--tx-file") tx_file = next();
         else if (a == "--tx-atten") tx_atten = std::stod(next());
+        else if (a == "--calibrate-noise") calibrate_path = next();
+        else if (a == "--noise-shape") shape_path = next();
         else if (a == "--model") model_dir = next();
         else if (a == "--print") print = std::stoull(next());
         else if (a == "--label") label = next();
@@ -173,34 +177,57 @@ int main(int argc, char **argv) {
     }
 
     if (band_mhz > 0) cfg.detect.band = static_cast<float>(std::min(1.0, band_mhz * 1e6 / fmt.sample_rate));
+    if (!shape_path.empty()) {
+        std::FILE *f = std::fopen(shape_path.c_str(), "rb");
+        if (!f) { std::fprintf(stderr, "cannot open %s\n", shape_path.c_str()); return 2; }
+        cfg.noise_shape.resize(std::size_t{fmt.channels} * cfg.channelizer.channels);
+        const std::size_t got = std::fread(cfg.noise_shape.data(), sizeof(float), cfg.noise_shape.size(), f);
+        std::fclose(f);
+        if (got == cfg.channelizer.channels) cfg.noise_shape.resize(got); // one shape for every stream
+        else if (got != cfg.noise_shape.size()) { std::fprintf(stderr, "%s: %zu values, need [streams][channels]\n", shape_path.c_str(), got); return 2; }
+    }
     std::FILE *dump = dump_path.empty() ? nullptr : std::fopen(dump_path.c_str(), "w");
     if (dump) std::fprintf(dump, "window,stream,channel,cls,prob,power\n");
 
     // Display feed: one JSON line per ui_every windows - the max power of each channel over those windows
-    // (dBFS, rounded) and, per channel, the result of its strongest window among them (short bursts would
-    // otherwise light up the waterfall but miss the labels). Channel order as produced (k >= M/2 negative).
+    // (dBFS, rounded) and, per channel detected in any of them, the probability-weighted vote over those
+    // windows: [stream, channel, class, share of the vote %, windows detected]. A single window is right ~91 %
+    // of the time on the cable loopback, a vote over 8 windows (34 ms) ~96 %. Channel order as produced.
     std::FILE *ui = ui_path.empty() ? nullptr : std::fopen(ui_path.c_str(), "w");
     const std::uint32_t S = fmt.channels, M = cfg.channelizer.channels;
     std::vector<float> ui_max(std::size_t{S} * M, 0.f), ui_floor(S, 0.f);
-    std::vector<WindowResult> ui_res(std::size_t{S} * M);
+    const auto ncls = static_cast<std::size_t>(model.tensors[model.output].channels);
+    std::vector<float> ui_vote(std::size_t{S} * M * ncls, 0.f); // [S][M][classes] summed probabilities
+    std::vector<std::uint8_t> ui_hits(std::size_t{S} * M, 0);
     if (ui) {
         std::fprintf(ui, "{\"meta\":{\"streams\":%u,\"channels\":%u,\"rate\":%.17g,\"freq\":%.17g,\"window\":%u,\"every\":%llu,\"source\":\"%s\"}}\n",
                      S, M, fmt.sample_rate, source == "omnicore" ? freq : 0.0, cfg.window,
                      static_cast<unsigned long long>(ui_every), source.c_str());
-        cfg.on_power = [&](std::uint64_t w, const float *p, const float *fl) {
-            if (w % ui_every == 0) std::fill(ui_max.begin(), ui_max.end(), 0.f);
-            for (std::size_t i = 0; i < ui_max.size(); ++i) ui_max[i] = std::max(ui_max[i], p[i]);
-            for (std::uint32_t s = 0; s < S; ++s) ui_floor[s] = fl[s];
-        };
     }
+    // Noise-shape calibration: per channel, the median power over (up to the first 4096) windows, divided by
+    // the median over the stream's in-band channels. Run with no signal at the input.
+    std::vector<float> cal; // [kept windows][S][M]
+    if (ui || !calibrate_path.empty())
+        cfg.on_power = [&](std::uint64_t w, const float *p, const float *fl) {
+            if (ui) {
+                if (w % ui_every == 0) std::fill(ui_max.begin(), ui_max.end(), 0.f);
+                for (std::size_t i = 0; i < ui_max.size(); ++i) ui_max[i] = std::max(ui_max[i], p[i]);
+                for (std::uint32_t s = 0; s < S; ++s) ui_floor[s] = fl[s];
+            }
+            if (!calibrate_path.empty() && w >= 4 && cal.size() < std::size_t{4096} * S * M) // first ~17 s
+                cal.insert(cal.end(), p, p + std::size_t{S} * M);
+        };
     std::string line;
     const auto st = run_classifier(*src, model, cfg, [&](std::uint64_t w, std::uint64_t first, const WindowResult *r, std::size_t n) {
-        if (ui) { // per channel, the result of its strongest window in this row (matches the max-power waterfall)
-            if (w % ui_every == 0)
-                for (auto &x : ui_res) x.power = 0;
+        if (ui) { // per channel: vote of this row's windows
+            if (w % ui_every == 0) {
+                std::fill(ui_vote.begin(), ui_vote.end(), 0.f);
+                std::fill(ui_hits.begin(), ui_hits.end(), std::uint8_t{0});
+            }
             for (std::size_t i = 0; i < n; ++i) {
-                WindowResult &x = ui_res[std::size_t{r[i].stream} * M + r[i].channel];
-                if (r[i].power > x.power) x = r[i];
+                const std::size_t e = std::size_t{r[i].stream} * M + r[i].channel;
+                ui_vote[e * ncls + r[i].cls] += r[i].prob;
+                ui_hits[e] = static_cast<std::uint8_t>(std::min(255, ui_hits[e] + 1));
             }
         }
         if (ui && w % ui_every == ui_every - 1) {
@@ -221,10 +248,14 @@ int main(int argc, char **argv) {
             }
             line += "],\"r\":[";
             bool comma = false;
-            for (std::size_t i = 0; i < ui_res.size(); ++i) {
-                if (ui_res[i].power <= 0) continue;
-                std::snprintf(b, sizeof b, comma ? ",[%u,%u,%u,%d]" : "[%u,%u,%u,%d]", ui_res[i].stream, ui_res[i].channel,
-                              ui_res[i].cls, static_cast<int>(std::lround(ui_res[i].prob * 100)));
+            for (std::size_t e = 0; e < ui_hits.size(); ++e) {
+                if (!ui_hits[e]) continue;
+                const float *v = &ui_vote[e * ncls];
+                const auto best = static_cast<std::size_t>(std::max_element(v, v + ncls) - v);
+                float total = 0.f;
+                for (std::size_t c = 0; c < ncls; ++c) total += v[c];
+                std::snprintf(b, sizeof b, comma ? ",[%zu,%zu,%zu,%d,%u]" : "[%zu,%zu,%zu,%d,%u]", e / M, e % M, best,
+                              static_cast<int>(std::lround(100 * v[best] / std::max(total, 1e-9f))), unsigned{ui_hits[e]});
                 line += b;
                 comma = true;
             }
@@ -244,6 +275,31 @@ int main(int argc, char **argv) {
                         10 * std::log10(std::max(r[i].power, 1e-20f)));
     });
     if (dump) std::fclose(dump);
+    if (!calibrate_path.empty()) {
+        const std::size_t n = cal.size() / (std::size_t{S} * M);
+        if (n < 16) { std::fprintf(stderr, "calibration: only %zu windows\n", n); return 1; }
+        const auto h = static_cast<std::uint32_t>(cfg.detect.band * static_cast<float>(M) / 2.f);
+        std::vector<float> shape(std::size_t{S} * M), col(n);
+        for (std::uint32_t s = 0; s < S; ++s) {
+            std::vector<float> inband;
+            for (std::uint32_t k = 0; k < M; ++k) {
+                for (std::size_t t = 0; t < n; ++t) col[t] = cal[(t * S + s) * M + k];
+                std::nth_element(col.begin(), col.begin() + static_cast<std::ptrdiff_t>(n / 2), col.end());
+                shape[std::size_t{s} * M + k] = col[n / 2];
+                if (std::min(k, M - k) <= h) inband.push_back(col[n / 2]);
+            }
+            std::nth_element(inband.begin(), inband.begin() + static_cast<std::ptrdiff_t>(inband.size() / 2), inband.end());
+            const float ref = inband[inband.size() / 2];
+            for (std::uint32_t k = 0; k < M; ++k) shape[std::size_t{s} * M + k] = std::max(shape[std::size_t{s} * M + k] / ref, 1e-3f);
+        }
+        std::FILE *f = std::fopen(calibrate_path.c_str(), "wb");
+        if (!f || std::fwrite(shape.data(), sizeof(float), shape.size(), f) != shape.size()) {
+            std::fprintf(stderr, "cannot write %s\n", calibrate_path.c_str());
+            return 1;
+        }
+        std::fclose(f);
+        std::fprintf(stderr, "noise shape [%u][%u] from %zu windows -> %s\n", S, M, n, calibrate_path.c_str());
+    }
     std::string js = st.to_json();
 #ifdef CURF_HAVE_OMNICORE
     if (och) {

@@ -6,29 +6,51 @@
 <title>cuRF-Stream</title>
 <style>
   :root {
-    --bg: #0d1014; --panel: #151a20; --line: #262e38; --text: #d8dee6; --dim: #7d8896;
+    --bg: #0d1014; --panel: #151a20; --line: #262e38; --text: #d8dee6; --dim: #7d8896; --hi: #1f2730;
     --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
   }
   * { box-sizing: border-box; }
   body { margin: 0; background: var(--bg); color: var(--text); font: 13px/1.4 system-ui, -apple-system, "PingFang SC", sans-serif; }
-  header { display: flex; flex-wrap: wrap; gap: 6px 24px; align-items: baseline; padding: 10px 16px; border-bottom: 1px solid var(--line); }
+  header { display: flex; flex-wrap: wrap; gap: 6px 22px; align-items: baseline; padding: 10px 16px; border-bottom: 1px solid var(--line); }
   header h1 { font-size: 15px; margin: 0; font-weight: 600; }
   .kv { color: var(--dim); font-family: var(--mono); font-size: 12px; }
   .kv b { color: var(--text); font-weight: 500; }
   #state.live b { color: #6fd08c; } #state.ended b { color: #e0b050; } #state.wait b { color: var(--dim); }
-  main { padding: 12px 16px; display: grid; gap: 14px; }
-  .stream { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px 10px; }
+  .bar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 18px; padding: 8px 16px 4px; }
+  .legend { display: flex; flex-wrap: wrap; gap: 4px 6px; }
+  .chip { display: inline-flex; align-items: center; gap: 6px; padding: 2px 8px; border: 1px solid var(--line); border-radius: 12px;
+          font-size: 12px; color: var(--dim); cursor: pointer; user-select: none; }
+  .chip i { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+  .chip b { color: var(--text); font-weight: 500; font-family: var(--mono); }
+  .chip.off { opacity: 0.35; }
+  .ctl { display: flex; align-items: center; gap: 8px; color: var(--dim); font-size: 12px; }
+  .ctl select, .ctl button { background: var(--panel); color: var(--text); border: 1px solid var(--line); border-radius: 4px;
+                             padding: 2px 6px; font: inherit; cursor: pointer; }
+  main { padding: 8px 16px 16px; display: grid; gap: 14px; }
+  .stream { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px 10px;
+            display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 10px; }
+  @media (max-width: 1000px) { .stream { grid-template-columns: minmax(0, 1fr); } }
   .stream h2 { font-size: 12px; font-weight: 600; margin: 0 0 6px; display: flex; justify-content: space-between; color: var(--dim); }
   .stream h2 span:first-child { color: var(--text); }
+  .plots { position: relative; min-width: 0; }
   canvas { display: block; width: 100%; }
-  canvas.wf { image-rendering: pixelated; height: 260px; }
-  canvas.cls { image-rendering: pixelated; height: 90px; margin-top: 3px; }
-  canvas.labels { height: 26px; }
+  canvas.wf { height: 250px; cursor: crosshair; }
+  canvas.cls { height: 80px; margin-top: 3px; cursor: crosshair; }
+  canvas.labels { height: 34px; }
   canvas.axis { height: 18px; }
-  .legend { display: flex; flex-wrap: wrap; gap: 4px 14px; padding: 2px 16px 12px; font-size: 12px; }
-  .legend span { display: inline-flex; align-items: center; gap: 5px; color: var(--dim); }
-  .legend i { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
-  .legend b { color: var(--text); font-weight: 500; font-family: var(--mono); }
+  .sel { position: absolute; top: 0; bottom: 0; background: rgba(120, 170, 255, 0.15); border-left: 1px solid #7aa7ff;
+         border-right: 1px solid #7aa7ff; pointer-events: none; display: none; }
+  .tip { position: fixed; pointer-events: none; background: #0b0e12ee; border: 1px solid var(--line); border-radius: 4px;
+         padding: 6px 8px; font: 12px/1.5 var(--mono); color: var(--text); display: none; z-index: 10; white-space: pre; }
+  .list { border-left: 1px solid var(--line); padding-left: 10px; min-width: 0; display: flex; flex-direction: column; }
+  .list h3 { margin: 0 0 4px; font-size: 12px; font-weight: 600; color: var(--dim); display: flex; justify-content: space-between; }
+  .rows { overflow-y: auto; max-height: 360px; font: 12px/1.6 var(--mono); }
+  .rows table { width: 100%; border-collapse: collapse; }
+  .rows th { text-align: right; color: var(--dim); font-weight: 500; position: sticky; top: 0; background: var(--panel); padding: 0 4px; }
+  .rows td { text-align: right; padding: 0 4px; white-space: nowrap; }
+  .rows th:nth-child(3), .rows td:nth-child(3) { text-align: left; }
+  .rows tr:hover td { background: var(--hi); cursor: pointer; }
+  .rows i { width: 9px; height: 9px; border-radius: 2px; display: inline-block; margin-right: 5px; }
   #end { margin: 0 16px 16px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px; font-family: var(--mono); font-size: 12px; color: var(--dim); white-space: pre-wrap; display: none; }
 </style>
 </head>
@@ -42,62 +64,81 @@
   <span class="kv">时间 <b id="t">-</b></span>
   <span class="kv">行/秒 <b id="rps">-</b></span>
 </header>
-<div class="legend" id="legend"></div>
+<div class="bar">
+  <div class="legend" id="legend"></div>
+  <div class="ctl">平滑
+    <select id="tau"><option value="0.15">0.15 s</option><option value="0.5" selected>0.5 s</option><option value="2">2 s</option></select>
+  </div>
+  <div class="ctl"><button id="reset">全带宽</button><span>在瀑布图上拖动可放大频段，双击复原</span></div>
+</div>
 <main id="streams"></main>
 <div id="end"></div>
+<div class="tip" id="tip"></div>
 <script>
 "use strict";
-// Class colours: distinct hues, readable on the dark background. Index 0 is "noise" (never drawn as a label).
-const PALETTE = ["#4a5563", "#5aa9e6", "#7fc8f8", "#4ecdc4", "#f9c74f", "#f8961e", "#c77dff", "#90be6d", "#f94144", "#ff8fab"];
-const ROWS = 260;            // waterfall history (rows)
-const SPAN_DB = 50;          // colour range above the floor
+// Distinct hues (Tableau-like) for the 9 signal classes; index 0 is "noise".
+const PALETTE = ["#5c6672", "#4e9de6", "#f28e2b", "#59d0c4", "#edc948", "#e15759", "#b07aa1", "#8cd17d", "#ff9da7", "#d9d9d9"];
+const ROWS = 250, CROWS = 80;     // waterfall / class-waterfall history in rows
+const SPAN_DB = 50;
+// Track hysteresis on the presence EMA (fraction of recent rows with a detection)
+const ON = 0.35, OFF = 0.12;
 
-let classes = [], meta = null, panels = [], floors = [], counts = [];
-let rowsSeen = 0, rateT0 = performance.now(), rateRows = 0;
+let classes = [], meta = null, panels = [], counts = [], hidden = new Set();
+let rowDt = 0.034, rateT0 = performance.now(), rateRows = 0, lastList = 0;
+let view = [0, 512];               // displayed column range (fft-shifted columns)
 
-// Waterfall colour map: black -> blue -> teal -> yellow -> white.
 const LUT = (() => {
   const stops = [[0, 6, 8, 14], [0.25, 20, 40, 110], [0.5, 30, 140, 150], [0.75, 235, 200, 70], [1, 255, 255, 240]];
   const lut = new Uint8ClampedArray(256 * 3);
   for (let i = 0; i < 256; i++) {
-    const x = i / 255;
-    let k = 0;
+    const x = i / 255; let k = 0;
     while (k < stops.length - 2 && x > stops[k + 1][0]) k++;
-    const [x0, r0, g0, b0] = stops[k], [x1, r1, g1, b1] = stops[k + 1];
-    const u = (x - x0) / (x1 - x0);
+    const [x0, r0, g0, b0] = stops[k], [x1, r1, g1, b1] = stops[k + 1], u = (x - x0) / (x1 - x0);
     lut[3 * i] = r0 + (r1 - r0) * u; lut[3 * i + 1] = g0 + (g1 - g0) * u; lut[3 * i + 2] = b0 + (b1 - b0) * u;
   }
   return lut;
 })();
-const hex = c => [parseInt(c.slice(1, 3), 16), parseInt(c.slice(3, 5), 16), parseInt(c.slice(5, 7), 16)];
-const RGB = PALETTE.map(hex);
+const RGB = PALETTE.map(c => [1, 3, 5].map(i => parseInt(c.slice(i, i + 2), 16)));
 const color = c => PALETTE[c % PALETTE.length];
-const rgb = c => RGB[c % RGB.length];
-const mhz = hz => (hz / 1e6).toFixed(hz % 1e6 ? 3 : 0) + " MHz";
+const name = c => classes[c] || "c" + c;
+const col = (k, M) => (k + M / 2) % M;                       // channel -> display column (left edge = -fs/2)
+const colHz = x => (x - meta.channels / 2) * meta.rate / meta.channels; // display column -> offset Hz
+const fmtMHz = x => ((meta.freq + colHz(x)) / 1e6).toFixed(2);
+
+function newTrack(M, C) {
+  return { act: new Float32Array(M), on: new Uint8Array(M), since: new Float64Array(M),
+           score: new Float32Array(M * C), pw: new Float32Array(M).fill(-200), cls: new Int16Array(M).fill(-1),
+           conf: new Float32Array(M) };
+}
 
 function build() {
   const root = document.getElementById("streams");
   root.innerHTML = "";
   panels = [];
   const M = meta.channels;
+  view = [0, M];
+  rowDt = meta.every * meta.window * M / (2 * meta.rate); // 2x-oversampled bank: channel rate 2 fs / M
   for (let s = 0; s < meta.streams; s++) {
     const el = document.createElement("section");
     el.className = "stream";
-    el.innerHTML = `<h2><span>RX${s + 1}</span><span class="info"></span></h2>
-      <canvas class="axis"></canvas><canvas class="labels"></canvas>
-      <canvas class="wf" width="${M}" height="${ROWS}"></canvas>
-      <canvas class="cls" width="${M}" height="${ROWS}"></canvas>`;
+    el.innerHTML = `<div class="plots"><h2><span>RX${s + 1}</span><span class="info"></span></h2>
+        <canvas class="axis"></canvas><canvas class="labels"></canvas><canvas class="wf"></canvas><canvas class="cls"></canvas>
+        <div class="sel"></div></div>
+      <div class="list"><h3><span>信号列表</span><span class="n"></span></h3><div class="rows"></div></div>`;
     root.appendChild(el);
     const [axis, labels, wf, cls] = el.querySelectorAll("canvas");
-    const p = { axis, labels, wf, cls, info: el.querySelector(".info"),
-                wctx: wf.getContext("2d"), cctx: cls.getContext("2d"),
-                row: new ImageData(M, 1), crow: new ImageData(M, 1) };
-    p.wctx.fillStyle = "#06080e"; p.wctx.fillRect(0, 0, M, ROWS);
-    p.cctx.fillStyle = "#0b0e13"; p.cctx.fillRect(0, 0, M, ROWS);
+    const off = document.createElement("canvas"); off.width = M; off.height = ROWS;
+    const coff = document.createElement("canvas"); coff.width = M; coff.height = CROWS;
+    const p = { s, axis, labels, wf, cls, off, coff, info: el.querySelector(".info"), rows: el.querySelector(".rows"),
+                n: el.querySelector(".n"), sel: el.querySelector(".sel"), plots: el.querySelector(".plots"),
+                octx: off.getContext("2d"), cctx: coff.getContext("2d"), row: new ImageData(M, 1), crow: new ImageData(M, 1),
+                trk: newTrack(M, Math.max(classes.length, 16)), floor: null, last: null, groups: [] };
+    p.octx.fillStyle = "#06080e"; p.octx.fillRect(0, 0, M, ROWS);
+    p.cctx.fillStyle = "#0b0e13"; p.cctx.fillRect(0, 0, M, CROWS);
+    for (const c of [wf, cls]) hookMouse(p, c);
     panels.push(p);
   }
-  floors = new Array(meta.streams).fill(null);
-  drawAxes();
+  redrawAll();
 }
 
 function fit(cv) {
@@ -107,109 +148,181 @@ function fit(cv) {
   ctx.setTransform(r, 0, 0, r, 0, 0);
   return [ctx, cv.clientWidth, cv.clientHeight];
 }
+const xOf = (x, w) => (x - view[0]) / (view[1] - view[0]) * w;       // column -> CSS px
+const colAt = (px, w) => Math.floor(view[0] + px / w * (view[1] - view[0]));
 
-function drawAxes() {
-  if (!meta) return;
-  const fs = meta.rate, fc = meta.freq;
-  for (const p of panels) {
-    const [ctx, w, h] = fit(p.axis);
-    ctx.clearRect(0, 0, w, h);
-    ctx.fillStyle = "#7d8896"; ctx.strokeStyle = "#39424e";
-    ctx.font = "11px ui-monospace, Menlo, monospace"; ctx.textBaseline = "top";
-    const ticks = 8;
-    for (let i = 0; i <= ticks; i++) {
-      const x = (i / ticks) * w, off = (i / ticks - 0.5) * fs;
-      ctx.beginPath(); ctx.moveTo(x + 0.5, h - 4); ctx.lineTo(x + 0.5, h); ctx.stroke();
-      const label = fc ? ((fc + off) / 1e6).toFixed(2) : (off >= 0 ? "+" : "") + (off / 1e6).toFixed(2);
-      ctx.textAlign = i === 0 ? "left" : i === ticks ? "right" : "center";
-      ctx.fillText(label, x, 1);
-    }
+function drawAxis(p) {
+  const [ctx, w, h] = fit(p.axis);
+  ctx.clearRect(0, 0, w, h);
+  ctx.fillStyle = "#7d8896"; ctx.strokeStyle = "#39424e"; ctx.font = "11px ui-monospace, Menlo, monospace"; ctx.textBaseline = "top";
+  const ticks = Math.max(2, Math.min(8, Math.floor(w / 90)));
+  for (let i = 0; i <= ticks; i++) {
+    const x = view[0] + (view[1] - view[0]) * i / ticks, px = i / ticks * w;
+    ctx.beginPath(); ctx.moveTo(px + 0.5, h - 4); ctx.lineTo(px + 0.5, h); ctx.stroke();
+    ctx.textAlign = i === 0 ? "left" : i === ticks ? "right" : "center";
+    ctx.fillText(meta.freq ? fmtMHz(x) : (colHz(x) >= 0 ? "+" : "") + (colHz(x) / 1e6).toFixed(2), px, 1);
   }
 }
 
-// Display column of channel k: fft-shifted, so the left edge is -fs/2.
-const col = (k, M) => (k + M / 2) % M;
+function blit(p) {
+  for (const [cv, src, rows] of [[p.wf, p.off, ROWS], [p.cls, p.coff, CROWS]]) {
+    const [ctx, w, h] = fit(cv);
+    ctx.imageSmoothingEnabled = false;
+    ctx.drawImage(src, view[0], 0, view[1] - view[0], rows, 0, 0, w, h);
+  }
+}
 
+function redrawAll() { for (const p of panels) { drawAxis(p); blit(p); drawLabels(p); } }
+
+// One feed row: update tracks, push one waterfall row, redraw.
 function onRow(row) {
-  const M = meta.channels, S = meta.streams;
-  const active = Array.from({ length: S }, () => new Int16Array(M).fill(-1));
-  const prob = Array.from({ length: S }, () => new Uint8Array(M));
-  for (const [s, k, c, p] of row.r) { const x = col(k, M); active[s][x] = c; prob[s][x] = p; }
-  counts = new Array(classes.length || 16).fill(0);
-
-  for (let s = 0; s < S; s++) {
-    const p = panels[s];
-    // floor: smoothed, so the colour scale does not flicker
+  const M = meta.channels, C = Math.max(classes.length, 16);
+  const tau = parseFloat(document.getElementById("tau").value);
+  const d = Math.exp(-rowDt / tau);
+  const det = panels.map(() => ({ cls: new Int16Array(M).fill(-1), prob: new Uint8Array(M) }));
+  for (const [s, k, c, pr] of row.r) { const x = col(k, M); det[s].cls[x] = c; det[s].prob[x] = pr; }
+  const now = row.t;
+  counts = new Array(C).fill(0);
+  for (const p of panels) {
+    const s = p.s, T = p.trk, D = det[s];
     const f = row.f[s];
-    floors[s] = floors[s] === null ? f : floors[s] + 0.05 * (f - floors[s]);
-    const lo = floors[s] - 6, scale = 255 / (SPAN_DB + 6);
-    const d = p.row.data, cd = p.crow.data;
+    p.floor = p.floor === null ? f : p.floor + 0.05 * (f - p.floor);
+    const lo = p.floor - 6, scale = 255 / (SPAN_DB + 6), pd = p.row.data, cd = p.crow.data;
     for (let k = 0; k < M; k++) {
-      const x = col(k, M), v = Math.max(0, Math.min(255, (row.p[s * M + k] - lo) * scale)) | 0;
-      d[4 * x] = LUT[3 * v]; d[4 * x + 1] = LUT[3 * v + 1]; d[4 * x + 2] = LUT[3 * v + 2]; d[4 * x + 3] = 255;
+      const x = col(k, M), pw = row.p[s * M + k];
+      const v = Math.max(0, Math.min(255, (pw - lo) * scale)) | 0;
+      pd[4 * x] = LUT[3 * v]; pd[4 * x + 1] = LUT[3 * v + 1]; pd[4 * x + 2] = LUT[3 * v + 2]; pd[4 * x + 3] = 255;
+      T.pw[x] = pw;
     }
-    let n = 0;
     for (let x = 0; x < M; x++) {
-      const c = active[s][x];
-      if (c > 0) {
-        const [r, g, b] = rgb(c), a = 0.35 + 0.65 * prob[s][x] / 100;
-        cd[4 * x] = r * a; cd[4 * x + 1] = g * a; cd[4 * x + 2] = b * a; n++; counts[c]++;
-      } else { cd[4 * x] = 11; cd[4 * x + 1] = 14; cd[4 * x + 2] = 19; }
+      const c = D.cls[x], hit = c >= 0;
+      T.act[x] = d * T.act[x] + (hit ? 1 - d : 0);
+      for (let j = 0; j < C; j++) T.score[x * C + j] *= d;
+      if (hit) T.score[x * C + c] += D.prob[x] / 100;
+      if (!T.on[x] && T.act[x] > ON) { T.on[x] = 1; T.since[x] = now; }
+      else if (T.on[x] && T.act[x] < OFF) T.on[x] = 0;
+      let best = -1, bs = 0, tot = 0;
+      for (let j = 0; j < C; j++) { const v = T.score[x * C + j]; tot += v; if (v > bs) { bs = v; best = j; } }
+      T.cls[x] = best; T.conf[x] = tot > 0 ? bs / tot : 0;
+      // class waterfall: tracked channels in their (smoothed) class colour, raw detections faint
+      if (T.on[x] && best > 0 && !hidden.has(best)) {
+        const [r, g, b] = RGB[best % RGB.length], a = 0.35 + 0.65 * T.conf[x];
+        cd[4 * x] = r * a; cd[4 * x + 1] = g * a; cd[4 * x + 2] = b * a;
+      } else if (hit) { cd[4 * x] = 40; cd[4 * x + 1] = 46; cd[4 * x + 2] = 54; }
+      else { cd[4 * x] = 11; cd[4 * x + 1] = 14; cd[4 * x + 2] = 19; }
       cd[4 * x + 3] = 255;
     }
-    // scroll down one row, new row on top
-    p.wctx.drawImage(p.wf, 0, 0, M, ROWS - 1, 0, 1, M, ROWS - 1);
-    p.wctx.putImageData(p.row, 0, 0);
-    p.cctx.drawImage(p.cls, 0, 0, M, ROWS - 1, 0, 1, M, ROWS - 1);
-    p.cctx.putImageData(p.crow, 0, 0);
-    p.info.textContent = `本底 ${f.toFixed(1)} dBFS · 识别 ${n} 个信道`;
-    drawLabels(p, active[s], prob[s]);
+    p.octx.drawImage(p.off, 0, 0, M, ROWS - 1, 0, 1, M, ROWS - 1); p.octx.putImageData(p.row, 0, 0);
+    p.cctx.drawImage(p.coff, 0, 0, M, CROWS - 1, 0, 1, M, CROWS - 1); p.cctx.putImageData(p.crow, 0, 0);
+    p.now = now;
+    p.groups = group(p, now);
+    for (const g of p.groups) counts[g.cls]++;
+    p.info.textContent = `本底 ${f.toFixed(1)} dBFS · 跟踪 ${p.groups.length} 个信号`;
+    blit(p); drawLabels(p);
   }
-  rowsSeen++; rateRows++;
   document.getElementById("t").textContent = row.t.toFixed(2) + " s";
-  const now = performance.now();
-  if (now - rateT0 > 1000) {
-    document.getElementById("rps").textContent = (rateRows * 1000 / (now - rateT0)).toFixed(1);
-    rateT0 = now; rateRows = 0;
-  }
-  drawLegend();
+  rateRows++;
+  const t = performance.now();
+  if (t - rateT0 > 1000) { document.getElementById("rps").textContent = (rateRows * 1000 / (t - rateT0)).toFixed(1); rateT0 = t; rateRows = 0; }
+  if (t - lastList > 250) { lastList = t; for (const p of panels) drawList(p); drawLegend(); } // lists at 4 Hz
 }
 
-// Label strip: one span per run of adjacent channels with the same class; the name when it fits.
-function drawLabels(p, act, prob) {
-  const M = meta.channels;
-  const [ctx, w, h] = fit(p.labels);
-  ctx.clearRect(0, 0, w, h);
-  ctx.font = "11px system-ui, sans-serif"; ctx.textBaseline = "middle"; ctx.textAlign = "center";
-  const px = w / M;
+// Adjacent tracked columns with the same class form one signal (a wideband signal spans several channels).
+function group(p, now) {
+  const T = p.trk, M = meta.channels, out = [];
   for (let x = 0; x < M;) {
-    const c = act[x];
-    let e = x + 1, best = prob[x];
-    while (e < M && act[e] === c) { best = Math.max(best, prob[e]); e++; }
-    if (c > 0) {
-      const x0 = x * px, x1 = e * px;
-      ctx.fillStyle = color(c);
-      ctx.fillRect(x0, h - 5, Math.max(1, x1 - x0), 5);
-      const name = (classes[c] || "c" + c) + " " + best + "%";
-      const tw = ctx.measureText(name).width;
-      if (tw + 4 <= Math.max(x1 - x0, 0) || (x1 - x0 >= 2 && tw < 70 && !crowded(act, x, e))) {
-        ctx.fillText(name, Math.min(Math.max((x0 + x1) / 2, tw / 2), w - tw / 2), (h - 5) / 2);
-      }
+    if (!T.on[x] || T.cls[x] <= 0) { x++; continue; }
+    const c = T.cls[x];
+    let e = x, pmax = -200, conf = 0, since = now, wsum = 0, xw = 0;
+    while (e < M && T.on[e] && T.cls[e] === c) {
+      const lin = Math.pow(10, T.pw[e] / 10);
+      pmax = Math.max(pmax, T.pw[e]); conf += T.conf[e]; since = Math.min(since, T.since[e]); wsum += lin; xw += lin * e; e++;
     }
+    out.push({ x0: x, x1: e, xc: xw / wsum, cls: c, conf: conf / (e - x), snr: pmax - p.floor, age: now - since });
     x = e;
   }
+  return out;
 }
-// Isolated narrow signals still get a label when no other signal is within ~6% of the band.
-function crowded(act, x, e) {
-  const M = act.length, r = Math.round(M * 0.06);
-  for (let k = Math.max(0, x - r); k < Math.min(M, e + r); k++) if ((k < x || k >= e) && act[k] > 0) return true;
-  return false;
+
+function drawLabels(p) {
+  const [ctx, w, h] = fit(p.labels);
+  ctx.clearRect(0, 0, w, h);
+  ctx.textBaseline = "middle"; ctx.textAlign = "center";
+  let lastEnd = -1e9;
+  for (const g of p.groups) {
+    if (hidden.has(g.cls) || g.x1 <= view[0] || g.x0 >= view[1]) continue;
+    const x0 = xOf(g.x0, w), x1 = xOf(g.x1, w);
+    ctx.fillStyle = color(g.cls);
+    ctx.fillRect(x0, h - 6, Math.max(2, x1 - x0 - 1), 6);
+    const t1 = name(g.cls), t2 = Math.round(g.conf * 100) + "%";
+    ctx.font = "600 11px system-ui, sans-serif";
+    const tw = Math.max(ctx.measureText(t1).width, 26), cx = (x0 + x1) / 2;
+    if (cx - tw / 2 > lastEnd + 3 && cx + tw / 2 < w) { // only where it does not collide with the previous label
+      ctx.fillText(t1, cx, 8);
+      ctx.font = "10px ui-monospace, Menlo, monospace"; ctx.fillStyle = "#9aa4b0";
+      ctx.fillText(t2, cx, 20);
+      lastEnd = cx + tw / 2;
+    }
+  }
+}
+
+function drawList(p) {
+  const gs = p.groups.filter(g => !hidden.has(g.cls) && g.x1 > view[0] && g.x0 < view[1]);
+  p.n.textContent = `${gs.length} 个`;
+  const bw = meta.rate / meta.channels;
+  p.rows.innerHTML = `<table><tr><th>频率 MHz</th><th>带宽 kHz</th><th>类别</th><th>置信</th><th>SNR</th><th>持续</th></tr>` +
+    gs.map(g => `<tr data-x="${g.xc}"><td>${fmtMHz(g.xc)}</td><td>${Math.round((g.x1 - g.x0 + 1) * bw / 1e3)}</td>` +
+      `<td><i style="background:${color(g.cls)}"></i>${name(g.cls)}</td><td>${Math.round(g.conf * 100)}%</td>` +
+      `<td>${g.snr.toFixed(0)} dB</td><td>${g.age < 60 ? g.age.toFixed(1) + " s" : (g.age / 60).toFixed(1) + " min"}</td></tr>`).join("") +
+    `</table>`;
+  for (const tr of p.rows.querySelectorAll("tr[data-x]"))
+    tr.onclick = () => { const x = parseFloat(tr.dataset.x), half = 24; setView(x - half, x + half); };
 }
 
 function drawLegend() {
   const el = document.getElementById("legend");
   el.innerHTML = classes.map((n, c) => c === 0 ? "" :
-    `<span><i style="background:${color(c)}"></i>${n} <b>${counts[c] || 0}</b></span>`).join("");
+    `<span class="chip${hidden.has(c) ? " off" : ""}" data-c="${c}"><i style="background:${color(c)}"></i>${n} <b>${counts[c] || 0}</b></span>`).join("");
+  for (const ch of el.querySelectorAll(".chip"))
+    ch.onclick = () => { const c = +ch.dataset.c; hidden.has(c) ? hidden.delete(c) : hidden.add(c); drawLegend(); for (const p of panels) { drawList(p); drawLabels(p); } };
+}
+
+function setView(a, b) {
+  const M = meta.channels;
+  a = Math.max(0, Math.floor(a)); b = Math.min(M, Math.ceil(b));
+  if (b - a < 8) { const c = (a + b) / 2; a = Math.max(0, Math.floor(c - 4)); b = Math.min(M, a + 8); }
+  view = [a, b];
+  redrawAll();
+  for (const p of panels) drawList(p);
+}
+
+function hookMouse(p, cv) {
+  const tip = document.getElementById("tip");
+  let drag = null;
+  cv.addEventListener("mousedown", e => { drag = e.offsetX; });
+  cv.addEventListener("mousemove", e => {
+    const w = cv.clientWidth, x = colAt(e.offsetX, w);
+    if (drag !== null) {
+      const a = Math.min(drag, e.offsetX), b = Math.max(drag, e.offsetX);
+      Object.assign(p.sel.style, { display: "block", left: a + "px", width: (b - a) + "px", top: cv.offsetTop + "px", height: cv.offsetHeight + "px" });
+    }
+    const T = p.trk, M = meta.channels;
+    if (x < 0 || x >= M) return;
+    const k = (x + M / 2) % M;
+    tip.style.display = "block";
+    tip.style.left = (e.clientX + 14) + "px"; tip.style.top = (e.clientY + 12) + "px";
+    tip.textContent = `${fmtMHz(x)} MHz  (信道 ${k})\n功率 ${T.pw[x].toFixed(0)} dBFS · 高于本底 ${(T.pw[x] - p.floor).toFixed(0)} dB\n` +
+      (T.on[x] && T.cls[x] > 0 ? `${name(T.cls[x])}  置信 ${Math.round(T.conf[x] * 100)}%  已持续 ${(p.now - T.since[x]).toFixed(1)} s` : "未跟踪");
+  });
+  cv.addEventListener("mouseleave", () => { tip.style.display = "none"; });
+  addEventListener("mouseup", e => {
+    if (drag === null) return;
+    const w = cv.clientWidth, a = Math.min(drag, e.offsetX), b = Math.max(drag, e.offsetX);
+    p.sel.style.display = "none";
+    if (e.target === cv && b - a > 6) setView(colAt(a, w), colAt(b, w) + 1);
+    drag = null;
+  });
+  cv.addEventListener("dblclick", () => setView(0, meta.channels));
 }
 
 function setState(cls, text) {
@@ -228,6 +341,7 @@ function onEnd(st) {
 async function start() {
   try { classes = await (await fetch("/classes")).json(); } catch { classes = []; }
   drawLegend();
+  document.getElementById("reset").onclick = () => meta && setView(0, meta.channels);
   const es = new EventSource("/feed");
   es.onmessage = ev => {
     const m = JSON.parse(ev.data);
@@ -235,18 +349,15 @@ async function start() {
       meta = m.meta;
       document.getElementById("src").textContent = meta.source;
       document.getElementById("rate").textContent = (meta.rate / 1e6).toFixed(2) + " MSPS × " + meta.streams;
-      document.getElementById("fc").textContent = meta.freq ? mhz(meta.freq) : "基带（相对频率）";
+      document.getElementById("fc").textContent = meta.freq ? (meta.freq / 1e6).toFixed(3) + " MHz" : "基带（相对频率）";
       document.getElementById("end").style.display = "none";
       build();
       setState("live", "运行中");
-    } else if (m.end) {
-      onEnd(m.end);
-    } else if (meta) {
-      onRow(m);
-    }
+    } else if (m.end) onEnd(m.end);
+    else if (meta) onRow(m);
   };
   es.onerror = () => setState("wait", "连接中断，重连中");
-  addEventListener("resize", drawAxes);
+  addEventListener("resize", () => meta && redrawAll());
 }
 start();
 </script>

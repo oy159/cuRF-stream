@@ -142,6 +142,50 @@ TEST_CASE("channels outside the usable band are neither reported nor part of the
     CHECK(read_active(ws).size() > 100);
 }
 
+TEST_CASE("a calibrated noise shape whitens a front end whose noise rises towards the band edges", "[cuda][windows]") {
+    // Noise rises linearly in dB from 0 at |k| = 150 to +10 dB at |k| = 256 (like the AD9361 at 61.44 MS/s).
+    // Signals: 30 (centre, +15 dB), 240 (edge, +10 dB over its local noise), and a flat wideband signal over
+    // channels 400..499 (+10 dB) - wider than any local-floor window, so it must stay detectable.
+    std::vector<float> shape(M);
+    for (std::uint32_t k = 0; k < M; ++k) {
+        const float d = static_cast<float>(std::min(k, M - k));
+        shape[k] = std::pow(10.f, std::max(0.f, (d - 150.f) / 106.f) * 1.f);
+    }
+    std::vector<cf32> win(std::size_t{S} * W * M);
+    std::mt19937 rng(13);
+    std::normal_distribution<float> nd(0.f, 0.7071f);
+    for (std::uint32_t t = 0; t < W; ++t)
+        for (std::uint32_t k = 0; k < M; ++k) {
+            float pw = 1e-6f * shape[k];
+            if (k == 30) pw *= 31.6f;
+            if (k == 240) pw *= 10.f;
+            if (k >= 400 && k < 500) pw *= 10.f;
+            const float a = std::sqrt(pw);
+            win[std::size_t{t} * M + k] = {a * nd(rng), a * nd(rng)};
+        }
+    cuda::DeviceBuffer<cf32> d(win.size());
+    CURF_CUDA_CHECK(cudaMemcpy(d.get(), win.data(), d.bytes(), cudaMemcpyHostToDevice));
+    cuda::WindowStage ws(S, M, W);
+    cuda::DetectConfig cfg;
+
+    ws.detect(d.get(), cfg, nullptr); // flat floor: the hot edge noise is flagged
+    const auto flat = read_active(ws);
+    std::uint32_t edge_noise = 0;
+    for (const auto k : flat)
+        if (k < M && std::min(k, M - k) > 215 && k != 240 && !(k >= 400 && k < 500)) ++edge_noise;
+    CHECK(edge_noise > 20);
+
+    ws.set_noise_shape(shape); // one shape for both streams
+    ws.detect(d.get(), cfg, nullptr);
+    std::vector<std::uint32_t> want{30, 240};
+    for (std::uint32_t k = 400; k < 500; ++k) want.push_back(k);
+    CHECK(read_active(ws) == want);
+
+    ws.set_noise_shape({}); // back to flat
+    ws.detect(d.get(), cfg, nullptr);
+    CHECK(read_active(ws) == flat);
+}
+
 TEST_CASE("gather transposes and normalises active windows, in chunks", "[cuda][windows]") {
     std::set<std::uint32_t> loud;
     for (std::uint32_t i = 0; i < 70; ++i) loud.insert((i * 37) % (S * M)); // 70 scattered channels

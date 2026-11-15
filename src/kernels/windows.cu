@@ -4,6 +4,7 @@
 #include <cub/device/device_select.cuh>
 #include <cub/iterator/counting_input_iterator.cuh>
 
+#include <algorithm>
 #include <cmath>
 #include <stdexcept>
 

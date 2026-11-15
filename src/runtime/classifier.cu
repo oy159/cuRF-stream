@@ -152,6 +152,7 @@ namespace curf {
         };
         std::unique_ptr<WinCtx> wins[2] = {std::make_unique<WinCtx>(S, M, W), std::make_unique<WinCtx>(S, M, W)};
         auto win = [&](std::uint64_t i) -> WinCtx & { return *wins[i % 2]; };
+        for (auto &w : wins) w->stage.set_noise_shape(cfg.noise_shape);
 
         // Results for entries [from, to) of window w: gather (clamped to the device-side count) + engine +
         // postprocess per chunk, then the D2H of those results. Entries past the real count are computed on
