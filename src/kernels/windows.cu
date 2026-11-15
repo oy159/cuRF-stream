@@ -33,14 +33,22 @@ namespace curf::cuda {
         // One block per stream: bitonic sort of the M channel powers in shared memory, take the percentile,
         // then flag channels above the threshold.
         __global__ void floor_flag_kernel(const float *__restrict__ part, float *power, float *__restrict__ floor_out,
-                                          std::uint8_t *__restrict__ flags, unsigned M, unsigned W, DetectConfig cfg) {
+                                          std::uint8_t *__restrict__ flags, unsigned M, unsigned W, DetectConfig cfg,
+                                          const float *__restrict__ shape) {
             extern __shared__ float v[];
             const unsigned s = blockIdx.x, S = gridDim.x;
             float *p = power + static_cast<std::size_t>(s) * M;
+            const float *sh = shape ? shape + static_cast<std::size_t>(s) * M : nullptr;
+            // usable band: channels within h of DC (channel k >= M/2 is at negative frequency M - k)
+            const unsigned h = min(M / 2, static_cast<unsigned>(fmaxf(cfg.band, 0.f) * static_cast<float>(M) / 2.f));
+            const unsigned usable = h >= M / 2 ? M : 2 * h + 1;
+            auto in_band = [=](unsigned i) { return min(i, M - i) <= h; };
             for (unsigned i = threadIdx.x; i < M; i += blockDim.x) { // power = mean over the window
                 float e = 0.f;
                 for (unsigned z = 0; z < kPowerSplits; ++z) e += part[(static_cast<std::size_t>(z) * S + s) * M + i];
-                p[i] = v[i] = e / static_cast<float>(W);
+                p[i] = e / static_cast<float>(W);
+                // outside the usable band: never reported, sorted to the top so the floor ignores it
+                v[i] = in_band(i) ? (sh ? p[i] / sh[i] : p[i]) : INFINITY; // whitened by the noise shape
             }
             __syncthreads();
             float thr = 0.f;
@@ -60,7 +68,7 @@ namespace curf::cuda {
                         }
                         __syncthreads();
                     }
-                const unsigned q = min(M - 1, static_cast<unsigned>(cfg.percentile * static_cast<float>(M)));
+                const unsigned q = min(usable - 1, static_cast<unsigned>(cfg.percentile * static_cast<float>(usable)));
                 const float fl = v[q];
                 if (threadIdx.x == 0) floor_out[s] = fl;
                 thr = fl * exp10f(cfg.threshold_db / 10.f);
@@ -70,7 +78,7 @@ namespace curf::cuda {
             }
             const float rej = cfg.neighbor_reject_db > 0.f ? exp10f(cfg.neighbor_reject_db / 10.f) : 0.f;
             for (unsigned i = threadIdx.x; i < M; i += blockDim.x) {
-                bool f = cfg.mode == DetectMode::all || p[i] > thr;
+                bool f = cfg.mode == DetectMode::all || (p[i] > (sh && cfg.mode == DetectMode::relative ? thr * sh[i] : thr) && in_band(i));
                 if (f && cfg.mode != DetectMode::all && rej > 0.f) {
                     // channels k - 1 and k + 1 are frequency neighbours, with wrap-around (0 is next to M - 1)
                     const float lo = p[(i + M - 1) & (M - 1)], hi = p[(i + 1) & (M - 1)];
@@ -183,14 +191,33 @@ namespace curf::cuda {
         cudaFree(d_active_);
         cudaFree(d_count_);
         cudaFree(d_cub_temp_);
+        cudaFree(d_shape_);
+    }
+
+    void WindowStage::set_noise_shape(const std::vector<float> &shape) {
+        if (shape.empty()) {
+            cudaFree(d_shape_);
+            d_shape_ = nullptr;
+            return;
+        }
+        std::vector<float> full(entries());
+        if (shape.size() == channels_) // one shape for every stream
+            for (std::uint32_t s = 0; s < streams_; ++s) std::copy(shape.begin(), shape.end(), full.begin() + std::size_t{s} * channels_);
+        else if (shape.size() == entries())
+            full = shape;
+        else
+            throw std::invalid_argument("WindowStage: noise shape must hold channels or streams * channels values");
+        for (const float x : full)
+            if (!(x > 0.f) || !std::isfinite(x)) throw std::invalid_argument("WindowStage: noise shape must be positive");
+        if (!d_shape_) CURF_CUDA_CHECK(cudaMalloc(&d_shape_, entries() * sizeof(float)));
+        CURF_CUDA_CHECK(cudaMemcpy(d_shape_, full.data(), entries() * sizeof(float), cudaMemcpyHostToDevice));
     }
 
     void WindowStage::detect(const cf32 *d_win, const DetectConfig &cfg, cudaStream_t stream) {
         const auto *win = reinterpret_cast<const float2 *>(d_win);
         power_kernel<<<dim3((channels_ + 255) / 256, streams_, kPowerSplits), 256, 0, stream>>>(win, d_part_, channels_, window_);
         floor_flag_kernel<<<streams_, 512, channels_ * sizeof(float), stream>>>(d_part_, d_power_, d_floor_, d_flags_, channels_,
-                                                                                window_,
-                                                                                cfg);
+                                                                                window_, cfg, d_shape_);
         CURF_CUDA_CHECK(cudaGetLastError());
         if (cfg.compaction == Compaction::ballot) {
             compact_ballot_kernel<<<1, 1024, 0, stream>>>(d_flags_, entries(), d_active_, d_count_);

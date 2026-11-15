@@ -92,6 +92,56 @@ TEST_CASE("leakage into neighbouring channels is rejected", "[cuda][windows]") {
     CHECK(read_active(ws) == std::vector<std::uint32_t>{99, 100, 101, 300});
 }
 
+TEST_CASE("over-the-air leakage (-10 dB) is rejected, a flat wideband signal is kept", "[cuda][windows]") {
+    // 100: signal, 99 / 101 at -10 dB (the loopback's median neighbour level); 200..207 a flat wideband signal
+    std::vector<cf32> win(std::size_t{S} * W * M);
+    std::mt19937 rng(7);
+    std::normal_distribution<float> nd(0.f, 0.7071f);
+    for (std::uint32_t t = 0; t < W; ++t)
+        for (std::uint32_t k = 0; k < M; ++k) {
+            float a = 0.001f;
+            if (k == 100) a = 0.1f;
+            if (k == 99 || k == 101) a = 0.1f * 0.316f;
+            if (k >= 200 && k < 208) a = 0.03f;
+            win[std::size_t{t} * M + k] = {a * nd(rng), a * nd(rng)};
+        }
+    cuda::DeviceBuffer<cf32> d(win.size());
+    CURF_CUDA_CHECK(cudaMemcpy(d.get(), win.data(), d.bytes(), cudaMemcpyHostToDevice));
+    cuda::WindowStage ws(S, M, W);
+    ws.detect(d.get(), cuda::DetectConfig{}, nullptr);
+    CHECK(read_active(ws) == std::vector<std::uint32_t>{100, 200, 201, 202, 203, 204, 205, 206, 207});
+}
+
+TEST_CASE("channels outside the usable band are neither reported nor part of the floor", "[cuda][windows]") {
+    // Noise power 1e-6 in band; the outer 2 x 60 channels (|offset| > 196 channels) are 20 dB hotter, like the
+    // shaped ADC noise at a real front end's band edges. Signals at 10 (in band) and 250 (outside).
+    std::vector<cf32> win(std::size_t{S} * W * M);
+    std::mt19937 rng(9);
+    std::normal_distribution<float> nd(0.f, 0.7071f);
+    auto edge = [](std::uint32_t k) { return std::min(k, M - k) > 196; };
+    for (std::uint32_t t = 0; t < W; ++t)
+        for (std::uint32_t k = 0; k < M; ++k) {
+            float a = edge(k) ? 0.01f : 0.001f;
+            if (k == 10) a = 0.01f;   // 20 dB over the in-band noise
+            if (k == 250) a = 0.1f;   // outside the band
+            win[std::size_t{t} * M + k] = {a * nd(rng), a * nd(rng)};
+        }
+    cuda::DeviceBuffer<cf32> d(win.size());
+    CURF_CUDA_CHECK(cudaMemcpy(d.get(), win.data(), d.bytes(), cudaMemcpyHostToDevice));
+    cuda::WindowStage ws(S, M, W);
+    cuda::DetectConfig cfg;
+    cfg.band = 392.f / 512.f; // +- 196 channels
+    ws.detect(d.get(), cfg, nullptr);
+    CHECK(read_active(ws) == std::vector<std::uint32_t>{10});
+    float fl = 0;
+    CURF_CUDA_CHECK(cudaMemcpy(&fl, ws.d_floor(), sizeof fl, cudaMemcpyDeviceToHost));
+    CHECK(fl < 2e-6f); // the in-band noise (1e-6), not the edge noise (1e-4)
+
+    cfg.band = 1.f; // full band: every hot edge channel is flagged
+    ws.detect(d.get(), cfg, nullptr);
+    CHECK(read_active(ws).size() > 100);
+}
+
 TEST_CASE("gather transposes and normalises active windows, in chunks", "[cuda][windows]") {
     std::set<std::uint32_t> loud;
     for (std::uint32_t i = 0; i < 70; ++i) loud.insert((i * 37) % (S * M)); // 70 scattered channels

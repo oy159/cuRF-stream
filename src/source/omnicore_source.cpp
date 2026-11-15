@@ -68,6 +68,14 @@ namespace curf {
             applied.struct_size = sizeof applied;
             check(och_get_config(dev_, &applied), "get_config");
 
+            // The AD9361 RX FIR lives in the board's RAM (loaded with `och fir rx load`, lost at power-off):
+            // record whether this run had it, since it changes the band edges.
+            och_fir_config fir{};
+            fir.struct_size = sizeof fir;
+            if (och_get_fir(dev_, OCH_RX, &fir) == OCH_OK)
+                name_ += fir.enabled ? ", RX FIR on (dec " + std::to_string(fir.factor) + ", " + std::to_string(fir.tap_count) + " taps)"
+                                     : ", RX FIR off";
+
             format_.wire = config_.iq_bits == 8 ? WireFormat::signed8 : WireFormat::packed12;
             format_.channels = config_.channels;
             format_.sample_rate = applied.sample_rate; // the rate the clock chain actually runs at

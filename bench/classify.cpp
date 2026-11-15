@@ -8,6 +8,8 @@
 //                 [--fp32-input]   (INT8: gather fp32 windows; default fp16, which the fused stem rounds to anyway)
 //
 //                 [--ui-out PATH] [--ui-every N]   (display feed, see tools/ui_server.py)
+//                 [--neighbor-db 6] [--band-mhz B]  (detection: leakage rejection; only report +- B/2 around the
+//                                                    centre - default the whole band, 52 MHz for omnicore)
 //   omnicore:     [--serial S] [--freq HZ] [--gain DB] [--agc 0..3] [--iq-bits 12|8] [--bandwidth HZ]
 //                 [--tx-file SC16 --tx-atten DB]  (loopback: send the file on TX1 in a loop; DB >= 40)
 //                 (--streams / --rate as for the other sources; drop mode is implied: hardware cannot wait)
@@ -49,6 +51,7 @@ int main(int argc, char **argv) {
     [[maybe_unused]] std::string serial;
     [[maybe_unused]] double freq = 2.4e9, gain = 30, bandwidth = 0;
     [[maybe_unused]] std::uint32_t agc = 0, iq_bits = 12;
+    double band_mhz = -1; // usable band for detection; default: all (omnicore: 52 MHz, see below)
     [[maybe_unused]] std::string tx_file;
     [[maybe_unused]] double tx_atten = 89.75;
     bool int8 = false;
@@ -77,6 +80,8 @@ int main(int argc, char **argv) {
             const auto m = next();
             cfg.detect.mode = m == "all" ? cuda::DetectMode::all : m == "absolute" ? cuda::DetectMode::absolute : cuda::DetectMode::relative;
         } else if (a == "--threshold-db") cfg.detect.threshold_db = std::stof(next());
+        else if (a == "--neighbor-db") cfg.detect.neighbor_reject_db = std::stof(next());
+        else if (a == "--band-mhz") band_mhz = std::stod(next());
         else if (a == "--abs-power") cfg.detect.absolute_power = std::stof(next());
         else if (a == "--compaction") cfg.detect.compaction = next() == "cub" ? cuda::Compaction::cub : cuda::Compaction::ballot;
         else if (a == "--seconds") cfg.seconds = std::stod(next());
@@ -141,6 +146,9 @@ int main(int argc, char **argv) {
                      tx_file.empty() ? "" : (", TX1 loopback at " + std::to_string(tx_atten) + " dB attenuation").c_str());
         src = std::move(o);
         cfg.drop_when_full = true;
+        // AD9361: 56 MHz analog filter and ADC noise shaping towards +- fs/2 (the loopback's edge channels read
+        // up to 13 dB over the centre floor): detect within +- 26 MHz unless told otherwise
+        if (band_mhz < 0) band_mhz = std::min(52e6, fmt.sample_rate) / 1e6;
 #else
         std::fprintf(stderr, "built without OmniCore (configure with -DCURF_OMNICORE=ON)\n");
         return 2;
@@ -164,6 +172,7 @@ int main(int argc, char **argv) {
         src = std::make_unique<SyntheticSource>(sc);
     }
 
+    if (band_mhz > 0) cfg.detect.band = static_cast<float>(std::min(1.0, band_mhz * 1e6 / fmt.sample_rate));
     std::FILE *dump = dump_path.empty() ? nullptr : std::fopen(dump_path.c_str(), "w");
     if (dump) std::fprintf(dump, "window,stream,channel,cls,prob,power\n");
 
