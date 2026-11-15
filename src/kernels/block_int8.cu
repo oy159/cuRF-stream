@@ -118,7 +118,7 @@ namespace curf::engine::detail {
                     const bool ok = pos >= 0 && pos < p.stem_lin;
                     cp_async16(smem_addr(sx + 4 * c), ok ? xin + static_cast<long long>(pos) * kStemCin : p.stem_x, ok);
                 }
-                cp_async_commit(); // its own group: the stem waits only for this one
+                cp_async_commit(); // its own group: the stem waits only for this one, the weight copies keep flying
             } else {
                 for (int c = tid; c < B::NX * (CIN / 16); c += NT) {
                     const int r = c / (CIN / 16), col = (c % (CIN / 16)) * 16, pos = px0 + r;
@@ -169,7 +169,7 @@ namespace curf::engine::detail {
             // floats of sx from 2 + 4r, so each fragment pair is one float2 read converted to half2 (the fp16
             // engine rounds the input the same way). The fp32 FMA version cost as much as the separate stem
             // kernel (14 x 8 FMAs and 3 shared loads per position and channel group); this is ~2 MMAs per 16 rows.
-            if constexpr (STEM) { // the weight copies issued above keep flying meanwhile
+            if constexpr (STEM) {
                 cp_async_wait<RES ? 1 : STAGES - 1>();
                 __syncthreads();
                 constexpr int MT = (B::NX + 15) / 16, N8 = CIN / 8;
