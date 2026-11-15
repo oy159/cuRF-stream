@@ -22,8 +22,9 @@ namespace curf::engine {
         bool starts_with(const std::string &s, const std::string &p) { return s.rfind(p, 0) == 0; }
 
         // A BasicBlock that may run as one kernel: conv1 (a), conv2 (b, with the residual), shortcut (c).
+        // s: the stem conv in front of it (fp32 graph input), if a stem-fused block variant can take it.
         struct Group {
-            std::size_t a = kNone, b = kNone, c = kNone;
+            std::size_t a = kNone, b = kNone, c = kNone, s = kNone;
         };
 
         // One kernel launch of a bucket's execution plan.
@@ -31,7 +32,11 @@ namespace curf::engine {
             enum class Kind { conv, gap_linear, linear_from_pool, block } kind = Kind::conv;
             std::size_t op = 0;        // conv / head op; block: its conv2
             std::size_t group = kNone; // block only
+            bool stem = false;         // block with the stem conv fused in front
         };
+
+        // Per bucket and group: how the BasicBlock runs.
+        enum class Fuse : unsigned char { none, block, stem };
 
     } // namespace
 
@@ -53,6 +58,8 @@ namespace curf::engine {
         std::vector<std::vector<const ConvVariant *>> conv_choice;   // [bucket][op]
         std::vector<std::vector<float>> conv_us;                     // [bucket][op]
         std::vector<std::vector<const BlockVariant *>> block_choice; // [bucket][group]
+        std::vector<std::vector<const BlockVariant *>> stem_choice;  // [bucket][group], stem-fused variant
+        std::vector<std::vector<Fuse>> fuse_mode;                    // [bucket][group]
         std::vector<cudaGraphExec_t> graphs;                         // [bucket]
         std::vector<OpChoice> choices;
         std::vector<FusionDecision> decisions;
@@ -63,6 +70,7 @@ namespace curf::engine {
         std::vector<std::size_t> w8_off, alpha_off; // [op] into w8 / alpha
         DeviceBuffer<std::int8_t> w8;
         DeviceBuffer<float> alpha;
+        DeviceBuffer<__half> stem_w16;           // stem weights fp16 [cout][16] (k padded) for stem-fused blocks
 
         const TensorDesc &tensor(std::uint32_t t) const { return model.tensors[t]; }
 
@@ -106,7 +114,7 @@ namespace curf::engine {
             return p;
         }
 
-        BlockParams block_params(std::size_t g, int batch) const {
+        BlockParams block_params(std::size_t g, int batch, bool with_stem = false) const {
             const auto &grp = groups[g];
             const auto &a = model.ops[grp.a], &b = model.ops[grp.b];
             BlockParams p;
@@ -147,8 +155,24 @@ namespace curf::engine {
                 p.x_scale = act_scale[a.in];
                 p.y1_inv_scale = 1.f / act_scale[a.out];
                 p.y_inv_scale = grp.b == pool_op ? 0.f : 1.f / act_scale[b.out];
+                if (with_stem && grp.s != kNone) {
+                    const auto &st = model.ops[grp.s];
+                    p.stem_x = static_cast<const float *>(ptr(st.in));
+                    p.stem_w16 = stem_w16.get();
+                    p.stem_b = wptr<float>(st.b_off);
+                    p.stem_lin = static_cast<int>(tensor(st.in).length);
+                    p.stem_cin = static_cast<int>(st.cin);
+                    p.stem_k = static_cast<int>(st.k);
+                    p.stem_stride = static_cast<int>(st.stride);
+                    p.stem_pad = static_cast<int>(st.pad);
+                    p.x_inv_scale = 1.f / act_scale[st.out]; // as the unfused stem's y_inv_scale
+                    if (!p.stem_x) p.stem_x = reinterpret_cast<const float *>(16); // shape check before allocation
+                }
             }
             return p;
+        }
+        bool block_variant_ok(const BlockVariant &v, bool with_stem) const {
+            return v.int8 == cfg.int8 && v.stem == with_stem && starts_with(v.name, cfg.block_prefix);
         }
 
         bool allowed(const ConvVariant &v) const {
@@ -206,11 +230,21 @@ namespace curf::engine {
                     continue;
                 }
                 groups.push_back(g);
-                const auto bp = block_params(groups.size() - 1, 1);
-                bool any = false;
-                for (const auto &v : block_variants())
-                    any = any || (v.int8 == cfg.int8 && starts_with(v.name, cfg.block_prefix) && v.supported(bp));
-                if (!any) { groups.pop_back(); continue; }
+                auto any_variant = [&](bool with_stem) {
+                    const auto bp = block_params(groups.size() - 1, 1, with_stem);
+                    for (const auto &v : block_variants())
+                        if (block_variant_ok(v, with_stem) && v.supported(bp)) return true;
+                    return false;
+                };
+                // stem in front: a conv on the graph input whose output only this block reads
+                const std::size_t is = producer[a.in];
+                if (cfg.int8 && is != kNone && model.ops[is].kind == OpKind::conv && model.ops[is].in == model.input &&
+                    model.ops[is].relu && model.ops[is].res == kNoTensor && is != pool_op &&
+                    consumers[a.in] == 1 + (b.res == a.in) + (g.c != kNone)) {
+                    groups.back().s = is;
+                    if (!any_variant(true)) groups.back().s = kNone;
+                }
+                if (groups.back().s == kNone && !any_variant(false)) { groups.pop_back(); continue; }
                 group_of[ia] = group_of[ib] = groups.size() - 1;
                 if (g.c != kNone) group_of[g.c] = groups.size() - 1;
             }
@@ -221,7 +255,9 @@ namespace curf::engine {
             const auto &op = model.ops[st.op];
             switch (st.kind) {
                 case Step::Kind::conv: launch_conv(*conv_choice[bi][st.op], conv_params(st.op, batch), s); break;
-                case Step::Kind::block: block_choice[bi][st.group]->launch(block_params(st.group, batch), s); break;
+                case Step::Kind::block:
+                    (st.stem ? stem_choice : block_choice)[bi][st.group]->launch(block_params(st.group, batch, st.stem), s);
+                    break;
                 case Step::Kind::gap_linear:
                     launch_gap_linear(static_cast<const __half *>(ptr(op.in)), wptr<float>(op.w_off), wptr<float>(op.b_off),
                                       static_cast<float *>(ptr(op.out)), batch, static_cast<int>(tensor(op.in).length),
@@ -254,11 +290,12 @@ namespace curf::engine {
             std::replace(s.begin(), s.end(), ' ', '_');
             return s;
         }
-        std::string block_key(std::size_t g, int batch) const {
-            const auto p = block_params(g, batch);
+        std::string block_key(std::size_t g, int batch, bool with_stem = false) const {
+            const auto p = block_params(g, batch, with_stem);
             std::ostringstream k;
-            k << gpu << "|B" << (cfg.int8 ? "I8" : "") << cfg.block_prefix << '|' << p.cin << ',' << p.cout << ',' << p.stride << ','
-              << (p.wsc != nullptr) << ',' << p.lin << ',' << (groups[g].b == pool_op) << '|' << batch;
+            k << gpu << "|B" << (cfg.int8 ? "I8" : "") << (with_stem ? "S" : "") << cfg.block_prefix << '|' << p.cin << ','
+              << p.cout << ',' << p.stride << ',' << (p.wsc != nullptr) << ',' << p.lin << ',' << (groups[g].b == pool_op)
+              << '|' << batch;
             auto s = k.str();
             std::replace(s.begin(), s.end(), ' ', '_');
             return s;
@@ -310,7 +347,7 @@ namespace curf::engine {
         const BlockVariant *pick_block(const BlockParams &p, float &best_us) const {
             const BlockVariant *best = nullptr;
             for (const auto &v : block_variants()) {
-                if (v.int8 != cfg.int8 || !starts_with(v.name, cfg.block_prefix) || !v.supported(p)) continue;
+                if (!block_variant_ok(v, p.stem_x != nullptr) || !v.supported(p)) continue;
                 if (!cfg.autotune) { best = &v; break; }
                 const float us = time_us([&] { v.launch(p, stream); });
                 if (!best || us < best_us) { best = &v; best_us = us; }
@@ -318,13 +355,16 @@ namespace curf::engine {
             return best;
         }
 
-        std::vector<Step> make_steps(std::size_t bi, const std::vector<bool> &fused) const {
-            (void)bi;
+        std::vector<Step> make_steps(const std::vector<Fuse> &mode) const {
             std::vector<Step> out;
+            std::vector<bool> stem_fused(model.ops.size(), false);
+            for (std::size_t g = 0; g < groups.size(); ++g)
+                if (mode[g] == Fuse::stem) stem_fused[groups[g].s] = true;
             for (std::size_t i = 0; i < model.ops.size(); ++i) {
                 const auto g = group_of[i];
-                if (g != kNone && fused[g]) {
-                    if (i == groups[g].b) out.push_back({Step::Kind::block, i, g}); // runs where its conv2 was
+                if (stem_fused[i]) continue; // inside its block
+                if (g != kNone && mode[g] != Fuse::none) {
+                    if (i == groups[g].b) out.push_back({Step::Kind::block, i, g, mode[g] == Fuse::stem}); // where conv2 was
                 } else if (model.ops[i].kind == OpKind::conv) {
                     out.push_back({Step::Kind::conv, i});
                 } else {
@@ -343,6 +383,8 @@ namespace curf::engine {
             conv_choice.assign(buckets.size(), std::vector<const ConvVariant *>(no, nullptr));
             conv_us.assign(buckets.size(), std::vector<float>(no, 0.f));
             block_choice.assign(buckets.size(), std::vector<const BlockVariant *>(groups.size(), nullptr));
+            stem_choice = block_choice;
+            fuse_mode.assign(buckets.size(), std::vector<Fuse>(groups.size(), Fuse::none));
             steps.assign(buckets.size(), {});
             auto cached = [&](const std::string &key, auto find, auto pick, float &us) {
                 using V = decltype(pick(us));
@@ -366,54 +408,71 @@ namespace curf::engine {
                     conv_choice[bi][i] = v;
                     conv_us[bi][i] = us;
                 }
-                std::vector<bool> fused(groups.size(), false);
-                std::vector<float> block_us(groups.size(), 0.f);
+                auto &mode = fuse_mode[bi];
+                std::vector<float> block_us(groups.size(), 0.f), stem_us(groups.size(), 0.f);
+                auto find_block = [](const std::string &n) -> const BlockVariant * {
+                    for (const auto &x : block_variants())
+                        if (x.name == n) return &x;
+                    return nullptr;
+                };
                 for (std::size_t g = 0; g < groups.size(); ++g) {
                     const auto p = block_params(g, batch);
-                    const BlockVariant *v = cached(
-                        block_key(g, batch),
-                        [](const std::string &n) -> const BlockVariant * {
-                            for (const auto &x : block_variants())
-                                if (x.name == n) return &x;
-                            return nullptr;
-                        },
-                        [&](float &u) { return pick_block(p, u); }, block_us[g]);
+                    const BlockVariant *v = cached(block_key(g, batch), find_block, [&](float &u) { return pick_block(p, u); },
+                                                   block_us[g]);
                     block_choice[bi][g] = v;
-                    fused[g] = v != nullptr;
+                    mode[g] = v ? Fuse::block : Fuse::none;
+                    if (groups[g].s != kNone) {
+                        const auto ps = block_params(g, batch, true);
+                        stem_choice[bi][g] = cached(block_key(g, batch, true), find_block,
+                                                    [&](float &u) { return pick_block(ps, u); }, stem_us[g]);
+                        if (stem_choice[bi][g]) mode[g] = Fuse::stem;
+                    }
                 }
                 // Fusion decided in context: toggle one block at a time and time the whole network, alternating
                 // the two plans for three rounds (best of each). Per-kernel timings in isolation mislead here: an
                 // unfused conv re-launched on the same buffers finds its input in L2, which the real sequence
                 // does not give it, and the balance shifts with the laptop GPU's clocks as it heats up.
+                // With a stem candidate there are three plans (separate convs, block, stem + block), timed the same way.
                 for (std::size_t g = 0; g < groups.size(); ++g) {
                     const auto &grp = groups[g];
-                    FusionDecision d{batch, model.ops[grp.b].name, block_choice[bi][g] ? block_choice[bi][g]->name : "",
-                                     0.f, 0.f, false};
-                    if (block_choice[bi][g] && cfg.autotune) {
-                        float f = 1e30f, u = 1e30f;
+                    FusionDecision d;
+                    d.bucket = batch;
+                    d.block = model.ops[grp.b].name;
+                    if (block_choice[bi][g]) d.fused_variant = block_choice[bi][g]->name;
+                    if (stem_choice[bi][g]) d.stem_variant = stem_choice[bi][g]->name;
+                    std::vector<Fuse> options{Fuse::none};
+                    if (block_choice[bi][g]) options.push_back(Fuse::block);
+                    if (stem_choice[bi][g]) options.push_back(Fuse::stem);
+                    if (options.size() > 1 && cfg.autotune) {
+                        float best[3] = {1e30f, 1e30f, 1e30f};
                         for (int r = 0; r < 3; ++r)
-                            for (const bool on : {true, false}) {
-                                fused[g] = on;
-                                steps[bi] = make_steps(bi, fused);
+                            for (const Fuse o : options) {
+                                mode[g] = o;
+                                steps[bi] = make_steps(mode);
                                 const float t = time_us([&] { run_eager(bi, batch, stream); });
-                                (on ? f : u) = std::min(on ? f : u, t);
+                                auto &b = best[static_cast<int>(o)];
+                                b = std::min(b, t);
                             }
-                        fused[g] = f < u;
-                        d.fused_us = f;
-                        d.unfused_us = u;
+                        mode[g] = Fuse::none;
+                        for (const Fuse o : options)
+                            if (best[static_cast<int>(o)] < best[static_cast<int>(mode[g])]) mode[g] = o;
+                        d.unfused_us = best[0];
+                        d.fused_us = best[1] < 1e29f ? best[1] : 0.f;
+                        d.stem_fused_us = best[2] < 1e29f ? best[2] : 0.f;
                     }
-                    d.fused = fused[g];
+                    d.fused = mode[g] != Fuse::none;
+                    d.stem = mode[g] == Fuse::stem;
                     decisions.push_back(d);
                 }
-                steps[bi] = make_steps(bi, fused);
+                steps[bi] = make_steps(mode);
                 for (const auto &st : steps[bi]) {
                     const auto &op = model.ops[st.op];
                     OpChoice oc{batch, op.name + (st.op == pool_op ? "+gap" : ""), "", 0.f, 0.0};
                     if (st.kind == Step::Kind::block) {
-                        oc.op = "block:" + oc.op;
-                        oc.variant = block_choice[bi][st.group]->name;
-                        oc.us = block_us[st.group];
-                        oc.flops = block_params(st.group, batch).flops();
+                        oc.op = (st.stem ? "block:" + model.ops[groups[st.group].s].name + "+" : "block:") + oc.op;
+                        oc.variant = (st.stem ? stem_choice : block_choice)[bi][st.group]->name;
+                        oc.us = (st.stem ? stem_us : block_us)[st.group];
+                        oc.flops = block_params(st.group, batch, st.stem).flops();
                     } else if (st.kind == Step::Kind::conv) {
                         oc.variant = conv_choice[bi][st.op]->name;
                         oc.us = conv_us[bi][st.op];
@@ -443,7 +502,7 @@ namespace curf::engine {
                 for (const auto &st : plan_steps) {
                     if (st.kind == Step::Kind::block) {
                         const auto &g = groups[st.group];
-                        need[model.ops[g.a].in] = true;
+                        if (!st.stem) need[model.ops[g.a].in] = true;
                         if (g.b != pool_op) need[model.ops[g.b].out] = true;
                     } else if (st.kind == Step::Kind::linear_from_pool) {
                         need[model.ops[st.op].out] = true;
@@ -561,6 +620,13 @@ namespace curf::engine {
                 }
                 while (hw.size() % 64) hw.push_back(0); // 64-byte aligned rows for the next op
                 while (ha.size() % 4) ha.push_back(0.f);
+                if (op.in == model.input && K <= 16) { // stem: fp16 rows of 16 for the stem-fused block's MMA
+                    std::vector<__half> t(std::size_t{16} * op.cout, __float2half(0.f));
+                    for (std::uint32_t nn = 0; nn < op.cout; ++nn)
+                        for (int k = 0; k < K; ++k) t[nn * 16 + k] = w[nn * op.kpad + k];
+                    stem_w16 = DeviceBuffer<__half>(t.size());
+                    CURF_CUDA_CHECK(cudaMemcpy(stem_w16.get(), t.data(), t.size() * sizeof(__half), cudaMemcpyHostToDevice));
+                }
             }
             w8 = DeviceBuffer<std::int8_t>(hw.size());
             alpha = DeviceBuffer<float>(ha.size());

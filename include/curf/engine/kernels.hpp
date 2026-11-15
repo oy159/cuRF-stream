@@ -79,8 +79,19 @@ namespace curf::engine {
         const std::int8_t *w1_8 = nullptr, *w2_8 = nullptr, *wsc_8 = nullptr;
         const float *alpha1 = nullptr, *alpha2 = nullptr, *alphasc = nullptr;
         float x_scale = 0.f, y1_inv_scale = 0.f, y_inv_scale = 0.f;
+        // Stem fused in front (BlockVariant::stem, INT8 only): x is not read from memory but computed in the
+        // kernel, x = quantise(relu(conv(stem_x, stem_w) + stem_b)) with x_inv_scale = 1 / x_scale, as the
+        // unfused stem stores it (on the tensor cores, with the input rounded to fp16). stem_x fp32
+        // [batch][stem_lin][stem_cin]; stem_w16 fp16 [cin][16], k = tap * stem_cin + ci, zero for k >= stem_k * stem_cin;
+        // lin is the stem's output length.
+        const float *stem_x = nullptr;
+        const __half *stem_w16 = nullptr;
+        const float *stem_b = nullptr;
+        int stem_lin = 0, stem_cin = 0, stem_k = 0, stem_stride = 0, stem_pad = 0;
+        float x_inv_scale = 0.f;
         double flops() const {
-            return 2.0 * batch * lout * cout * (3.0 * cin + 3.0 * cout + (wsc ? cin : 0));
+            return 2.0 * batch * lout * cout * (3.0 * cin + 3.0 * cout + (wsc ? cin : 0)) +
+                   (stem_x ? 2.0 * batch * lin * cin * stem_k * stem_cin : 0.0);
         }
     };
 
@@ -89,6 +100,7 @@ namespace curf::engine {
         bool (*supported)(const BlockParams &) = nullptr;
         void (*launch)(const BlockParams &, cudaStream_t) = nullptr;
         bool int8 = false;
+        bool stem = false; // computes x from the fp32 input (BlockParams::stem_x), replacing the stem conv
     };
     std::span<const BlockVariant> block_variants();
 

@@ -61,6 +61,10 @@ namespace curf::engine {
         std::string fused_variant;  // best block variant
         float fused_us = 0, unfused_us = 0; // whole network, per batch
         bool fused = false;
+        // INT8 first block: the variant with the stem conv fused in front, and the network time with it
+        std::string stem_variant;
+        float stem_fused_us = 0;
+        bool stem = false;           // chosen (implies fused)
     };
 
     class Engine {

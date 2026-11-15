@@ -19,6 +19,13 @@
 //
 // One CTA = BL output positions x all COUT channels of one sample; warp jobs are 32x32 output tiles, plus
 // conv1's 2 halo rows as m16 x 32 jobs (as in block_fused.cu).
+//
+// STEM (first block only): the stem conv (k7 s2 pad3, 2 -> CIN channels, fp32 input) is computed into the
+// x tile instead of loading it. The stem output (CIN x L int8 = 16 KB per window, written once and read
+// twice - conv1 and the identity residual) then never reaches memory, and one launch disappears. The stem
+// is cheap on the tensor cores (K = 14 in one m16n8k16 step): each CTA recomputes its x tile including the
+// 2 + 2 halo rows. The input is rounded to fp16 for the MMA, so the tile can differ from the unfused fp32
+// direct stem by one int8 step where a value sits on a rounding boundary.
 
 #include "conv1d_internal.hpp"
 #include "mma_common.cuh"
@@ -36,7 +43,10 @@ namespace curf::engine::detail {
         // RES: all weights resident in shared memory (loaded once with the x tile), so the k loops run without
         // barriers; otherwise they stream through a 3-stage ring of KS 32-byte k-steps per barrier
         // (KS = 1: rows padded to 48 bytes; KS = 2: 64-byte rows, XOR-swizzled like the conv kernels' tiles).
-        template <int CIN, int COUT, int S, int BL_, bool RES_ = false, int KS_ = 1>
+        // fused stem shape: k7 stride 2 pad 3 over 2 fp32 input channels
+        constexpr int kStemCin = 2, kStemTaps = 7, kStemStride = 2, kStemPad = 3, kStemK = kStemTaps * kStemCin;
+
+        template <int CIN, int COUT, int S, int BL_, bool RES_ = false, int KS_ = 1, bool STEM_ = false>
         struct I8Block {
             static constexpr bool RES = RES_, SC = S != 1 || CIN != COUT;
             static constexpr int KS = KS_;
@@ -57,7 +67,14 @@ namespace curf::engine::detail {
             static constexpr std::size_t STG_POOL = up16(std::size_t{BL} * LDC * 2) + std::size_t{NW} * COUT * 4;
             static constexpr std::size_t STG_Q = std::size_t{BL} * LDQ;
             static constexpr std::size_t STG = STG_POOL > STG_Q ? STG_POOL : STG_Q;
-            static constexpr std::size_t SMEM = XB + (YB + WB > STG ? YB + WB : STG);
+            static constexpr std::size_t MAIN = XB + (YB + WB > STG ? YB + WB : STG);
+            // stem: fp32 input rows [SR][kStemCin] after everything else
+            static constexpr bool STEM = STEM_;
+            // fp32 input rows: one extra leading row so the span starts 16-byte aligned (copied with cp.async)
+            static constexpr int SR = (NX - 1) * kStemStride + kStemTaps + 1;
+            static constexpr std::size_t SXB = up16(std::size_t{SR} * kStemCin * 4);
+            static constexpr std::size_t SMEM = MAIN + (STEM ? SXB : 0);
+            static_assert(!STEM || (S == 1 && CIN % 8 == 0 && SR % 2 == 0 && kStemK <= 16), "stem in front of a stride-1 block");
             static_assert(CIN % 32 == 0 && COUT % 32 == 0 && BL % 32 == 0 && NC <= NW, "tile shapes");
             static_assert(KS == 1 || (KS == 2 && K1 % 64 == 0 && K2 % 64 == 0 && KSC % 64 == 0), "k-steps per tile");
             // byte offset of 16-byte chunk q of ring row n
@@ -73,9 +90,9 @@ namespace curf::engine::detail {
             return make_float2(static_cast<float>(p[0]), static_cast<float>(p[1]));
         }
 
-        template <int CIN, int COUT, int S, int BL, bool SC, bool RES, int KS>
-        __global__ void __launch_bounds__(I8Block<CIN, COUT, S, BL, RES, KS>::NT) block_i8(BlockParams p) {
-            using B = I8Block<CIN, COUT, S, BL, RES, KS>;
+        template <int CIN, int COUT, int S, int BL, bool SC, bool RES, int KS, bool STEM>
+        __global__ void __launch_bounds__(I8Block<CIN, COUT, S, BL, RES, KS, STEM>::NT) block_i8(BlockParams p) {
+            using B = I8Block<CIN, COUT, S, BL, RES, KS, STEM>;
             static_assert(SC == B::SC);
             constexpr int STAGES = B::STAGES, NT = B::NT, NW = B::NW, NC = B::NC, JM = B::JM;
             constexpr int LDX = B::LDX, LDY = B::LDY, LDW = B::LDW;
@@ -90,10 +107,24 @@ namespace curf::engine::detail {
             const auto *xg = static_cast<const std::int8_t *>(static_cast<const void *>(p.x));
             const std::int8_t *xb = xg + static_cast<long long>(b) * p.lin * CIN;
 
-            for (int c = tid; c < B::NX * (CIN / 16); c += NT) {
-                const int r = c / (CIN / 16), col = (c % (CIN / 16)) * 16, pos = px0 + r;
-                const bool ok = pos >= 0 && pos < p.lin;
-                cp_async16(smem_addr(X + r * LDX + col), ok ? xb + static_cast<long long>(pos) * CIN + col : xg, ok);
+            // stem: input rows from ia = (first stem input row) - 1, even, so 16-byte chunks hold 2 whole rows
+            // that are either both inside [0, stem_lin) or both outside (stem_lin even)
+            [[maybe_unused]] float *sx = reinterpret_cast<float *>(smem + B::MAIN);         // [SR][kStemCin]
+            [[maybe_unused]] const int ia = px0 * kStemStride - kStemPad - 1;
+            if constexpr (STEM) {
+                const float *xin = p.stem_x + static_cast<long long>(b) * p.stem_lin * kStemCin;
+                for (int c = tid; c < B::SR / 2; c += NT) {
+                    const int pos = ia + 2 * c;
+                    const bool ok = pos >= 0 && pos < p.stem_lin;
+                    cp_async16(smem_addr(sx + 4 * c), ok ? xin + static_cast<long long>(pos) * kStemCin : p.stem_x, ok);
+                }
+                cp_async_commit(); // its own group: the stem waits only for this one
+            } else {
+                for (int c = tid; c < B::NX * (CIN / 16); c += NT) {
+                    const int r = c / (CIN / 16), col = (c % (CIN / 16)) * 16, pos = px0 + r;
+                    const bool ok = pos >= 0 && pos < p.lin;
+                    cp_async16(smem_addr(X + r * LDX + col), ok ? xb + static_cast<long long>(pos) * CIN + col : xg, ok);
+                }
             }
 
             // weight k-tile stream: [conv1] [conv2] [shortcut], BK bytes of K per tile (RES: k-steps of 32)
@@ -131,6 +162,54 @@ namespace curf::engine::detail {
                     if (st < T) load_w(st);
                     cp_async_commit();
                 }
+            }
+
+            // Stem on the tensor cores: m16n8k16 fp16 (K = 14 taps x channels, padded to 16) with fp32
+            // accumulators. A row r (stem output px0 + r) is input rows ia + 1 + 2r .. + 6, i.e. 16 consecutive
+            // floats of sx from 2 + 4r, so each fragment pair is one float2 read converted to half2 (the fp16
+            // engine rounds the input the same way). The fp32 FMA version cost as much as the separate stem
+            // kernel (14 x 8 FMAs and 3 shared loads per position and channel group); this is ~2 MMAs per 16 rows.
+            if constexpr (STEM) { // the weight copies issued above keep flying meanwhile
+                cp_async_wait<RES ? 1 : STAGES - 1>();
+                __syncthreads();
+                constexpr int MT = (B::NX + 15) / 16, N8 = CIN / 8;
+                const int g = lane / 4, kq = (lane % 4) * 2;
+                unsigned bw[N8][2];
+                float2 bias[N8];
+#pragma unroll
+                for (int j = 0; j < N8; ++j) {
+                    const __half *w = p.stem_w16 + (j * 8 + g) * 16 + kq;
+                    bw[j][0] = *reinterpret_cast<const unsigned *>(w);
+                    bw[j][1] = *reinterpret_cast<const unsigned *>(w + 8);
+                    bias[j] = *reinterpret_cast<const float2 *>(p.stem_b + j * 8 + kq);
+                }
+                auto ld_a = [&](int r, int k) -> unsigned {
+                    r = r < B::NX ? r : B::NX - 1;
+                    const float2 v = *reinterpret_cast<const float2 *>(sx + 2 + 4 * r + k);
+                    const __half2 h = __floats2half2_rn(v.x, v.y);
+                    return *reinterpret_cast<const unsigned *>(&h);
+                };
+                const float sc = p.x_inv_scale;
+                for (int mt = warp; mt < MT; mt += NW) {
+                    const int r0 = mt * 16 + g;
+                    const bool hi = kq + 8 < kStemK; // k 14, 15 are padding (and would read past the tile)
+                    const unsigned a[4] = {ld_a(r0, kq), ld_a(r0 + 8, kq), hi ? ld_a(r0, kq + 8) : 0u,
+                                           hi ? ld_a(r0 + 8, kq + 8) : 0u};
+#pragma unroll
+                    for (int j = 0; j < N8; ++j) {
+                        float c[4] = {bias[j].x, bias[j].y, bias[j].x, bias[j].y};
+                        mma(c, a, bw[j]);
+#pragma unroll
+                        for (int h = 0; h < 2; ++h) {
+                            const int r = r0 + 8 * h, pos = px0 + r;
+                            if (r >= B::NX) continue;
+                            const bool in = pos >= 0 && pos < p.lin; // conv1's zero padding
+                            *reinterpret_cast<unsigned short *>(X + r * LDX + j * 8 + kq) =
+                                in ? pack_q2(fmaxf(c[2 * h], 0.f) * sc, fmaxf(c[2 * h + 1], 0.f) * sc) : 0;
+                        }
+                    }
+                }
+                // visible to the GEMMs after the barrier that waits for the first weights
             }
 
             int acc1[JM][2][4][4], halo[1][4][4], acc2[JM][2][4][4];
@@ -333,24 +412,31 @@ namespace curf::engine::detail {
             }
         }
 
-        template <int CIN, int COUT, int S, int BL, bool SC, bool RES, int KS = 1>
+        template <int CIN, int COUT, int S, int BL, bool SC, bool RES, int KS = 1, bool STEM = false>
         void launch_block_i8(const BlockParams &p, cudaStream_t s) {
-            using B = I8Block<CIN, COUT, S, BL, RES, KS>;
+            using B = I8Block<CIN, COUT, S, BL, RES, KS, STEM>;
             static const bool configured = [] {
-                CURF_CUDA_CHECK(cudaFuncSetAttribute(block_i8<CIN, COUT, S, BL, SC, RES, KS>,
+                CURF_CUDA_CHECK(cudaFuncSetAttribute(block_i8<CIN, COUT, S, BL, SC, RES, KS, STEM>,
                                                      cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(B::SMEM)));
                 return true;
             }();
             (void)configured;
             const dim3 grid(static_cast<unsigned>((p.lout + BL - 1) / BL), static_cast<unsigned>(p.batch));
-            block_i8<CIN, COUT, S, BL, SC, RES, KS><<<grid, B::NT, B::SMEM, s>>>(p);
+            block_i8<CIN, COUT, S, BL, SC, RES, KS, STEM><<<grid, B::NT, B::SMEM, s>>>(p);
             CURF_CUDA_CHECK(cudaGetLastError());
         }
 
         template <int CIN, int COUT, int S, bool SC> bool sup_block_i8(const BlockParams &p) {
-            return p.int8 && p.cin == CIN && p.cout == COUT && p.stride == S && (p.wsc_8 != nullptr) == SC &&
+            return p.int8 && !p.stem_x && p.cin == CIN && p.cout == COUT && p.stride == S && (p.wsc_8 != nullptr) == SC &&
                    p.w1_8 && p.w2_8 && p.kpad1 >= 3 * CIN && p.kpad2 >= 3 * COUT && (!SC || p.kpadsc >= CIN) &&
                    p.lout == (p.lin - 1) / S + 1 && (SC || p.lin == p.lout);
+        }
+        template <int CIN, int COUT> bool sup_stem_block_i8(const BlockParams &p) {
+            BlockParams q = p;
+            q.stem_x = nullptr;
+            return p.stem_x && p.stem_w16 && p.stem_b && p.stem_cin == kStemCin && p.stem_k == kStemTaps &&
+                   p.stem_stride == kStemStride && p.stem_pad == kStemPad && p.stem_lin % 2 == 0 && p.x_inv_scale > 0.f &&
+                   p.lin == (p.stem_lin + 2 * kStemPad - kStemTaps) / kStemStride + 1 && sup_block_i8<CIN, COUT, 1, false>(q);
         }
 
         template <int CIN, int COUT, int S, bool SC> void add_block(std::vector<BlockVariant> &v) {
@@ -368,9 +454,20 @@ namespace curf::engine::detail {
             }
         }
 
+        // stem fused in front of the first block (identity shortcut only)
+        template <int CIN, int COUT> void add_stem_block(std::vector<BlockVariant> &v) {
+            const std::string shape = std::to_string(CIN) + "x" + std::to_string(COUT) + "s1";
+            auto sup = &sup_stem_block_i8<CIN, COUT>;
+            v.push_back({"i8.block.stem.l128r." + shape, sup, &launch_block_i8<CIN, COUT, 1, 128, false, true, 1, true>, true, true});
+            v.push_back({"i8.block.stem.l64r." + shape, sup, &launch_block_i8<CIN, COUT, 1, 64, false, true, 1, true>, true, true});
+            v.push_back({"i8.block.stem.l128." + shape, sup, &launch_block_i8<CIN, COUT, 1, 128, false, false, 1, true>, true, true});
+            v.push_back({"i8.block.stem.l64." + shape, sup, &launch_block_i8<CIN, COUT, 1, 64, false, false, 1, true>, true, true});
+        }
+
     } // namespace
 
     void add_int8_block_variants(std::vector<BlockVariant> &v) {
+        add_stem_block<32, 32>(v);
         add_block<32, 32, 1, false>(v);
         add_block<32, 64, 2, true>(v);
         add_block<64, 64, 1, false>(v);

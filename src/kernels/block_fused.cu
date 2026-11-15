@@ -349,7 +349,7 @@ namespace curf::engine {
         }
 
         template <int CIN, int COUT, int S, bool SC> bool sup_block(const BlockParams &p) {
-            return !p.int8 && p.cin == CIN && p.cout == COUT && p.stride == S && (p.wsc != nullptr) == SC &&
+            return !p.int8 && !p.stem_x && p.cin == CIN && p.cout == COUT && p.stride == S && (p.wsc != nullptr) == SC &&
                    p.kpad1 == 3 * CIN && p.kpad2 == 3 * COUT && (!SC || p.kpadsc == CIN) &&
                    p.lout == (p.lin - 1) / S + 1 && (SC || p.lin == p.lout);
         }

@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
+#include <memory>
 #include <optional>
 
 using namespace curf::engine;
@@ -257,6 +258,71 @@ TEST_CASE("fused INT8 BasicBlocks match the golden", "[cuda][engine][int8][fusio
         for (int i = 0; i < n; ++i) agree += argmax(&logits[i * c], c) == argmax(&g.logits[i * c], c);
         std::printf("  %s: logits rel err %.2e, top-1 %d/%d\n", block.c_str(),
                     rel_err(logits, g.activations[d->model.output].data(), logits.size()), agree, n);
+        CHECK(agree >= n - 2);
+    }
+}
+
+TEST_CASE("INT8 stem fused into the first block matches the separate stem", "[cuda][engine][int8][fusion]") {
+    const auto *d = data();
+    if (!d) SKIP("no converted model in " + kDir.string());
+    const auto &g = d->golden;
+    const int n = static_cast<int>(g.n_layer), c = static_cast<int>(g.classes);
+    std::uint32_t stem_out = kNoTensor, block1_out = kNoTensor;
+    for (const auto &op : d->model.ops) {
+        if (op.in == d->model.input) stem_out = op.out;
+        if (op.name.find("stage1.0/conv2") != std::string::npos) block1_out = op.out;
+    }
+    REQUIRE(stem_out != kNoTensor);
+    REQUIRE(block1_out != kNoTensor);
+    auto make = [&](const std::string &block) {
+        EngineConfig cfg = int8_config(g, d->model);
+        cfg.buckets = {n};
+        cfg.variant_prefix = "i8.mma.64x64.w32.s3.z";
+        cfg.block_prefix = block;
+        cfg.calib_percentile = 1.0;
+        cfg.autotune = false;
+        cfg.cuda_graphs = false;
+        cfg.reuse_memory = false;
+        auto e = std::make_unique<Engine>(d->model, cfg);
+        upload(*e, g, 0, n);
+        e->run(n, nullptr);
+        CURF_CUDA_CHECK(cudaDeviceSynchronize());
+        return e;
+    };
+    for (const std::string tile : {"l128r.", "l64r.", "l128.", "l64."}) {
+        const auto ref = make("i8.block." + tile);      // stem kernel + block kernel
+        const auto fused = make("i8.block.stem." + tile); // one kernel; the other blocks run as convs
+        CHECK(fused->materialized(block1_out));
+        CHECK_FALSE(fused->materialized(stem_out));
+        CHECK(ref->materialized(stem_out));
+        const auto a = ref->read_tensor(block1_out, n), b = fused->read_tensor(block1_out, n);
+        // The fused stem rounds its input to fp16 for the MMA: a stem value next to a rounding boundary moves by
+        // one int8 step, which conv1 spreads over 3 positions x all channels. Count and size of the differences, in
+        // steps of the block output's scale:
+        const double step = fused->activation_scales()[block1_out];
+        std::size_t diff = 0;
+        double worst = 0, se = 0, sv = 0;
+        for (std::size_t i = 0; i < a.size(); ++i) {
+            diff += a[i] != b[i];
+            worst = std::max(worst, std::fabs(static_cast<double>(a[i]) - b[i]) / step);
+            se += (static_cast<double>(a[i]) - b[i]) * (a[i] - b[i]);
+            sv += static_cast<double>(a[i]) * a[i];
+        }
+        std::printf("  i8.block.stem.%s: %zu of %zu block-1 outputs differ from stem kernel + block, max %.0f steps, "
+                    "rms rel %.2e\n", tile.c_str(), diff, a.size(), worst, std::sqrt(se / sv));
+        CHECK(diff <= a.size() / 20);
+        CHECK(worst <= 3.0);
+        CHECK(std::sqrt(se / sv) < 0.01);
+        for (std::uint32_t t = 0; t < d->model.tensors.size(); ++t) {
+            if (t == d->model.input || t == d->model.output || !fused->materialized(t)) continue;
+            const auto got = fused->read_tensor(t, n);
+            INFO(tile << " tensor " << t << " (" << d->model.tensors[t].name << ")");
+            CHECK(rel_err(got, g.activations[t].data(), got.size()) < 0.12);
+        }
+        const auto logits = fused->read_tensor(d->model.output, n);
+        int agree = 0;
+        for (int i = 0; i < n; ++i) agree += argmax(&logits[i * c], c) == argmax(&g.logits[i * c], c);
+        std::printf("  i8.block.stem.%s: %zu steps, top-1 %d/%d\n", tile.c_str(), fused->steps(), agree, n);
         CHECK(agree >= n - 2);
     }
 }
