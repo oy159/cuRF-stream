@@ -57,6 +57,7 @@ TEST_CASE("every conv variant matches the fp32 golden layer by layer", "[cuda][e
     if (!d) SKIP("no converted model in " + kDir.string());
     const int n = static_cast<int>(d->golden.n_layer);
     for (const auto &v : conv_variants()) {
+        if (v.int8) continue; // INT8 variants: own test below
         EngineConfig cfg;
         cfg.buckets = {n};
         cfg.variant_prefix = v.name;
@@ -166,4 +167,125 @@ TEST_CASE("tuned engine with memory reuse and CUDA graphs matches the golden log
     double diff = 0;
     for (int i = 0; i < 5 * c; ++i) diff = std::max(diff, static_cast<double>(std::fabs(small[i] - logits[i])));
     CHECK(diff < 0.1); // buckets may pick different kernels (accumulation order, fp16 accumulators)
+}
+
+namespace {
+    // Calibration on the first half of the golden windows, evaluation on all of them.
+    EngineConfig int8_config(const Golden &g, const Model &m) {
+        EngineConfig cfg;
+        cfg.int8 = true;
+        const auto per = m.tensors[m.input].elems_per_window();
+        cfg.calibration.assign(g.input.begin(), g.input.begin() + static_cast<std::ptrdiff_t>(per * (g.n_full / 2)));
+        return cfg;
+    }
+} // namespace
+
+TEST_CASE("every INT8 conv variant matches the fp32 golden layer by layer", "[cuda][engine][int8]") {
+    const auto *d = data();
+    if (!d) SKIP("no converted model in " + kDir.string());
+    const auto &g = d->golden;
+    const int n = static_cast<int>(g.n_layer);
+    for (const auto &v : conv_variants()) {
+        if (!v.int8 || v.name.rfind("i8.mma.", 0) != 0) continue;
+        EngineConfig cfg = int8_config(g, d->model);
+        cfg.buckets = {n};
+        cfg.variant_prefix = v.name; // the stem falls back to the INT8 direct kernel
+        cfg.calib_percentile = 1.0;  // max calibration: no clipping, so the max error measures the kernels
+        cfg.autotune = false;
+        cfg.cuda_graphs = false;
+        cfg.reuse_memory = false;
+        Engine e(d->model, cfg);
+        upload(e, g, 0, n);
+        e.run(n, nullptr);
+        CURF_CUDA_CHECK(cudaDeviceSynchronize());
+        double worst = 0, worst_rms = 0;
+        for (std::uint32_t t = 0; t < d->model.tensors.size(); ++t) {
+            if (t == d->model.input || !e.materialized(t)) continue;
+            const auto got = e.read_tensor(t, n);
+            const double err = rel_err(got, g.activations[t].data(), got.size());
+            double se = 0, sv = 0;
+            for (std::size_t i = 0; i < got.size(); ++i) {
+                const double dlt = got[i] - g.activations[t][i];
+                se += dlt * dlt;
+                sv += static_cast<double>(g.activations[t][i]) * g.activations[t][i];
+            }
+            const double rms = std::sqrt(se / std::max(sv, 1e-30));
+            worst = std::max(worst, err);
+            worst_rms = std::max(worst_rms, rms);
+            INFO(v.name << " tensor " << t << " (" << d->model.tensors[t].name << ") rel err " << err << " rms " << rms);
+            CHECK(err < 0.12); // 8-bit steps (1/127 of the range) per layer, compounding over 11 convs
+            CHECK(rms < 0.12); // sparse post-ReLU tensors: many small values below one step
+        }
+        std::printf("  %-28s worst tensor: max rel err %.2e, rms rel err %.2e\n", v.name.c_str(), worst, worst_rms);
+    }
+}
+
+TEST_CASE("fused INT8 BasicBlocks match the golden", "[cuda][engine][int8][fusion]") {
+    const auto *d = data();
+    if (!d) SKIP("no converted model in " + kDir.string());
+    const auto &g = d->golden;
+    const int n = static_cast<int>(g.n_layer), c = static_cast<int>(g.classes);
+    for (const std::string block : {"i8.block.l128.", "i8.block.l64.", "i8.block.l128r.", "i8.block.l64r.", "i8.block.l64k2.",
+                                     "i8.block.l128k2."}) {
+        // no resident 64x128 block; k2 variants only for cin = 64 (stage2.1, stage3): two blocks run as convs
+        const bool resident = block[block.size() - 2] == 'r', k2 = block.find("k2.") != std::string::npos;
+        EngineConfig cfg = int8_config(g, d->model);
+        cfg.buckets = {n};
+        cfg.variant_prefix = "i8.mma.64x64.w32.s3.z";
+        cfg.block_prefix = block;
+        cfg.calib_percentile = 1.0;
+        cfg.autotune = false;
+        cfg.cuda_graphs = false;
+        cfg.reuse_memory = false;
+        Engine e(d->model, cfg);
+        CHECK(e.steps() == (resident ? 8u : k2 ? 9u : 6u)); // stem + 4 blocks + head; unfused blocks as convs
+        upload(e, g, 0, n);
+        e.run(n, nullptr);
+        CURF_CUDA_CHECK(cudaDeviceSynchronize());
+        int checked = 0;
+        for (std::uint32_t t = 0; t < d->model.tensors.size(); ++t) {
+            if (t == d->model.input || t == d->model.output || !e.materialized(t)) continue;
+            const auto got = e.read_tensor(t, n);
+            const double err = rel_err(got, g.activations[t].data(), got.size());
+            INFO(block << " tensor " << t << " (" << d->model.tensors[t].name << ") rel err " << err);
+            CHECK(err < 0.12);
+            ++checked;
+        }
+        CHECK(checked == (resident ? 6 : k2 ? 7 : 4)); // stem out + 3 block outputs + the unfused blocks' inner tensors
+        const auto logits = e.read_tensor(d->model.output, n);
+        int agree = 0;
+        for (int i = 0; i < n; ++i) agree += argmax(&logits[i * c], c) == argmax(&g.logits[i * c], c);
+        std::printf("  %s: logits rel err %.2e, top-1 %d/%d\n", block.c_str(),
+                    rel_err(logits, g.activations[d->model.output].data(), logits.size()), agree, n);
+        CHECK(agree >= n - 2);
+    }
+}
+
+TEST_CASE("tuned INT8 engine keeps the fp32 accuracy", "[cuda][engine][int8]") {
+    const auto *d = data();
+    if (!d) SKIP("no converted model in " + kDir.string());
+    const auto &g = d->golden;
+    const int n = static_cast<int>(g.n_full), c = static_cast<int>(g.classes);
+    EngineConfig cfg = int8_config(g, d->model);
+    cfg.buckets = {1, 8, 128, n};
+    cfg.tune_iters = 5;
+    Engine e(d->model, cfg);
+    upload(e, g, 0, n);
+    e.run(n, nullptr);
+    CURF_CUDA_CHECK(cudaDeviceSynchronize());
+    const auto logits = e.read_tensor(d->model.output, n);
+    int agree = 0, correct = 0, correct_ref = 0, held_agree = 0, held = 0;
+    for (int i = 0; i < n; ++i) {
+        const int a = argmax(&logits[i * c], c), b = argmax(&g.logits[i * c], c);
+        agree += a == b;
+        correct += a == g.labels[i];
+        correct_ref += b == g.labels[i];
+        if (i >= n / 2) { held_agree += a == b; ++held; }
+    }
+    std::printf("  int8 engine: top-1 agreement %d/%d (held-out %d/%d), accuracy %d vs fp32 %d\n", agree, n, held_agree,
+                held, correct, correct_ref);
+    for (const auto &ch : e.choices())
+        if (ch.bucket == n) std::printf("    %-40s %-28s %8.1f us\n", ch.op.c_str(), ch.variant.c_str(), ch.us);
+    CHECK(held_agree >= held * 97 / 100);
+    CHECK(correct >= correct_ref - n / 100);
 }

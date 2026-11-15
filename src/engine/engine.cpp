@@ -3,6 +3,8 @@
 #include "curf/cuda/memory.hpp"
 
 #include <algorithm>
+#include <cmath>
+#include <cstring>
 #include <fstream>
 #include <functional>
 #include <map>
@@ -55,6 +57,12 @@ namespace curf::engine {
         std::vector<OpChoice> choices;
         std::vector<FusionDecision> decisions;
         std::string gpu;
+        // INT8
+        std::vector<float> act_scale;            // [tensor]
+        std::vector<int> kpad8;                  // [op] int8 weight row length (multiple of 64)
+        std::vector<std::size_t> w8_off, alpha_off; // [op] into w8 / alpha
+        DeviceBuffer<std::int8_t> w8;
+        DeviceBuffer<float> alpha;
 
         const TensorDesc &tensor(std::uint32_t t) const { return model.tensors[t]; }
 
@@ -87,6 +95,14 @@ namespace curf::engine {
             p.pad = static_cast<int>(op.pad);
             p.kpad = static_cast<int>(op.kpad);
             p.relu = op.relu;
+            if (cfg.int8 && !act_scale.empty()) {
+                p.int8 = true;
+                p.kpad = kpad8[i];
+                p.w8 = w8.get() + w8_off[i];
+                p.alpha = alpha.get() + alpha_off[i];
+                p.res_scale = op.res == kNoTensor ? 0.f : act_scale[op.res];
+                p.y_inv_scale = i == pool_op ? 0.f : 1.f / act_scale[op.out];
+            }
             return p;
         }
 
@@ -115,10 +131,28 @@ namespace curf::engine {
             p.stride = static_cast<int>(a.stride);
             p.kpad1 = static_cast<int>(a.kpad);
             p.kpad2 = static_cast<int>(b.kpad);
+            if (cfg.int8 && !act_scale.empty()) {
+                p.int8 = true;
+                p.w1_8 = w8.get() + w8_off[grp.a];
+                p.w2_8 = w8.get() + w8_off[grp.b];
+                p.alpha1 = alpha.get() + alpha_off[grp.a];
+                p.alpha2 = alpha.get() + alpha_off[grp.b];
+                p.kpad1 = kpad8[grp.a];
+                p.kpad2 = kpad8[grp.b];
+                if (grp.c != kNone) {
+                    p.wsc_8 = w8.get() + w8_off[grp.c];
+                    p.alphasc = alpha.get() + alpha_off[grp.c];
+                    p.kpadsc = kpad8[grp.c];
+                }
+                p.x_scale = act_scale[a.in];
+                p.y1_inv_scale = 1.f / act_scale[a.out];
+                p.y_inv_scale = grp.b == pool_op ? 0.f : 1.f / act_scale[b.out];
+            }
             return p;
         }
 
         bool allowed(const ConvVariant &v) const {
+            if (v.int8 != cfg.int8) return false;
             for (const auto &x : cfg.exclude_prefixes)
                 if (starts_with(v.name, x)) return false;
             return true;
@@ -174,7 +208,8 @@ namespace curf::engine {
                 groups.push_back(g);
                 const auto bp = block_params(groups.size() - 1, 1);
                 bool any = false;
-                for (const auto &v : block_variants()) any = any || (starts_with(v.name, cfg.block_prefix) && v.supported(bp));
+                for (const auto &v : block_variants())
+                    any = any || (v.int8 == cfg.int8 && starts_with(v.name, cfg.block_prefix) && v.supported(bp));
                 if (!any) { groups.pop_back(); continue; }
                 group_of[ia] = group_of[ib] = groups.size() - 1;
                 if (g.c != kNone) group_of[g.c] = groups.size() - 1;
@@ -210,7 +245,7 @@ namespace curf::engine {
         std::string conv_key(std::size_t i, int batch) const {
             const auto &op = model.ops[i];
             std::ostringstream k;
-            k << gpu << '|' << cfg.variant_prefix << '|';
+            k << gpu << '|' << (cfg.int8 ? "I8" : "") << cfg.variant_prefix << '|';
             for (const auto &x : cfg.exclude_prefixes) k << '-' << x;
             k << '|' << op.cin << ',' << op.cout << ',' << op.k << ',' << op.stride << ',' << op.pad << ','
               << tensor(op.in).length << ',' << (op.res != kNoTensor) << op.relu << (op.in == model.input)
@@ -222,7 +257,7 @@ namespace curf::engine {
         std::string block_key(std::size_t g, int batch) const {
             const auto p = block_params(g, batch);
             std::ostringstream k;
-            k << gpu << "|B" << cfg.block_prefix << '|' << p.cin << ',' << p.cout << ',' << p.stride << ','
+            k << gpu << "|B" << (cfg.int8 ? "I8" : "") << cfg.block_prefix << '|' << p.cin << ',' << p.cout << ',' << p.stride << ','
               << (p.wsc != nullptr) << ',' << p.lin << ',' << (groups[g].b == pool_op) << '|' << batch;
             auto s = k.str();
             std::replace(s.begin(), s.end(), ' ', '_');
@@ -275,7 +310,7 @@ namespace curf::engine {
         const BlockVariant *pick_block(const BlockParams &p, float &best_us) const {
             const BlockVariant *best = nullptr;
             for (const auto &v : block_variants()) {
-                if (!starts_with(v.name, cfg.block_prefix) || !v.supported(p)) continue;
+                if (v.int8 != cfg.int8 || !starts_with(v.name, cfg.block_prefix) || !v.supported(p)) continue;
                 if (!cfg.autotune) { best = &v; break; }
                 const float us = time_us([&] { v.launch(p, stream); });
                 if (!best || us < best_us) { best = &v; best_us = us; }
@@ -422,7 +457,7 @@ namespace curf::engine {
 
         void allocate_arena() {
             const auto maxb = static_cast<std::size_t>(buckets.back());
-            plan = plan_memory(model, maxb, sizeof(__half), cfg.reuse_memory, &materialized);
+            plan = plan_memory(model, maxb, cfg.int8 ? 1 : sizeof(__half), cfg.reuse_memory, &materialized);
             arena = DeviceBuffer<std::byte>(plan.arena_bytes);
             if (arena.bytes()) CURF_CUDA_CHECK(cudaMemset(arena.get(), 0, arena.bytes()));
         }
@@ -441,6 +476,96 @@ namespace curf::engine {
                 CURF_CUDA_CHECK(cudaGraphInstantiate(&graphs[bi], g, 0));
                 CURF_CUDA_CHECK(cudaGraphDestroy(g));
             }
+        }
+
+        // ------------------------------------------------------------ INT8
+        // Activation scales: the fp16 engine (no fusion, every tensor kept, fp32-accumulating kernels) runs over
+        // the calibration windows; pass 1 finds max |v| per tensor, pass 2 a 4096-bin histogram of |v| / max,
+        // from which the calib_percentile quantile is read.
+        void calibrate() {
+            const auto &in = model.tensors[model.input];
+            const std::size_t per = in.elems_per_window();
+            if (cfg.calibration.empty() || cfg.calibration.size() % per != 0)
+                throw std::invalid_argument("engine: int8 needs calibration windows [n][L][C]");
+            const int n = static_cast<int>(cfg.calibration.size() / per);
+            const int B = std::min(n, 256);
+            EngineConfig c;
+            c.buckets = {B};
+            c.variant_prefix = "mma.f32.";
+            c.fuse_blocks = c.fuse_gap = c.autotune = c.cuda_graphs = c.reuse_memory = false;
+            Engine fp(model, c);
+            const auto nt = model.tensors.size();
+            std::vector<double> mx(nt, 0.0);
+            constexpr int BINS = 4096;
+            std::vector<std::vector<std::uint64_t>> hist(nt, std::vector<std::uint64_t>(BINS, 0));
+            const bool use_hist = cfg.calib_percentile < 1.0;
+            for (int pass = 0; pass < (use_hist ? 2 : 1); ++pass)
+                for (int b0 = 0; b0 < n; b0 += B) {
+                    const int nb = std::min(B, n - b0);
+                    CURF_CUDA_CHECK(cudaMemcpy(fp.input(), cfg.calibration.data() + static_cast<std::size_t>(b0) * per,
+                                               static_cast<std::size_t>(nb) * per * sizeof(float), cudaMemcpyHostToDevice));
+                    fp.run(B, nullptr);
+                    for (std::uint32_t t = 0; t < nt; ++t) {
+                        if (t == model.input || t == model.output) continue;
+                        const auto v = fp.read_tensor(t, nb);
+                        if (pass == 0) {
+                            for (const float x : v) mx[t] = std::max(mx[t], static_cast<double>(std::fabs(x)));
+                        } else if (mx[t] > 0) {
+                            const double k = BINS / mx[t];
+                            for (const float x : v) ++hist[t][std::min<std::size_t>(BINS - 1, static_cast<std::size_t>(std::fabs(x) * k))];
+                        }
+                    }
+                }
+            act_scale.assign(nt, 0.f);
+            for (std::uint32_t t = 0; t < nt; ++t) {
+                if (t == model.input || t == model.output) continue;
+                double a = mx[t];
+                if (use_hist && a > 0) {
+                    std::uint64_t total = 0, run = 0;
+                    for (auto h : hist[t]) total += h;
+                    const auto target = static_cast<std::uint64_t>(std::ceil(cfg.calib_percentile * static_cast<double>(total)));
+                    for (int i = 0; i < BINS; ++i)
+                        if ((run += hist[t][i]) >= target) { a = mx[t] * (i + 1) / BINS; break; }
+                }
+                act_scale[t] = static_cast<float>(std::max(a, 1e-8) / 127.0);
+            }
+        }
+
+        // Weights: per output channel s_w = max |w| / 127, rows re-padded to a multiple of 64 bytes;
+        // alpha[n] = s_w[n] * s_x (s_x: the conv input's scale; 1 for the fp32 stem, which keeps fp16 weights).
+        void quantize_weights() {
+            const auto no = model.ops.size();
+            kpad8.assign(no, 0);
+            w8_off.assign(no, 0);
+            alpha_off.assign(no, 0);
+            std::vector<std::int8_t> hw;
+            std::vector<float> ha;
+            for (std::size_t i = 0; i < no; ++i) {
+                const auto &op = model.ops[i];
+                if (op.kind != OpKind::conv) continue;
+                const int K = static_cast<int>(op.k * op.cin), kp = (K + 63) / 64 * 64;
+                kpad8[i] = op.in == model.input ? static_cast<int>(op.kpad) : kp; // stem: fp16 weights, kpad unchanged
+                w8_off[i] = hw.size();
+                alpha_off[i] = ha.size();
+                const auto *w = reinterpret_cast<const __half *>(model.blob.data() + op.w_off);
+                const float sx = op.in == model.input ? 1.f : act_scale[op.in];
+                for (std::uint32_t nn = 0; nn < op.cout; ++nn) {
+                    float a = 0.f;
+                    for (int k = 0; k < K; ++k) a = std::max(a, std::fabs(__half2float(w[nn * op.kpad + k])));
+                    const float sw = std::max(a, 1e-12f) / 127.f;
+                    ha.push_back(sw * sx);
+                    for (int k = 0; k < kp; ++k) {
+                        const float v = k < K ? __half2float(w[nn * op.kpad + k]) / sw : 0.f;
+                        hw.push_back(static_cast<std::int8_t>(std::lround(std::clamp(v, -127.f, 127.f))));
+                    }
+                }
+                while (hw.size() % 64) hw.push_back(0); // 64-byte aligned rows for the next op
+                while (ha.size() % 4) ha.push_back(0.f);
+            }
+            w8 = DeviceBuffer<std::int8_t>(hw.size());
+            alpha = DeviceBuffer<float>(ha.size());
+            CURF_CUDA_CHECK(cudaMemcpy(w8.get(), hw.data(), hw.size(), cudaMemcpyHostToDevice));
+            CURF_CUDA_CHECK(cudaMemcpy(alpha.get(), ha.data(), ha.size() * sizeof(float), cudaMemcpyHostToDevice));
         }
 
         std::size_t bucket_index(int batch) const {
@@ -477,9 +602,15 @@ namespace curf::engine {
         m.weights = DeviceBuffer<std::byte>(m.model.blob.size());
         CURF_CUDA_CHECK(cudaMemcpy(m.weights.get(), m.model.blob.data(), m.model.blob.size(), cudaMemcpyHostToDevice));
 
+        if (m.cfg.int8) {
+            m.calibrate();
+            m.quantize_weights();
+        }
+
         // Fusion candidates only depend on shapes, so they are found before activations exist (null pointers).
         m.materialized.assign(m.model.tensors.size(), true);
         m.find_fusions();
+        if (m.cfg.int8 && m.pool_op == kNone) throw std::runtime_error("engine: int8 needs the GAP fusion (fuse_gap)");
 
         const auto maxb = static_cast<std::size_t>(m.buckets.back());
         m.input = DeviceBuffer<float>(maxb * m.model.tensors[m.model.input].elems_per_window());
@@ -512,6 +643,7 @@ namespace curf::engine {
     const float *Engine::logits() const { return impl_->logits.get(); }
     const MemoryPlan &Engine::memory_plan() const { return impl_->plan; }
     const std::vector<OpChoice> &Engine::choices() const { return impl_->choices; }
+    const std::vector<float> &Engine::activation_scales() const { return impl_->act_scale; }
     const std::vector<FusionDecision> &Engine::fusion_decisions() const { return impl_->decisions; }
     bool Engine::materialized(std::uint32_t t) const { return impl_->materialized.at(t); }
     std::size_t Engine::steps(int batch) const { return impl_->steps[impl_->bucket_index(batch)].size(); }
@@ -548,7 +680,8 @@ namespace curf::engine {
             return out;
         }
         if (m.scratch.size() < n) m.scratch = DeviceBuffer<float>(n);
-        launch_half_to_float(static_cast<const __half *>(m.ptr(t)), m.scratch.get(), n, m.stream);
+        if (m.cfg.int8) launch_int8_to_float(static_cast<const std::int8_t *>(m.ptr(t)), m.scratch.get(), n, m.act_scale[t], m.stream);
+        else launch_half_to_float(static_cast<const __half *>(m.ptr(t)), m.scratch.get(), n, m.stream);
         CURF_CUDA_CHECK(cudaStreamSynchronize(m.stream));
         CURF_CUDA_CHECK(cudaMemcpy(out.data(), m.scratch.get(), n * sizeof(float), cudaMemcpyDeviceToHost));
         return out;

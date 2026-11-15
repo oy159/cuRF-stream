@@ -20,6 +20,7 @@
 // Channel counts are compile-time (the shapes of this model); other shapes fall back to separate convs.
 
 #include "curf/cuda/memory.hpp"
+#include "conv1d_internal.hpp"
 #include "curf/engine/kernels.hpp"
 #include "mma_common.cuh"
 
@@ -348,7 +349,7 @@ namespace curf::engine {
         }
 
         template <int CIN, int COUT, int S, bool SC> bool sup_block(const BlockParams &p) {
-            return p.cin == CIN && p.cout == COUT && p.stride == S && (p.wsc != nullptr) == SC &&
+            return !p.int8 && p.cin == CIN && p.cout == COUT && p.stride == S && (p.wsc != nullptr) == SC &&
                    p.kpad1 == 3 * CIN && p.kpad2 == 3 * COUT && (!SC || p.kpadsc == CIN) &&
                    p.lout == (p.lin - 1) / S + 1 && (SC || p.lin == p.lout);
         }
@@ -372,6 +373,7 @@ namespace curf::engine {
             add<32, 64, 2, true>(v);
             add<64, 64, 1, false>(v);
             add<64, 128, 2, true>(v);
+            detail::add_int8_block_variants(v);
             return v;
         }
 

@@ -256,7 +256,8 @@ namespace curf::engine {
         // are template parameters: the first version (TL 256, Q 4, 69 registers, 3 blocks / SM) reached only
         // 53% of DRAM bandwidth because each block's load -> compute -> store runs serially and too few blocks
         // were resident to overlap them.
-        template <class TIn, int TL, int Q, int MINB>
+        // I8: int8 output (and residual) with the per-tensor scales of ConvParams (the INT8 engine's stem).
+        template <class TIn, int TL, int Q, int MINB, bool I8 = false>
         __global__ void __launch_bounds__(256, MINB) conv_direct(ConvParams p) {
             constexpr int PG = TL / Q;
             extern __shared__ float sm[];
@@ -303,6 +304,24 @@ namespace curf::engine {
                     const int l = l0 + pg + q * PG;
                     if (l >= p.lout) continue;
                     const long long m = static_cast<long long>(b) * p.lout + l;
+                    if constexpr (I8) {
+                        float v[8];
+#pragma unroll
+                        for (int e = 0; e < 8; ++e) v[e] = acc[q][e];
+                        if (p.res) {
+                            const uint2 rq = *reinterpret_cast<const uint2 *>(static_cast<const std::int8_t *>(
+                                                                                  static_cast<const void *>(p.res)) + m * p.cout + n);
+                            const auto *rb = reinterpret_cast<const std::int8_t *>(&rq);
+#pragma unroll
+                            for (int e = 0; e < 8; ++e) v[e] = fmaf(static_cast<float>(rb[e]), p.res_scale, v[e]);
+                        }
+                        const float sc = p.y_inv_scale;
+#pragma unroll
+                        for (int e = 0; e < 8; ++e) v[e] = (p.relu ? fmaxf(v[e], 0.f) : v[e]) * sc;
+                        *reinterpret_cast<uint2 *>(static_cast<std::int8_t *>(static_cast<void *>(p.y)) + m * p.cout + n) =
+                            make_uint2(detail::pack_q4(v[0], v[1], v[2], v[3]), detail::pack_q4(v[4], v[5], v[6], v[7]));
+                        continue;
+                    }
                     __half2 o[4];
 #pragma unroll
                     for (int e = 0; e < 4; ++e) o[e] = __floats2half2_rn(acc[q][2 * e], acc[q][2 * e + 1]);
@@ -372,7 +391,14 @@ namespace curf::engine {
         }
         // Direct conv only pays off for a handful of input channels.
         bool sup_direct(const ConvParams &p) {
-            return p.cin <= 8 && p.cout % 8 == 0 && direct_smem(p) <= 48 * 1024;
+            return !p.int8 && p.cin <= 8 && p.cout % 8 == 0 && direct_smem(p) <= 48 * 1024;
+        }
+        template <int TL, int Q, int MINB> void launch_direct_i8(const ConvParams &p, cudaStream_t s) {
+            const dim3 grid(static_cast<unsigned>((p.lout + TL - 1) / TL), static_cast<unsigned>(p.batch));
+            conv_direct<float, TL, Q, MINB, true><<<grid, 256, direct_smem(p, TL), s>>>(p);
+        }
+        bool sup_direct_i8(const ConvParams &p) {
+            return p.int8 && p.x_f32 && p.cin <= 8 && p.cout % 8 == 0 && direct_smem(p) <= 48 * 1024;
         }
 
         template <int BM, int BN, bool Fused, class AccT> void launch_wmma(const ConvParams &p, cudaStream_t s) {
@@ -409,6 +435,10 @@ namespace curf::engine {
             v.push_back({"direct.t128q2b6", true, &sup_direct, &launch_direct<128, 2, 6>});
             v.push_back({"direct.t256q2b6", true, &sup_direct, &launch_direct<256, 2, 6>});
             v.push_back({"direct.t512q4b4", true, &sup_direct, &launch_direct<512, 4, 4>});
+            detail::add_int8_variants(v);
+            v.push_back({"i8.direct.t256q4b4", true, &sup_direct_i8, &launch_direct_i8<256, 4, 4>, false, true});
+            v.push_back({"i8.direct.t512q4b4", true, &sup_direct_i8, &launch_direct_i8<512, 4, 4>, false, true});
+            v.push_back({"i8.direct.t256q2b6", true, &sup_direct_i8, &launch_direct_i8<256, 2, 6>, false, true});
 #ifdef CURF_HAVE_CUDNN
             detail::add_cudnn_variants(v);
 #endif
@@ -462,7 +492,18 @@ namespace curf::engine {
                 dst[i] = __half2float(src[i]);
         }
 
+        __global__ void int8_to_float_kernel(const std::int8_t *src, float *dst, std::size_t n, float scale) {
+            for (std::size_t i = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x; i < n;
+                 i += static_cast<std::size_t>(gridDim.x) * blockDim.x)
+                dst[i] = scale * static_cast<float>(src[i]);
+        }
+
     } // namespace
+
+    void launch_int8_to_float(const std::int8_t *src, float *dst, std::size_t n, float scale, cudaStream_t s) {
+        int8_to_float_kernel<<<static_cast<unsigned>(std::min<std::size_t>((n + 255) / 256, 1024)), 256, 0, s>>>(src, dst, n, scale);
+        CURF_CUDA_CHECK(cudaGetLastError());
+    }
 
     std::span<const ConvVariant> conv_variants() {
         static const std::vector<ConvVariant> registry = make_registry();

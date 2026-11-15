@@ -137,7 +137,10 @@ namespace curf {
             PinnedBuffer<std::uint32_t> count;
             DeviceBuffer<WindowResult> d_res;
             PinnedBuffer<WindowResult> h_res;
-            Event start, count_ready, done;
+            // The host thread sleeps on count_ready / done (cudaEventSynchronize below): blocking-sync events
+            // put it to sleep instead of spinning a core (default events busy-wait). On the laptop the CPU
+            // and GPU share one cooling system, so a spinning core costs GPU clock under sustained load.
+            Event start, count_ready{cudaEventBlockingSync}, done{cudaEventBlockingSync};
             Clock::time_point ready_at{};
             std::uint64_t first_sample = 0;
             std::uint32_t n = 0;

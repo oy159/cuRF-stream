@@ -6,7 +6,8 @@
 // A step is PREFIX[+gap][+stem][+block][+lib]: conv ops are autotuned among variants with that name prefix
 // ("all" = whole registry); +gap fuses global pooling into the last layer, +stem allows the direct stem
 // kernel, +block fuses each BasicBlock into one kernel, +lib lets cuDNN / CUTLASS variants compete too
-// (a "cudnn" or "cutlass" step uses that library wherever it supports the layer). The bucket's CUDA Graph is replayed for --ms
+// (a "cudnn" or "cutlass" step uses that library wherever it supports the layer), +int8 runs the INT8 engine
+// (prefix "i8", calibrated on the golden windows). The bucket's CUDA Graph is replayed for --ms
 // milliseconds per bucket.
 // One JSON line per (step, bucket); with --ops also one per (step, op) at the largest bucket.
 
@@ -121,6 +122,11 @@ int main(int argc, char **argv) {
                 if (tok[0].rfind(lib, 0) != 0) cfg.exclude_prefixes.push_back(lib);
         cfg.cuda_graphs = graph;
         cfg.tune_iters = 20;
+        if (has("int8")) {
+            static const Golden golden = Golden::load(std::filesystem::path(dir) / "amc.golden", model);
+            cfg.int8 = true;
+            cfg.calibration = golden.input;
+        }
         Engine e(model, cfg);
         if (profile) {
             CURF_CUDA_CHECK(cudaStreamSynchronize(s));

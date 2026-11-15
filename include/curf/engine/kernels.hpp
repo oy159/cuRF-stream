@@ -32,6 +32,13 @@ namespace curf::engine {
                                      // (fp32, zeroed beforehand) - global average pool fused into the epilogue
         int batch = 0, lin = 0, lout = 0, cin = 0, cout = 0, k = 1, stride = 1, pad = 0, kpad = 0;
         bool relu = false;
+        // INT8 path (ConvVariant::int8): x (unless x_f32), res and y are int8 with per-tensor scales,
+        // value = scale * q. Weights int8 [cout][kpad] (kpad a multiple of 64), per-output-channel scales.
+        bool int8 = false;
+        const std::int8_t *w8 = nullptr;
+        const float *alpha = nullptr; // [cout]: weight scale[n] * input scale, dequantises the int32 accumulator
+        float res_scale = 0.f;        // residual tensor's scale
+        float y_inv_scale = 0.f;      // 1 / output tensor's scale
 
         long long m() const { return static_cast<long long>(batch) * lout; }
         double flops() const { return 2.0 * static_cast<double>(m()) * cout * cin * k; }
@@ -43,6 +50,7 @@ namespace curf::engine {
         bool (*supported)(const ConvParams &) = nullptr;
         void (*launch)(const ConvParams &, cudaStream_t) = nullptr;
         bool pool = false;  // supports ConvParams::pool
+        bool int8 = false;  // INT8 variant (only used for ConvParams::int8, and only those are)
     };
 
     // All registered variants, in ladder order.
@@ -65,6 +73,12 @@ namespace curf::engine {
         const float *b1 = nullptr, *b2 = nullptr, *bsc = nullptr;
         int batch = 0, lin = 0, lout = 0, cin = 0, cout = 0, stride = 1;
         int kpad1 = 0, kpad2 = 0, kpadsc = 0;
+        // INT8 (BlockVariant::int8): x / y int8, weights int8 with per-channel scales folded into alpha*
+        // (as ConvParams::alpha); y1 is requantised with the conv1 output tensor's scale.
+        bool int8 = false;
+        const std::int8_t *w1_8 = nullptr, *w2_8 = nullptr, *wsc_8 = nullptr;
+        const float *alpha1 = nullptr, *alpha2 = nullptr, *alphasc = nullptr;
+        float x_scale = 0.f, y1_inv_scale = 0.f, y_inv_scale = 0.f;
         double flops() const {
             return 2.0 * batch * lout * cout * (3.0 * cin + 3.0 * cout + (wsc ? cin : 0));
         }
@@ -74,6 +88,7 @@ namespace curf::engine {
         std::string name; // e.g. "block.f16.l128.64x128s2" (accumulator, positions per CTA, shape)
         bool (*supported)(const BlockParams &) = nullptr;
         void (*launch)(const BlockParams &, cudaStream_t) = nullptr;
+        bool int8 = false;
     };
     std::span<const BlockVariant> block_variants();
 
@@ -88,5 +103,6 @@ namespace curf::engine {
     // Utility for tests / debugging: fp16 -> fp32 copy on the device.
     void launch_half_to_float(const __half *src, float *dst, std::size_t n, cudaStream_t s);
     void launch_float_to_half(const float *src, __half *dst, std::size_t n, cudaStream_t s);
+    void launch_int8_to_float(const std::int8_t *src, float *dst, std::size_t n, float scale, cudaStream_t s);
 
 } // namespace curf::engine

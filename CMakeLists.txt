@@ -78,7 +78,9 @@ if(CURF_HAVE_CUDA)
         src/kernels/windows.cu
         src/kernels/conv1d.cu
         src/kernels/conv1d_mma.cu
+        src/kernels/conv1d_int8.cu
         src/kernels/block_fused.cu
+        src/kernels/block_int8.cu
         src/engine/engine.cpp
         src/runtime/pipeline.cpp
         src/runtime/classifier.cu)

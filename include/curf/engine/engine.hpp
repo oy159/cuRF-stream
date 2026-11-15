@@ -36,6 +36,14 @@ namespace curf::engine {
         bool cuda_graphs = true;
         bool reuse_memory = true;         // false: every tensor keeps its own buffer (layer debugging)
         std::filesystem::path tune_cache; // empty: do not cache
+
+        // INT8 inference (symmetric, per-tensor activation scales, per-output-channel weight scales). The
+        // activation scales come from running the fp16 engine over `calibration` (fp32 windows [n][L][C]):
+        // per tensor, the calib_percentile quantile of |v| (1 = the maximum) maps to 127. Requires the GAP
+        // fusion (the head reads fp32 pooled sums). BasicBlocks fuse into INT8 block kernels (block_int8.cu).
+        bool int8 = false;
+        std::vector<float> calibration;
+        double calib_percentile = 0.9999;
     };
 
     struct OpChoice {
@@ -86,6 +94,7 @@ namespace curf::engine {
         const MemoryPlan &memory_plan() const;
         std::size_t device_bytes() const;
         const std::vector<OpChoice> &choices() const; // per bucket, per op
+        const std::vector<float> &activation_scales() const; // INT8: per tensor (0 for the input / output)
 
     private:
         struct Impl;

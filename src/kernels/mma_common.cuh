@@ -135,6 +135,22 @@ namespace curf::engine::detail {
         atomicAdd(pool + cur * ld + n0 + c, sum);
     }
 
+    // Quantise 4 floats (already divided by the output scale) to int8 with round-to-nearest, saturating at +-127.
+    __device__ __forceinline__ unsigned pack_q4(float a, float b, float c, float d) {
+        auto q = [](float v) {
+            v = v > 127.f ? 127.f : (v < -127.f ? -127.f : v);
+            return static_cast<unsigned>(static_cast<int>(__float2int_rn(v)) & 0xFF);
+        };
+        return q(a) | (q(b) << 8) | (q(c) << 16) | (q(d) << 24);
+    }
+
+    __device__ __forceinline__ void mma(int (&c)[4], const unsigned (&a)[4], const unsigned (&b)[2]) {
+        asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
+                     "{%0,%1,%2,%3};\n"
+                     : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3])
+                     : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+    }
+
     // In-place y = relu(y + r) on 8 halves.
     __device__ __forceinline__ uint4 add_relu8(uint4 v, uint4 r, bool relu) {
         auto *vh = reinterpret_cast<__half2 *>(&v);

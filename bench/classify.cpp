@@ -4,7 +4,7 @@
 //                 [--streams 2] [--rate 61.44e6] [--active N] [--tone-amp A] [--noise R] [--realtime]
 //                 [--detect relative|absolute|all] [--threshold-db 10] [--abs-power P] [--compaction ballot|cub]
 //                 [--seconds 5] [--windows N] [--buckets 1,8,32,128,512] [--drop] [--model DIR]
-//                 [--ring SLOTS] [--print N] [--dump CSV] [--label NAME]
+//                 [--ring SLOTS] [--print N] [--dump CSV] [--label NAME] [--int8] [--calib-percentile Q] [--tune-cache FILE]
 //
 // Synthetic source: noise plus, per stream, N tones at the centres of N channels spread over the band
 // (random phases), so exactly N channels per stream carry energy - the load knob. Prints one JSON line of
@@ -32,6 +32,7 @@ int main(int argc, char **argv) {
     double tone_amp = -1, noise = 0.003;
     std::uint64_t print = 0;
     std::string dump_path; // CSV of every result: window,stream,channel,class,prob,power
+    bool int8 = false;     // INT8 engine, calibrated on the model directory's golden windows
     ClassifierConfig cfg;
     cfg.engine.tune_iters = 10;
     // finer buckets than the engine default: the active count rounds up to the next bucket
@@ -70,10 +71,17 @@ int main(int argc, char **argv) {
         else if (a == "--model") model_dir = next();
         else if (a == "--print") print = std::stoull(next());
         else if (a == "--label") label = next();
+        else if (a == "--int8") int8 = true;
+        else if (a == "--calib-percentile") cfg.engine.calib_percentile = std::stod(next());
+        else if (a == "--tune-cache") cfg.engine.tune_cache = next();
         else { std::fprintf(stderr, "unknown option %s\n", a.c_str()); return 2; }
     }
 
     const auto model = engine::Model::load(std::filesystem::path(model_dir) / "amc.curf");
+    if (int8) {
+        cfg.engine.int8 = true;
+        cfg.engine.calibration = engine::Golden::load(std::filesystem::path(model_dir) / "amc.golden", model).input;
+    }
     std::unique_ptr<ISource> src;
     if (source == "file") {
         src = std::make_unique<FileSource>(FileConfig{file, fmt, loop});
@@ -113,6 +121,7 @@ int main(int argc, char **argv) {
     if (dump) std::fclose(dump);
     std::string js = st.to_json();
     if (!label.empty()) js.insert(1, "\"label\":\"" + label + "\",");
+    if (int8) js.insert(1, "\"int8\":true,");
     std::printf("%s\n", js.c_str());
     return 0;
 }
