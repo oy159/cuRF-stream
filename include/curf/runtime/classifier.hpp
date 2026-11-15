@@ -38,6 +38,10 @@ namespace curf {
         bool drop_when_full = false;
         double seconds = 5.0;                          // 0 = until the source ends or max_windows
         std::uint64_t max_windows = 0;
+        // Optional, called in window order right before the results of the same window: mean power of every
+        // channel [streams][channels] (linear, full scale = 1; channel k at k * fs / channels, k >= channels / 2
+        // negative) and the per-stream noise floor. Setting it adds a 4 KB D2H per window (for displays).
+        std::function<void(std::uint64_t window, const float *power, const float *floor)> on_power;
     };
 
     struct WindowResult {

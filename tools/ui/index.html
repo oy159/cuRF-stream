@@ -1,0 +1,254 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cuRF-Stream</title>
+<style>
+  :root {
+    --bg: #0d1014; --panel: #151a20; --line: #262e38; --text: #d8dee6; --dim: #7d8896;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 13px/1.4 system-ui, -apple-system, "PingFang SC", sans-serif; }
+  header { display: flex; flex-wrap: wrap; gap: 6px 24px; align-items: baseline; padding: 10px 16px; border-bottom: 1px solid var(--line); }
+  header h1 { font-size: 15px; margin: 0; font-weight: 600; }
+  .kv { color: var(--dim); font-family: var(--mono); font-size: 12px; }
+  .kv b { color: var(--text); font-weight: 500; }
+  #state.live b { color: #6fd08c; } #state.ended b { color: #e0b050; } #state.wait b { color: var(--dim); }
+  main { padding: 12px 16px; display: grid; gap: 14px; }
+  .stream { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px 10px; }
+  .stream h2 { font-size: 12px; font-weight: 600; margin: 0 0 6px; display: flex; justify-content: space-between; color: var(--dim); }
+  .stream h2 span:first-child { color: var(--text); }
+  canvas { display: block; width: 100%; }
+  canvas.wf { image-rendering: pixelated; height: 260px; }
+  canvas.cls { image-rendering: pixelated; height: 90px; margin-top: 3px; }
+  canvas.labels { height: 26px; }
+  canvas.axis { height: 18px; }
+  .legend { display: flex; flex-wrap: wrap; gap: 4px 14px; padding: 2px 16px 12px; font-size: 12px; }
+  .legend span { display: inline-flex; align-items: center; gap: 5px; color: var(--dim); }
+  .legend i { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+  .legend b { color: var(--text); font-weight: 500; font-family: var(--mono); }
+  #end { margin: 0 16px 16px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px; font-family: var(--mono); font-size: 12px; color: var(--dim); white-space: pre-wrap; display: none; }
+</style>
+</head>
+<body>
+<header>
+  <h1>cuRF-Stream</h1>
+  <span class="kv" id="state">状态 <b>等待数据</b></span>
+  <span class="kv">源 <b id="src">-</b></span>
+  <span class="kv">采样率 <b id="rate">-</b></span>
+  <span class="kv">中心频率 <b id="fc">-</b></span>
+  <span class="kv">时间 <b id="t">-</b></span>
+  <span class="kv">行/秒 <b id="rps">-</b></span>
+</header>
+<div class="legend" id="legend"></div>
+<main id="streams"></main>
+<div id="end"></div>
+<script>
+"use strict";
+// Class colours: distinct hues, readable on the dark background. Index 0 is "noise" (never drawn as a label).
+const PALETTE = ["#4a5563", "#5aa9e6", "#7fc8f8", "#4ecdc4", "#f9c74f", "#f8961e", "#c77dff", "#90be6d", "#f94144", "#ff8fab"];
+const ROWS = 260;            // waterfall history (rows)
+const SPAN_DB = 50;          // colour range above the floor
+
+let classes = [], meta = null, panels = [], floors = [], counts = [];
+let rowsSeen = 0, rateT0 = performance.now(), rateRows = 0;
+
+// Waterfall colour map: black -> blue -> teal -> yellow -> white.
+const LUT = (() => {
+  const stops = [[0, 6, 8, 14], [0.25, 20, 40, 110], [0.5, 30, 140, 150], [0.75, 235, 200, 70], [1, 255, 255, 240]];
+  const lut = new Uint8ClampedArray(256 * 3);
+  for (let i = 0; i < 256; i++) {
+    const x = i / 255;
+    let k = 0;
+    while (k < stops.length - 2 && x > stops[k + 1][0]) k++;
+    const [x0, r0, g0, b0] = stops[k], [x1, r1, g1, b1] = stops[k + 1];
+    const u = (x - x0) / (x1 - x0);
+    lut[3 * i] = r0 + (r1 - r0) * u; lut[3 * i + 1] = g0 + (g1 - g0) * u; lut[3 * i + 2] = b0 + (b1 - b0) * u;
+  }
+  return lut;
+})();
+const hex = c => [parseInt(c.slice(1, 3), 16), parseInt(c.slice(3, 5), 16), parseInt(c.slice(5, 7), 16)];
+const RGB = PALETTE.map(hex);
+const color = c => PALETTE[c % PALETTE.length];
+const rgb = c => RGB[c % RGB.length];
+const mhz = hz => (hz / 1e6).toFixed(hz % 1e6 ? 3 : 0) + " MHz";
+
+function build() {
+  const root = document.getElementById("streams");
+  root.innerHTML = "";
+  panels = [];
+  const M = meta.channels;
+  for (let s = 0; s < meta.streams; s++) {
+    const el = document.createElement("section");
+    el.className = "stream";
+    el.innerHTML = `<h2><span>RX${s + 1}</span><span class="info"></span></h2>
+      <canvas class="axis"></canvas><canvas class="labels"></canvas>
+      <canvas class="wf" width="${M}" height="${ROWS}"></canvas>
+      <canvas class="cls" width="${M}" height="${ROWS}"></canvas>`;
+    root.appendChild(el);
+    const [axis, labels, wf, cls] = el.querySelectorAll("canvas");
+    const p = { axis, labels, wf, cls, info: el.querySelector(".info"),
+                wctx: wf.getContext("2d"), cctx: cls.getContext("2d"),
+                row: new ImageData(M, 1), crow: new ImageData(M, 1) };
+    p.wctx.fillStyle = "#06080e"; p.wctx.fillRect(0, 0, M, ROWS);
+    p.cctx.fillStyle = "#0b0e13"; p.cctx.fillRect(0, 0, M, ROWS);
+    panels.push(p);
+  }
+  floors = new Array(meta.streams).fill(null);
+  drawAxes();
+}
+
+function fit(cv) {
+  const r = devicePixelRatio || 1, w = Math.round(cv.clientWidth * r), h = Math.round(cv.clientHeight * r);
+  if (cv.width !== w || cv.height !== h) { cv.width = w; cv.height = h; }
+  const ctx = cv.getContext("2d");
+  ctx.setTransform(r, 0, 0, r, 0, 0);
+  return [ctx, cv.clientWidth, cv.clientHeight];
+}
+
+function drawAxes() {
+  if (!meta) return;
+  const fs = meta.rate, fc = meta.freq;
+  for (const p of panels) {
+    const [ctx, w, h] = fit(p.axis);
+    ctx.clearRect(0, 0, w, h);
+    ctx.fillStyle = "#7d8896"; ctx.strokeStyle = "#39424e";
+    ctx.font = "11px ui-monospace, Menlo, monospace"; ctx.textBaseline = "top";
+    const ticks = 8;
+    for (let i = 0; i <= ticks; i++) {
+      const x = (i / ticks) * w, off = (i / ticks - 0.5) * fs;
+      ctx.beginPath(); ctx.moveTo(x + 0.5, h - 4); ctx.lineTo(x + 0.5, h); ctx.stroke();
+      const label = fc ? ((fc + off) / 1e6).toFixed(2) : (off >= 0 ? "+" : "") + (off / 1e6).toFixed(2);
+      ctx.textAlign = i === 0 ? "left" : i === ticks ? "right" : "center";
+      ctx.fillText(label, x, 1);
+    }
+  }
+}
+
+// Display column of channel k: fft-shifted, so the left edge is -fs/2.
+const col = (k, M) => (k + M / 2) % M;
+
+function onRow(row) {
+  const M = meta.channels, S = meta.streams;
+  const active = Array.from({ length: S }, () => new Int16Array(M).fill(-1));
+  const prob = Array.from({ length: S }, () => new Uint8Array(M));
+  for (const [s, k, c, p] of row.r) { const x = col(k, M); active[s][x] = c; prob[s][x] = p; }
+  counts = new Array(classes.length || 16).fill(0);
+
+  for (let s = 0; s < S; s++) {
+    const p = panels[s];
+    // floor: smoothed, so the colour scale does not flicker
+    const f = row.f[s];
+    floors[s] = floors[s] === null ? f : floors[s] + 0.05 * (f - floors[s]);
+    const lo = floors[s] - 6, scale = 255 / (SPAN_DB + 6);
+    const d = p.row.data, cd = p.crow.data;
+    for (let k = 0; k < M; k++) {
+      const x = col(k, M), v = Math.max(0, Math.min(255, (row.p[s * M + k] - lo) * scale)) | 0;
+      d[4 * x] = LUT[3 * v]; d[4 * x + 1] = LUT[3 * v + 1]; d[4 * x + 2] = LUT[3 * v + 2]; d[4 * x + 3] = 255;
+    }
+    let n = 0;
+    for (let x = 0; x < M; x++) {
+      const c = active[s][x];
+      if (c > 0) {
+        const [r, g, b] = rgb(c), a = 0.35 + 0.65 * prob[s][x] / 100;
+        cd[4 * x] = r * a; cd[4 * x + 1] = g * a; cd[4 * x + 2] = b * a; n++; counts[c]++;
+      } else { cd[4 * x] = 11; cd[4 * x + 1] = 14; cd[4 * x + 2] = 19; }
+      cd[4 * x + 3] = 255;
+    }
+    // scroll down one row, new row on top
+    p.wctx.drawImage(p.wf, 0, 0, M, ROWS - 1, 0, 1, M, ROWS - 1);
+    p.wctx.putImageData(p.row, 0, 0);
+    p.cctx.drawImage(p.cls, 0, 0, M, ROWS - 1, 0, 1, M, ROWS - 1);
+    p.cctx.putImageData(p.crow, 0, 0);
+    p.info.textContent = `本底 ${f.toFixed(1)} dBFS · 识别 ${n} 个信道`;
+    drawLabels(p, active[s], prob[s]);
+  }
+  rowsSeen++; rateRows++;
+  document.getElementById("t").textContent = row.t.toFixed(2) + " s";
+  const now = performance.now();
+  if (now - rateT0 > 1000) {
+    document.getElementById("rps").textContent = (rateRows * 1000 / (now - rateT0)).toFixed(1);
+    rateT0 = now; rateRows = 0;
+  }
+  drawLegend();
+}
+
+// Label strip: one span per run of adjacent channels with the same class; the name when it fits.
+function drawLabels(p, act, prob) {
+  const M = meta.channels;
+  const [ctx, w, h] = fit(p.labels);
+  ctx.clearRect(0, 0, w, h);
+  ctx.font = "11px system-ui, sans-serif"; ctx.textBaseline = "middle"; ctx.textAlign = "center";
+  const px = w / M;
+  for (let x = 0; x < M;) {
+    const c = act[x];
+    let e = x + 1, best = prob[x];
+    while (e < M && act[e] === c) { best = Math.max(best, prob[e]); e++; }
+    if (c > 0) {
+      const x0 = x * px, x1 = e * px;
+      ctx.fillStyle = color(c);
+      ctx.fillRect(x0, h - 5, Math.max(1, x1 - x0), 5);
+      const name = (classes[c] || "c" + c) + " " + best + "%";
+      const tw = ctx.measureText(name).width;
+      if (tw + 4 <= Math.max(x1 - x0, 0) || (x1 - x0 >= 2 && tw < 70 && !crowded(act, x, e))) {
+        ctx.fillText(name, Math.min(Math.max((x0 + x1) / 2, tw / 2), w - tw / 2), (h - 5) / 2);
+      }
+    }
+    x = e;
+  }
+}
+// Isolated narrow signals still get a label when no other signal is within ~6% of the band.
+function crowded(act, x, e) {
+  const M = act.length, r = Math.round(M * 0.06);
+  for (let k = Math.max(0, x - r); k < Math.min(M, e + r); k++) if ((k < x || k >= e) && act[k] > 0) return true;
+  return false;
+}
+
+function drawLegend() {
+  const el = document.getElementById("legend");
+  el.innerHTML = classes.map((n, c) => c === 0 ? "" :
+    `<span><i style="background:${color(c)}"></i>${n} <b>${counts[c] || 0}</b></span>`).join("");
+}
+
+function setState(cls, text) {
+  const el = document.getElementById("state");
+  el.className = "kv " + cls; el.innerHTML = `状态 <b>${text}</b>`;
+}
+
+function onEnd(st) {
+  setState("ended", "已结束");
+  const el = document.getElementById("end");
+  el.style.display = "block";
+  const keys = ["wall_s", "x_realtime", "windows", "classified", "dropped_frames", "gap_frames", "latency_ms"];
+  el.textContent = "运行统计  " + keys.filter(k => k in st).map(k => `${k}=${JSON.stringify(st[k])}`).join("  ");
+}
+
+async function start() {
+  try { classes = await (await fetch("/classes")).json(); } catch { classes = []; }
+  drawLegend();
+  const es = new EventSource("/feed");
+  es.onmessage = ev => {
+    const m = JSON.parse(ev.data);
+    if (m.meta) {
+      meta = m.meta;
+      document.getElementById("src").textContent = meta.source;
+      document.getElementById("rate").textContent = (meta.rate / 1e6).toFixed(2) + " MSPS × " + meta.streams;
+      document.getElementById("fc").textContent = meta.freq ? mhz(meta.freq) : "基带（相对频率）";
+      document.getElementById("end").style.display = "none";
+      build();
+      setState("live", "运行中");
+    } else if (m.end) {
+      onEnd(m.end);
+    } else if (meta) {
+      onRow(m);
+    }
+  };
+  es.onerror = () => setState("wait", "连接中断，重连中");
+  addEventListener("resize", drawAxes);
+}
+start();
+</script>
+</body>
+</html>

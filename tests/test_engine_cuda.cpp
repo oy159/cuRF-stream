@@ -405,24 +405,24 @@ TEST_CASE("INT8 engine with fp16 input equals the fp32-input engine", "[cuda][en
     stage.detect(win.get(), det, nullptr);
     CURF_CUDA_CHECK(cudaDeviceSynchronize());
     for (const std::string tile : {"l128r.", "l64."}) {
-        auto config = [&](bool half) {
+        auto config = [&](bool fp16) {
             EngineConfig cfg = int8_config(g, d->model);
             cfg.buckets = {160}; // chunks of 160 and 96 (a partial bucket)
             cfg.autotune = false;
             cfg.block_prefix = "i8.block.stem." + tile;
-            cfg.half_input = half;
+            cfg.half_input = fp16;
             return cfg;
         };
-        Engine ref(d->model, config(false)), half(d->model, config(true));
-        CHECK(half.steps() == ref.steps());
+        Engine ref(d->model, config(false)), h16(d->model, config(true));
+        CHECK(h16.steps() == ref.steps());
         for (std::uint32_t first = 0; first < S * M; first += 160) {
             const int n = static_cast<int>(std::min<std::uint32_t>(160, S * M - first));
             stage.gather(win.get(), first, static_cast<std::uint32_t>(n), ref.input(), nullptr);
-            stage.gather_half(win.get(), first, static_cast<std::uint32_t>(n), half.input_half(), nullptr);
+            stage.gather_half(win.get(), first, static_cast<std::uint32_t>(n), h16.input_half(), nullptr);
             ref.run(n, nullptr);
-            half.run(n, nullptr);
+            h16.run(n, nullptr);
             CURF_CUDA_CHECK(cudaDeviceSynchronize());
-            const auto a = ref.read_tensor(d->model.output, n), b = half.read_tensor(d->model.output, n);
+            const auto a = ref.read_tensor(d->model.output, n), b = h16.read_tensor(d->model.output, n);
             std::size_t diff = 0;
             for (std::size_t i = 0; i < a.size(); ++i) diff += a[i] != b[i];
             int agree = 0;

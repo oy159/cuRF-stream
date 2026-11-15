@@ -137,6 +137,7 @@ namespace curf {
             PinnedBuffer<std::uint32_t> count;
             DeviceBuffer<WindowResult> d_res;
             PinnedBuffer<WindowResult> h_res;
+            PinnedBuffer<float> h_power, h_floor; // on_power only
             // The host thread sleeps on count_ready / done (cudaEventSynchronize below): blocking-sync events
             // put it to sleep instead of spinning a core (default events busy-wait). On the laptop the CPU
             // and GPU share one cooling system, so a spinning core costs GPU clock under sustained load.
@@ -147,7 +148,7 @@ namespace curf {
             std::uint32_t spec = 0; // entries enqueued speculatively with the detection (see 4.)
             WinCtx(std::uint32_t S_, std::uint32_t M_, std::uint32_t W_)
                 : buf(std::size_t{S_} * W_ * M_), stage(S_, M_, W_), count(1), d_res(std::size_t{S_} * M_),
-                  h_res(std::size_t{S_} * M_) {}
+                  h_res(std::size_t{S_} * M_), h_power(std::size_t{S_} * M_), h_floor(S_) {}
         };
         std::unique_ptr<WinCtx> wins[2] = {std::make_unique<WinCtx>(S, M, W), std::make_unique<WinCtx>(S, M, W)};
         auto win = [&](std::uint64_t i) -> WinCtx & { return *wins[i % 2]; };
@@ -227,6 +228,7 @@ namespace curf {
                     lat.push_back(std::chrono::duration<double, std::milli>(Clock::now() - w.ready_at).count());
                     wgpu.push_back(elapsed_ms(w.start, w.done));
                     for (std::uint32_t i = 0; i < w.n; ++i) ++st.class_histogram[w.h_res[i].cls];
+                    if (cfg.on_power) cfg.on_power(delivered, w.h_power.get(), w.h_floor.get());
                     if (on_results) on_results(delivered, w.first_sample, w.h_res.get(), w.n);
                     st.classified += w.n;
                     st.max_active = std::max(st.max_active, w.n);
@@ -258,6 +260,12 @@ namespace curf {
                             CURF_CUDA_CHECK(cudaMemcpyAsync(w.count.get(), w.stage.d_count(), sizeof(std::uint32_t),
                                                             cudaMemcpyDeviceToHost, comp_s));
                             CURF_CUDA_CHECK(cudaEventRecord(w.count_ready.e, comp_s));
+                            if (cfg.on_power) { // after the count: does not delay the count's arrival
+                                CURF_CUDA_CHECK(cudaMemcpyAsync(w.h_power.get(), w.stage.d_power(), std::size_t{S} * M * sizeof(float),
+                                                                cudaMemcpyDeviceToHost, comp_s));
+                                CURF_CUDA_CHECK(cudaMemcpyAsync(w.h_floor.get(), w.stage.d_floor(), S * sizeof(float),
+                                                                cudaMemcpyDeviceToHost, comp_s));
+                            }
                             // Enqueue the predicted part of this window's classification right away instead of
                             // after the count reaches the host: the read-back + wake-up + launch left the GPU idle
                             // ~160 us per window (4.8% at full load). The rest, if the count is larger, follows in 2.

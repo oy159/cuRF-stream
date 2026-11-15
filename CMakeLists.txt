@@ -70,6 +70,22 @@ add_library(curf_core
 target_include_directories(curf_core PUBLIC include)
 target_link_libraries(curf_core PUBLIC Threads::Threads PRIVATE curf_warnings)
 
+# Live hardware source: an installed OmniCore Host (OmniCoreHost_DIR / CMAKE_PREFIX_PATH, e.g.
+# /opt/omnicore/0.8.0) or its source tree (CURF_OMNICORE_SOURCE), built here as a subproject.
+set(CURF_OMNICORE_SOURCE "" CACHE PATH "OmniCore-SDR-Host source tree (empty: find_package)")
+if(CURF_OMNICORE)
+    if(CURF_OMNICORE_SOURCE)
+        set(OCH_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+        add_subdirectory(${CURF_OMNICORE_SOURCE} omnicore EXCLUDE_FROM_ALL)
+    else()
+        find_package(OmniCoreHost 0.8 CONFIG REQUIRED)
+    endif()
+    target_sources(curf_core PRIVATE src/source/omnicore_source.cpp)
+    target_link_libraries(curf_core PUBLIC OmniCore::omnicore)
+    target_compile_definitions(curf_core PUBLIC CURF_HAVE_OMNICORE=1)
+    message(STATUS "cuRF-Stream: OmniCore source ON")
+endif()
+
 if(CURF_HAVE_CUDA)
     add_library(curf_cuda
         src/kernels/unpack.cu

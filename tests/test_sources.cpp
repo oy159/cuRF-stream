@@ -1,4 +1,5 @@
 #include "curf/reference.hpp"
+#include "curf/sample_clock.hpp"
 #include "curf/sources.hpp"
 
 #include <catch2/catch_approx.hpp>
@@ -110,4 +111,43 @@ TEST_CASE("file source replays a capture, optionally looping", "[source]") {
                                gen.period().begin() + (k % 4096) * fb));
     }
     std::filesystem::remove(path);
+}
+
+TEST_CASE("SampleClock places hardware-timed reads and reports every gap") {
+    SampleClock c;
+    // first read: origin, never a discontinuity (even though the driver flags the start of the epoch)
+    auto p = c.place({true, 1'000'000, 0, true}, 100);
+    CHECK(p.first_sample == 0);
+    CHECK_FALSE(p.discontinuity);
+    p = c.place({true, 1'000'100, 0, false}, 50); // contiguous
+    CHECK(p.first_sample == 100);
+    CHECK_FALSE(p.discontinuity);
+    p = c.place({true, 1'000'200, 0, true}, 10); // 50 samples lost (overflow)
+    CHECK(p.first_sample == 200);
+    CHECK(p.discontinuity);
+    p = c.place({true, 1'000'210, 0, true}, 10); // contiguous but flagged (retune): discontinuity
+    CHECK(p.first_sample == 210);
+    CHECK(p.discontinuity);
+    p = c.place({true, 5, 0, true}, 10); // device time reset: continue the timeline, rebase
+    CHECK(p.first_sample == 220);
+    CHECK(p.discontinuity);
+    p = c.place({true, 15, 0, false}, 10); // lines up after the rebase
+    CHECK(p.first_sample == 230);
+    CHECK_FALSE(p.discontinuity);
+    CHECK(c.next() == 240);
+}
+
+TEST_CASE("SampleClock without hardware time counts the reported losses") {
+    SampleClock c;
+    auto p = c.place({false, 0, 0, false}, 64);
+    CHECK(p.first_sample == 0);
+    p = c.place({false, 0, 0, false}, 64);
+    CHECK(p.first_sample == 64);
+    CHECK_FALSE(p.discontinuity);
+    p = c.place({false, 0, 1000, true}, 64);
+    CHECK(p.first_sample == 1128);
+    CHECK(p.discontinuity);
+    p = c.place({false, 0, 0, true}, 64); // flagged, loss unknown
+    CHECK(p.first_sample == 1192);
+    CHECK(p.discontinuity);
 }
