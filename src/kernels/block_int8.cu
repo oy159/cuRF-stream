@@ -71,7 +71,8 @@ namespace curf::engine::detail {
             // stem: fp32 input rows [SR][kStemCin] after everything else
             static constexpr bool STEM = STEM_;
             // fp32 input rows: one extra leading row so the span starts 16-byte aligned (copied with cp.async)
-            static constexpr int SR = (NX - 1) * kStemStride + kStemTaps + 1;
+            // (rounded up to 4 rows: fp16 input copies 4 rows per 16-byte chunk)
+            static constexpr int SR = ((NX - 1) * kStemStride + kStemTaps + 1 + 3) / 4 * 4;
             static constexpr std::size_t SXB = up16(std::size_t{SR} * kStemCin * 4);
             static constexpr std::size_t SMEM = MAIN + (STEM ? SXB : 0);
             static_assert(!STEM || (S == 1 && CIN % 8 == 0 && SR % 2 == 0 && kStemK <= 16), "stem in front of a stride-1 block");
@@ -112,11 +113,21 @@ namespace curf::engine::detail {
             [[maybe_unused]] float *sx = reinterpret_cast<float *>(smem + B::MAIN);         // [SR][kStemCin]
             [[maybe_unused]] const int ia = px0 * kStemStride - kStemPad - 1;
             if constexpr (STEM) {
-                const float *xin = p.stem_x + static_cast<long long>(b) * p.stem_lin * kStemCin;
-                for (int c = tid; c < B::SR / 2; c += NT) {
-                    const int pos = ia + 2 * c;
-                    const bool ok = pos >= 0 && pos < p.stem_lin;
-                    cp_async16(smem_addr(sx + 4 * c), ok ? xin + static_cast<long long>(pos) * kStemCin : p.stem_x, ok);
+                if (p.stem_half) { // fp16 input: 4 rows per chunk (ia and stem_lin multiples of 4)
+                    const __half *xh = static_cast<const __half *>(static_cast<const void *>(p.stem_x));
+                    const __half *xin = xh + static_cast<long long>(b) * p.stem_lin * kStemCin;
+                    for (int c = tid; c < B::SR / 4; c += NT) {
+                        const int pos = ia + 4 * c;
+                        const bool ok = pos >= 0 && pos < p.stem_lin;
+                        cp_async16(smem_addr(reinterpret_cast<__half *>(sx) + 8 * c), ok ? xin + static_cast<long long>(pos) * kStemCin : xh, ok);
+                    }
+                } else {
+                    const float *xin = p.stem_x + static_cast<long long>(b) * p.stem_lin * kStemCin;
+                    for (int c = tid; c < B::SR / 2; c += NT) {
+                        const int pos = ia + 2 * c;
+                        const bool ok = pos >= 0 && pos < p.stem_lin;
+                        cp_async16(smem_addr(sx + 4 * c), ok ? xin + static_cast<long long>(pos) * kStemCin : p.stem_x, ok);
+                    }
                 }
                 cp_async_commit(); // its own group: the stem waits only for this one, the weight copies keep flying
             } else {
@@ -183,8 +194,10 @@ namespace curf::engine::detail {
                     bw[j][1] = *reinterpret_cast<const unsigned *>(w + 8);
                     bias[j] = *reinterpret_cast<const float2 *>(p.stem_b + j * 8 + kq);
                 }
+                const bool half_in = p.stem_half;
                 auto ld_a = [&](int r, int k) -> unsigned {
                     r = r < B::NX ? r : B::NX - 1;
+                    if (half_in) return *reinterpret_cast<const unsigned *>(reinterpret_cast<const __half *>(sx) + 2 + 4 * r + k);
                     const float2 v = *reinterpret_cast<const float2 *>(sx + 2 + 4 * r + k);
                     const __half2 h = __floats2half2_rn(v.x, v.y);
                     return *reinterpret_cast<const unsigned *>(&h);
@@ -435,7 +448,7 @@ namespace curf::engine::detail {
             BlockParams q = p;
             q.stem_x = nullptr;
             return p.stem_x && p.stem_w16 && p.stem_b && p.stem_cin == kStemCin && p.stem_k == kStemTaps &&
-                   p.stem_stride == kStemStride && p.stem_pad == kStemPad && p.stem_lin % 2 == 0 && p.x_inv_scale > 0.f &&
+                   p.stem_stride == kStemStride && p.stem_pad == kStemPad && p.stem_lin % (p.stem_half ? 4 : 2) == 0 && p.x_inv_scale > 0.f &&
                    p.lin == (p.stem_lin + 2 * kStemPad - kStemTaps) / kStemStride + 1 && sup_block_i8<CIN, COUT, 1, false>(q);
         }
 

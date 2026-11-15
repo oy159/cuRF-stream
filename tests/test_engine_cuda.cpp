@@ -1,6 +1,7 @@
 // Layer-by-layer alignment of the engine against the fp32 golden activations from convert.py.
 
 #include "curf/cuda/memory.hpp"
+#include "curf/cuda/windows.hpp"
 #include "curf/engine/engine.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -376,6 +377,61 @@ TEST_CASE("INT8 conv2 with the shortcut fused in matches the separate shortcut",
         CHECK(vs_ref < 0.05);
         CHECK(vs_gold < 0.12);
         CHECK(agree >= n - 2);
+    }
+}
+
+TEST_CASE("INT8 engine with fp16 input equals the fp32-input engine", "[cuda][engine][int8][fusion]") {
+    const auto *d = data();
+    if (!d) SKIP("no converted model in " + kDir.string());
+    const auto &g = d->golden;
+    const int c = static_cast<int>(g.classes);
+    constexpr std::uint32_t S = 2, M = 128, W = 1024;
+    REQUIRE(g.n_full == S * M);
+    REQUIRE(d->model.tensors[d->model.input].length == W);
+    // channelizer-layout buffer [S][W][M]: entry e = s * M + k holds golden window e at gain 0.05 + 0.02 e
+    std::vector<curf::cf32> h(std::size_t{S} * W * M);
+    for (std::uint32_t s = 0; s < S; ++s)
+        for (std::uint32_t t = 0; t < W; ++t)
+            for (std::uint32_t k = 0; k < M; ++k) {
+                const std::size_t e = s * M + k;
+                const float gain = 0.05f + 0.02f * static_cast<float>(e);
+                h[(std::size_t{s} * W + t) * M + k] = {gain * g.input[(e * W + t) * 2], gain * g.input[(e * W + t) * 2 + 1]};
+            }
+    curf::cuda::DeviceBuffer<curf::cf32> win(h.size());
+    CURF_CUDA_CHECK(cudaMemcpy(win.get(), h.data(), h.size() * sizeof(h[0]), cudaMemcpyHostToDevice));
+    curf::cuda::WindowStage stage(S, M, W);
+    curf::cuda::DetectConfig det;
+    det.mode = curf::cuda::DetectMode::all;
+    stage.detect(win.get(), det, nullptr);
+    CURF_CUDA_CHECK(cudaDeviceSynchronize());
+    for (const std::string tile : {"l128r.", "l64."}) {
+        auto config = [&](bool half) {
+            EngineConfig cfg = int8_config(g, d->model);
+            cfg.buckets = {160}; // chunks of 160 and 96 (a partial bucket)
+            cfg.autotune = false;
+            cfg.block_prefix = "i8.block.stem." + tile;
+            cfg.half_input = half;
+            return cfg;
+        };
+        Engine ref(d->model, config(false)), half(d->model, config(true));
+        CHECK(half.steps() == ref.steps());
+        for (std::uint32_t first = 0; first < S * M; first += 160) {
+            const int n = static_cast<int>(std::min<std::uint32_t>(160, S * M - first));
+            stage.gather(win.get(), first, static_cast<std::uint32_t>(n), ref.input(), nullptr);
+            stage.gather_half(win.get(), first, static_cast<std::uint32_t>(n), half.input_half(), nullptr);
+            ref.run(n, nullptr);
+            half.run(n, nullptr);
+            CURF_CUDA_CHECK(cudaDeviceSynchronize());
+            const auto a = ref.read_tensor(d->model.output, n), b = half.read_tensor(d->model.output, n);
+            std::size_t diff = 0;
+            for (std::size_t i = 0; i < a.size(); ++i) diff += a[i] != b[i];
+            int agree = 0;
+            for (int i = 0; i < n; ++i) agree += argmax(&b[i * c], c) == argmax(&g.logits[(first + i) * c], c);
+            std::printf("  fp16 input, %s chunk at %u (%d windows): %zu of %zu logits differ, top-1 vs fp32 %d/%d\n",
+                        tile.c_str(), first, n, diff, a.size(), agree, n);
+            CHECK(diff == 0); // the stem rounds to fp16 either way
+            CHECK(agree >= n * 95 / 100);
+        }
     }
 }
 

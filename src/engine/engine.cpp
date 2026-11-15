@@ -186,6 +186,7 @@ namespace curf::engine {
                     p.stem_stride = static_cast<int>(st.stride);
                     p.stem_pad = static_cast<int>(st.pad);
                     p.x_inv_scale = 1.f / act_scale[st.out]; // as the unfused stem's y_inv_scale
+                    p.stem_half = cfg.half_input;
                     if (!p.stem_x) p.stem_x = reinterpret_cast<const float *>(16); // shape check before allocation
                 }
             }
@@ -436,6 +437,7 @@ namespace curf::engine {
                 const int batch = buckets[bi];
                 for (std::size_t i = 0; i < no; ++i) {
                     if (model.ops[i].kind != OpKind::conv) continue;
+                    if (cfg.half_input && model.ops[i].in == model.input) continue; // only runs inside its block
                     const auto p = conv_params(i, batch);
                     float us = 0;
                     const ConvVariant *v = cached(conv_key(i, batch), [](const std::string &n) { return find_conv_variant(n); },
@@ -486,6 +488,11 @@ namespace curf::engine {
                     std::vector<Fuse> options{Fuse::none};
                     if (block_choice[bi][g]) options.push_back(Fuse::block);
                     if (stem_choice[bi][g]) options.push_back(Fuse::stem);
+                    if (cfg.half_input && groups[g].s != kNone) { // the fp16 input is only read by the stem block
+                        if (!stem_choice[bi][g]) throw std::runtime_error("engine: half_input needs a stem-fused block variant");
+                        options = {Fuse::stem};
+                        mode[g] = Fuse::stem;
+                    }
                     if (sc_choice[bi][g]) {
                         options.push_back(Fuse::shortcut);
                         d.sc_variant = sc_choice[bi][g]->name;
@@ -736,6 +743,8 @@ namespace curf::engine {
         m.materialized.assign(m.model.tensors.size(), true);
         m.find_fusions();
         if (m.cfg.int8 && m.pool_op == kNone) throw std::runtime_error("engine: int8 needs the GAP fusion (fuse_gap)");
+        if (m.cfg.half_input && std::none_of(m.groups.begin(), m.groups.end(), [](const Group &g) { return g.s != kNone; }))
+            throw std::runtime_error("engine: half_input needs int8 and a stem that fuses into the first block");
 
         const auto maxb = static_cast<std::size_t>(m.buckets.back());
         m.input = DeviceBuffer<float>(maxb * m.model.tensors[m.model.input].elems_per_window());
@@ -765,6 +774,7 @@ namespace curf::engine {
     const EngineConfig &Engine::config() const { return impl_->cfg; }
     int Engine::max_batch() const { return impl_->buckets.back(); }
     float *Engine::input() const { return impl_->input.get(); }
+    __half *Engine::input_half() const { return reinterpret_cast<__half *>(impl_->input.get()); }
     const float *Engine::logits() const { return impl_->logits.get(); }
     const MemoryPlan &Engine::memory_plan() const { return impl_->plan; }
     const std::vector<OpChoice> &Engine::choices() const { return impl_->choices; }

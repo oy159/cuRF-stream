@@ -95,6 +95,7 @@ namespace curf::engine {
         const float *stem_b = nullptr;
         int stem_lin = 0, stem_cin = 0, stem_k = 0, stem_stride = 0, stem_pad = 0;
         float x_inv_scale = 0.f;
+        bool stem_half = false; // stem_x holds fp16 (the bits of a const __half *), already rounded as the MMA needs
         double flops() const {
             return 2.0 * batch * lout * cout * (3.0 * cin + 3.0 * cout + (wsc ? cin : 0)) +
                    (stem_x ? 2.0 * batch * lin * cin * stem_k * stem_cin : 0.0);

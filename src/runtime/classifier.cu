@@ -144,12 +144,33 @@ namespace curf {
             Clock::time_point ready_at{};
             std::uint64_t first_sample = 0;
             std::uint32_t n = 0;
+            std::uint32_t spec = 0; // entries enqueued speculatively with the detection (see 4.)
             WinCtx(std::uint32_t S_, std::uint32_t M_, std::uint32_t W_)
                 : buf(std::size_t{S_} * W_ * M_), stage(S_, M_, W_), count(1), d_res(std::size_t{S_} * M_),
                   h_res(std::size_t{S_} * M_) {}
         };
         std::unique_ptr<WinCtx> wins[2] = {std::make_unique<WinCtx>(S, M, W), std::make_unique<WinCtx>(S, M, W)};
         auto win = [&](std::uint64_t i) -> WinCtx & { return *wins[i % 2]; };
+
+        // Results for entries [from, to) of window w: gather (clamped to the device-side count) + engine +
+        // postprocess per chunk, then the D2H of those results. Entries past the real count are computed on
+        // zero/stale rows and ignored.
+        auto enqueue_range = [&](WinCtx &w, std::uint32_t from, std::uint32_t to) {
+            for (std::uint32_t first = from; first < to; first += chunk) {
+                const std::uint32_t c = std::min(chunk, to - first);
+                if (cfg.engine.half_input) w.stage.gather_half(w.buf.get(), first, c, eng.input_half(), comp_s);
+                else w.stage.gather(w.buf.get(), first, c, eng.input(), comp_s);
+                eng.run(static_cast<int>(c), comp_s);
+                postprocess_kernel<<<(c + 127) / 128, 128, 0, comp_s>>>(
+                    eng.logits(), classes, w.stage.d_active(), w.stage.d_power(), first, c, M, w.d_res.get());
+                CURF_CUDA_CHECK(cudaGetLastError());
+            }
+            if (to > from)
+                CURF_CUDA_CHECK(cudaMemcpyAsync(w.h_res.get() + from, w.d_res.get() + from, (to - from) * sizeof(WindowResult),
+                                                cudaMemcpyDeviceToHost, comp_s));
+        };
+        // Count of the last window whose count has arrived: the speculative size for the next detection.
+        std::uint32_t predicted = 0;
 
         ProducerControl pc;
         std::thread producer = start_producer(source, ring, cfg.block_frames, fb, cfg.drop_when_full, pc);
@@ -193,17 +214,8 @@ namespace curf {
                     WinCtx &w = win(gathered);
                     const std::uint32_t n = w.count[0];
                     w.n = n;
-                    for (std::uint32_t first = 0; first < n; first += chunk) {
-                        const std::uint32_t c = std::min(chunk, n - first);
-                        w.stage.gather(w.buf.get(), first, c, eng.input(), comp_s);
-                        eng.run(static_cast<int>(c), comp_s);
-                        postprocess_kernel<<<(c + 127) / 128, 128, 0, comp_s>>>(
-                            eng.logits(), classes, w.stage.d_active(), w.stage.d_power(), first, c, M, w.d_res.get());
-                        CURF_CUDA_CHECK(cudaGetLastError());
-                    }
-                    if (n)
-                        CURF_CUDA_CHECK(cudaMemcpyAsync(w.h_res.get(), w.d_res.get(), n * sizeof(WindowResult),
-                                                        cudaMemcpyDeviceToHost, comp_s));
+                    predicted = n;
+                    enqueue_range(w, w.spec, n); // only what the speculative launch did not cover
                     CURF_CUDA_CHECK(cudaEventRecord(w.done.e, comp_s));
                     ++gathered;
                     progressed = true;
@@ -246,6 +258,11 @@ namespace curf {
                             CURF_CUDA_CHECK(cudaMemcpyAsync(w.count.get(), w.stage.d_count(), sizeof(std::uint32_t),
                                                             cudaMemcpyDeviceToHost, comp_s));
                             CURF_CUDA_CHECK(cudaEventRecord(w.count_ready.e, comp_s));
+                            // Enqueue the predicted part of this window's classification right away instead of
+                            // after the count reaches the host: the read-back + wake-up + launch left the GPU idle
+                            // ~160 us per window (4.8% at full load). The rest, if the count is larger, follows in 2.
+                            w.spec = std::min(predicted, S * M);
+                            enqueue_range(w, 0, w.spec);
                             ++detected;
                         }
                         ring.mark_submitted();

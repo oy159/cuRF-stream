@@ -13,6 +13,7 @@
 
 #include "curf/format.hpp"
 
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <cstddef>
@@ -46,6 +47,8 @@ namespace curf::cuda {
         void detect(const cf32 *d_win, const DetectConfig &cfg, cudaStream_t stream);
         // Gather active windows [first, first + n) of the list into d_out ([n][W][2] fp32), unit RMS.
         void gather(const cf32 *d_win, std::uint32_t first, std::uint32_t n, float *d_out, cudaStream_t stream);
+        // Same, rounded to fp16 ([n][W][2] half): half the bytes, for an engine with an fp16 input.
+        void gather_half(const cf32 *d_win, std::uint32_t first, std::uint32_t n, __half *d_out, cudaStream_t stream);
 
         const std::uint32_t *d_count() const noexcept { return d_count_; }
         const std::uint32_t *d_active() const noexcept { return d_active_; }
@@ -56,6 +59,7 @@ namespace curf::cuda {
     private:
         std::uint32_t streams_, channels_, window_;
         float *d_power_ = nullptr, *d_floor_ = nullptr;
+        float *d_part_ = nullptr; // [splits][streams][M] partial channel energies (power kernel -> floor_flag)
         std::uint8_t *d_flags_ = nullptr;
         std::uint32_t *d_active_ = nullptr, *d_count_ = nullptr;
         void *d_cub_temp_ = nullptr;

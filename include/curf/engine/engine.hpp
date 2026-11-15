@@ -44,6 +44,10 @@ namespace curf::engine {
         bool int8 = false;
         std::vector<float> calibration;
         double calib_percentile = 0.9999;
+        // INT8: the input is fp16 [batch][L][C] (input_half()), written by a producer that already rounds it -
+        // the stem-fused first block rounds its input to fp16 for the MMA anyway, so this halves the input
+        // traffic without changing a bit. The stem is then always fused (there is no fp16 standalone stem).
+        bool half_input = false;
     };
 
     struct OpChoice {
@@ -84,6 +88,7 @@ namespace curf::engine {
         int bucket_for(int batch) const; // smallest bucket >= batch; throws if batch > max_batch()
 
         float *input() const;         // device, fp32 [max_batch][L][C]
+        __half *input_half() const;   // device, fp16 [max_batch][L][C] (half_input; same buffer as input())
         const float *logits() const;  // device, fp32 [max_batch][classes]
 
         void run(int batch, cudaStream_t stream);       // CUDA Graph replay (or eager if graphs are off)

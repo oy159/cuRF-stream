@@ -11,30 +11,40 @@ namespace curf::cuda {
 
     namespace {
 
-        // power[s][k] = mean_t |win[s][t][k]|^2; threads over k (coalesced rows), loop over t.
-        __global__ void power_kernel(const float2 *__restrict__ win, float *__restrict__ power, unsigned M, unsigned W) {
-            const unsigned s = blockIdx.y, k = blockIdx.x * blockDim.x + threadIdx.x;
+        // Partial channel energies: part[z][s][k] = sum_{t in split z} |win[s][t][k]|^2; threads over k
+        // (coalesced rows), frames split over grid z. (One block per 256 channels and stream looping over all
+        // W frames ran 4 blocks on a 16-SM GPU: 62 us for the 8 MB window at full load.) floor_flag sums the
+        // splits in a fixed order, so the power stays deterministic.
+        constexpr unsigned kPowerSplits = 16;
+        __global__ void power_kernel(const float2 *__restrict__ win, float *__restrict__ part, unsigned M, unsigned W) {
+            const unsigned s = blockIdx.y, k = blockIdx.x * blockDim.x + threadIdx.x, z = blockIdx.z;
             if (k >= M) return;
+            const unsigned per = (W + kPowerSplits - 1) / kPowerSplits, t0 = z * per, t1 = min(W, t0 + per);
             const float2 *p = win + static_cast<std::size_t>(s) * W * M + k;
             float acc = 0.f;
-            for (unsigned t = 0; t < W; ++t) {
+#pragma unroll 8
+            for (unsigned t = t0; t < t1; ++t) {
                 const float2 v = p[static_cast<std::size_t>(t) * M];
                 acc = fmaf(v.x, v.x, fmaf(v.y, v.y, acc));
             }
-            power[static_cast<std::size_t>(s) * M + k] = acc / static_cast<float>(W);
+            part[(static_cast<std::size_t>(z) * gridDim.y + s) * M + k] = acc;
         }
 
         // One block per stream: bitonic sort of the M channel powers in shared memory, take the percentile,
         // then flag channels above the threshold.
-        __global__ void floor_flag_kernel(const float *__restrict__ power, float *__restrict__ floor_out,
-                                          std::uint8_t *__restrict__ flags, unsigned M, DetectConfig cfg) {
+        __global__ void floor_flag_kernel(const float *__restrict__ part, float *power, float *__restrict__ floor_out,
+                                          std::uint8_t *__restrict__ flags, unsigned M, unsigned W, DetectConfig cfg) {
             extern __shared__ float v[];
-            const unsigned s = blockIdx.x;
-            const float *p = power + static_cast<std::size_t>(s) * M;
+            const unsigned s = blockIdx.x, S = gridDim.x;
+            float *p = power + static_cast<std::size_t>(s) * M;
+            for (unsigned i = threadIdx.x; i < M; i += blockDim.x) { // power = mean over the window
+                float e = 0.f;
+                for (unsigned z = 0; z < kPowerSplits; ++z) e += part[(static_cast<std::size_t>(z) * S + s) * M + i];
+                p[i] = v[i] = e / static_cast<float>(W);
+            }
+            __syncthreads();
             float thr = 0.f;
             if (cfg.mode == DetectMode::relative) {
-                for (unsigned i = threadIdx.x; i < M; i += blockDim.x) v[i] = p[i];
-                __syncthreads();
                 for (unsigned k = 2; k <= M; k <<= 1)
                     for (unsigned j = k >> 1; j > 0; j >>= 1) {
                         for (unsigned i = threadIdx.x; i < M; i += blockDim.x) {
@@ -108,9 +118,13 @@ namespace curf::cuda {
         // out[e][t] = win[s][t][k] / sqrt(power[s][k]) for active entry e = (s, k), frames tiled by 32 and
         // entries by 32, transposed through shared memory: reads along k, writes along t (both coalesced
         // when active channels are adjacent).
+        // OutT = __half2: the same values rounded to fp16 (for an engine with an fp16 input).
+        __device__ __forceinline__ void store_out(float2 *p, float2 v) { *p = v; }
+        __device__ __forceinline__ void store_out(__half2 *p, float2 v) { *p = __floats2half2_rn(v.x, v.y); }
+        template <class OutT>
         __global__ void gather_kernel(const float2 *__restrict__ win, const float *__restrict__ power,
                                       const std::uint32_t *__restrict__ active, const std::uint32_t *__restrict__ count,
-                                      unsigned first, unsigned n, unsigned M, unsigned W, float2 *__restrict__ out) {
+                                      unsigned first, unsigned n, unsigned M, unsigned W, OutT *__restrict__ out) {
             __shared__ float2 tile[32][33];
             const unsigned e0 = blockIdx.x * 32, t0 = blockIdx.y * 32;
             const unsigned avail = min(n, *count > first ? *count - first : 0u);
@@ -137,7 +151,7 @@ namespace curf::cuda {
             __syncthreads();
             for (unsigned ey = threadIdx.y; ey < 32; ey += blockDim.y) {
                 const unsigned e = e0 + ey;
-                if (e < avail) out[static_cast<std::size_t>(e) * W + t0 + threadIdx.x] = tile[threadIdx.x][ey];
+                if (e < avail) store_out(out + static_cast<std::size_t>(e) * W + t0 + threadIdx.x, tile[threadIdx.x][ey]);
             }
         }
 
@@ -150,6 +164,7 @@ namespace curf::cuda {
         if (window % 32 != 0) throw std::invalid_argument("WindowStage: window must be a multiple of 32");
         const std::size_t n = entries();
         CURF_CUDA_CHECK(cudaMalloc(&d_power_, n * sizeof(float)));
+        CURF_CUDA_CHECK(cudaMalloc(&d_part_, n * kPowerSplits * sizeof(float)));
         CURF_CUDA_CHECK(cudaMalloc(&d_floor_, streams * sizeof(float)));
         CURF_CUDA_CHECK(cudaMalloc(&d_flags_, n));
         CURF_CUDA_CHECK(cudaMalloc(&d_active_, n * sizeof(std::uint32_t)));
@@ -162,6 +177,7 @@ namespace curf::cuda {
 
     WindowStage::~WindowStage() {
         cudaFree(d_power_);
+        cudaFree(d_part_);
         cudaFree(d_floor_);
         cudaFree(d_flags_);
         cudaFree(d_active_);
@@ -171,8 +187,9 @@ namespace curf::cuda {
 
     void WindowStage::detect(const cf32 *d_win, const DetectConfig &cfg, cudaStream_t stream) {
         const auto *win = reinterpret_cast<const float2 *>(d_win);
-        power_kernel<<<dim3((channels_ + 255) / 256, streams_), 256, 0, stream>>>(win, d_power_, channels_, window_);
-        floor_flag_kernel<<<streams_, 512, channels_ * sizeof(float), stream>>>(d_power_, d_floor_, d_flags_, channels_,
+        power_kernel<<<dim3((channels_ + 255) / 256, streams_, kPowerSplits), 256, 0, stream>>>(win, d_part_, channels_, window_);
+        floor_flag_kernel<<<streams_, 512, channels_ * sizeof(float), stream>>>(d_part_, d_power_, d_floor_, d_flags_, channels_,
+                                                                                window_,
                                                                                 cfg);
         CURF_CUDA_CHECK(cudaGetLastError());
         if (cfg.compaction == Compaction::ballot) {
@@ -190,6 +207,14 @@ namespace curf::cuda {
         const dim3 grid((n + 31) / 32, window_ / 32), block(32, 8);
         gather_kernel<<<grid, block, 0, stream>>>(reinterpret_cast<const float2 *>(d_win), d_power_, d_active_, d_count_,
                                                   first, n, channels_, window_, reinterpret_cast<float2 *>(d_out));
+        CURF_CUDA_CHECK(cudaGetLastError());
+    }
+
+    void WindowStage::gather_half(const cf32 *d_win, std::uint32_t first, std::uint32_t n, __half *d_out, cudaStream_t stream) {
+        if (n == 0) return;
+        const dim3 grid((n + 31) / 32, window_ / 32), block(32, 8);
+        gather_kernel<<<grid, block, 0, stream>>>(reinterpret_cast<const float2 *>(d_win), d_power_, d_active_, d_count_,
+                                                  first, n, channels_, window_, reinterpret_cast<__half2 *>(d_out));
         CURF_CUDA_CHECK(cudaGetLastError());
     }
 
