@@ -16,6 +16,12 @@
 // and requantises in the coalesced second pass; the fused global average pool reads the staged fp16 tile.
 //
 // Requirements: int8 input with cin % 16 == 0, cout % BN == 0, kpad % 64 == 0.
+//
+// SC variants ("i8.mma.sc.*") also run a 1x1 strided shortcut conv as extra k-tiles in front of the main GEMM
+// (the stage3 BasicBlock: conv2 + shortcut). The two GEMMs have different scales (s_y1 * s_w2[n] vs
+// s_x * s_wsc[n]), so after the shortcut tiles the accumulators are dequantised into fp32 registers and
+// cleared; the epilogue adds them instead of reading an int8 residual. The shortcut output (128 ch x 128
+// positions int8 per window) is then never written and re-read, and its kernel disappears.
 
 #include "conv1d_internal.hpp"
 #include "mma_common.cuh"
@@ -46,7 +52,7 @@ namespace curf::engine::detail {
             static_assert(BM * 4 % NT == 0 && BN * 4 % NT == 0 && A_PER >= 1 && B_PER >= 1, "tile loads");
         };
 
-        template <int BM, int BN, int WM, int STAGES, int WN, bool SWZ>
+        template <int BM, int BN, int WM, int STAGES, int WN, bool SWZ, bool SC>
         __global__ void __launch_bounds__(I8Shape<BM, BN, WM, STAGES, WN, SWZ>::NT) conv_i8(ConvParams p) {
             using S = I8Shape<BM, BN, WM, STAGES, WN, SWZ>;
             constexpr int BK = S::BK, LDS = S::LDS, NT = S::NT, MI = S::MI, NI = S::NI;
@@ -80,9 +86,43 @@ namespace curf::engine::detail {
             const std::int8_t *w_row = p.w8 + static_cast<long long>(n0 + tid / 4) * p.kpad + kc;
             const long long w_step = static_cast<long long>(NT / 4) * p.kpad;
 
-            auto load_tile = [&](int stage, int k0) {
+            // shortcut k-tiles: A rows at sc_x[b][l * sc_stride], 64 channels per tile
+            const int KTS = SC ? p.sc_cin / BK : 0;
+            [[maybe_unused]] const std::int8_t *sc_row[S::A_PER];
+            [[maybe_unused]] const std::int8_t *wsc_row = nullptr;
+            if constexpr (SC) {
+#pragma unroll
+                for (int i = 0; i < S::A_PER; ++i) {
+                    const long long m = m0 + tid / 4 + i * (NT / 4);
+                    if (m < M) {
+                        const int b = static_cast<int>(m / p.lout), l = static_cast<int>(m - static_cast<long long>(b) * p.lout);
+                        sc_row[i] = p.sc_x + (static_cast<long long>(b) * p.sc_lin + static_cast<long long>(l) * p.sc_stride) * p.sc_cin + kc;
+                    } else {
+                        sc_row[i] = nullptr;
+                    }
+                }
+                wsc_row = p.sc_w8 + static_cast<long long>(n0 + tid / 4) * p.sc_kpad + kc;
+            }
+
+            auto load_tile = [&](int stage, int kidx) {
                 __half *as = As + stage * BM * LDS;
                 __half *bs = Bs + stage * BN * LDS;
+                if constexpr (SC) {
+                    if (kidx < KTS) {
+#pragma unroll
+                        for (int i = 0; i < S::A_PER; ++i) {
+                            const bool ok = sc_row[i] != nullptr;
+                            cp_async16_ca(smem_addr(as + sidx<SWZ, LDS>(tid / 4 + i * (NT / 4), tid % 4)),
+                                          ok ? sc_row[i] + kidx * BK : p.sc_x, ok);
+                        }
+#pragma unroll
+                        for (int i = 0; i < S::B_PER; ++i)
+                            cp_async16(smem_addr(bs + sidx<SWZ, LDS>(tid / 4 + i * (NT / 4), tid % 4)),
+                                       wsc_row + i * static_cast<long long>(NT / 4) * p.sc_kpad + kidx * BK, true);
+                        return;
+                    }
+                }
+                const int k0 = (kidx - KTS) * BK;
 #pragma unroll
                 for (int i = 0; i < S::A_PER; ++i) {
                     const int pos = a_pos0[i] + tap;
@@ -105,10 +145,10 @@ namespace curf::engine::detail {
 #pragma unroll
                     for (int e = 0; e < 4; ++e) acc[i][j][e] = 0;
 
-            const int KT = p.kpad / BK;
+            const int KT = KTS + p.kpad / BK;
 #pragma unroll
             for (int s = 0; s < STAGES - 1; ++s) {
-                if (s < KT) load_tile(s, s * BK);
+                if (s < KT) load_tile(s, s);
                 cp_async_commit();
             }
 
@@ -139,13 +179,33 @@ namespace curf::engine::detail {
 #pragma unroll
                     for (int j = 0; j < NI; ++j) mma(acc[i][j], af[buf][i], bf[buf][j]);
             };
+            // after the last shortcut tile: fsc = acc * sc_alpha + sc_bias, accumulators cleared for the main GEMM
+            [[maybe_unused]] float fsc[SC ? MI : 1][SC ? NI : 1][4];
+            auto finish_sc = [&](int kt) {
+                if constexpr (SC) {
+                    if (kt != KTS - 1) return;
+#pragma unroll
+                    for (int j = 0; j < NI; ++j) {
+                        const int c = n0 + wn * WN + j * 8 + (lane % 4) * 2;
+                        const float2 al = *reinterpret_cast<const float2 *>(p.sc_alpha + c);
+                        const float2 bs = *reinterpret_cast<const float2 *>(p.sc_bias + c);
+#pragma unroll
+                        for (int i = 0; i < MI; ++i)
+#pragma unroll
+                            for (int e = 0; e < 4; ++e) {
+                                fsc[i][j][e] = fmaf(static_cast<float>(acc[i][j][e]), e % 2 ? al.y : al.x, e % 2 ? bs.y : bs.x);
+                                acc[i][j][e] = 0;
+                            }
+                    }
+                }
+            };
 
             if constexpr (SWZ) {
                 cp_async_wait<STAGES - 2>();
                 __syncthreads();
                 load_frags(0, 0, 0);
                 for (int kt = 0; kt < KT; ++kt) {
-                    if (const int nk = kt + STAGES - 1; nk < KT) load_tile(nk % STAGES, nk * BK);
+                    if (const int nk = kt + STAGES - 1; nk < KT) load_tile(nk % STAGES, nk);
                     cp_async_commit();
                     load_frags(1, kt % STAGES, 16);
                     mma_all(0);
@@ -153,18 +213,20 @@ namespace curf::engine::detail {
                     __syncthreads();
                     if (kt + 1 < KT) load_frags(0, (kt + 1) % STAGES, 0);
                     mma_all(1);
+                    finish_sc(kt);
                 }
             } else {
                 for (int kt = 0; kt < KT; ++kt) {
                     cp_async_wait<STAGES - 2>();
                     __syncthreads();
-                    if (const int nk = kt + STAGES - 1; nk < KT) load_tile(nk % STAGES, nk * BK);
+                    if (const int nk = kt + STAGES - 1; nk < KT) load_tile(nk % STAGES, nk);
                     cp_async_commit();
 #pragma unroll
                     for (int ks = 0; ks < 32; ks += 16) {
                         load_frags(0, kt % STAGES, ks);
                         mma_all(0);
                     }
+                    finish_sc(kt);
                 }
             }
             cp_async_wait<0>();
@@ -185,6 +247,10 @@ namespace curf::engine::detail {
                         const int r = wm * WM + i * 16 + lane / 4 + h * 8;
                         float2 v = make_float2(fmaf(static_cast<float>(acc[i][j][2 * h]), al.x, bias.x),
                                                fmaf(static_cast<float>(acc[i][j][2 * h + 1]), al.y, bias.y));
+                        if constexpr (SC) {
+                            v.x += fsc[i][j][2 * h];
+                            v.y += fsc[i][j][2 * h + 1];
+                        }
                         if (relu_now) {
                             v.x = fmaxf(v.x, 0.f);
                             v.y = fmaxf(v.y, 0.f);
@@ -237,21 +303,27 @@ namespace curf::engine::detail {
             }
         }
 
-        template <int BM, int BN, int WM, int STAGES, int WN, bool SWZ>
+        template <int BM, int BN, int WM, int STAGES, int WN, bool SWZ, bool SC = false>
         void launch_i8(const ConvParams &p, cudaStream_t s) {
             using S = I8Shape<BM, BN, WM, STAGES, WN, SWZ>;
             static const bool configured = [] {
-                CURF_CUDA_CHECK(cudaFuncSetAttribute(conv_i8<BM, BN, WM, STAGES, WN, SWZ>,
+                CURF_CUDA_CHECK(cudaFuncSetAttribute(conv_i8<BM, BN, WM, STAGES, WN, SWZ, SC>,
                                                      cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(S::SMEM)));
                 return true;
             }();
             (void)configured;
             const dim3 grid(static_cast<unsigned>((p.m() + BM - 1) / BM), static_cast<unsigned>(p.cout / BN));
-            conv_i8<BM, BN, WM, STAGES, WN, SWZ><<<grid, S::NT, S::SMEM, s>>>(p);
+            conv_i8<BM, BN, WM, STAGES, WN, SWZ, SC><<<grid, S::NT, S::SMEM, s>>>(p);
         }
 
         template <int BN> bool sup_i8(const ConvParams &p) {
-            return p.int8 && !p.x_f32 && p.cin % 16 == 0 && p.cout % BN == 0 && p.kpad % 64 == 0 && p.w8 && p.alpha;
+            return p.int8 && !p.x_f32 && !p.sc_x && p.cin % 16 == 0 && p.cout % BN == 0 && p.kpad % 64 == 0 && p.w8 && p.alpha;
+        }
+        template <int BN> bool sup_i8_sc(const ConvParams &p) {
+            ConvParams q = p;
+            q.sc_x = nullptr;
+            return p.sc_x && p.sc_w8 && p.sc_alpha && p.sc_bias && !p.res && p.sc_cin % 64 == 0 && p.sc_kpad >= p.sc_cin &&
+                   p.lout == (p.sc_lin - 1) / p.sc_stride + 1 && sup_i8<BN>(q);
         }
 
         template <int BM, int BN, int WM, int STAGES, int WN = 32, bool SWZ = false> void add(std::vector<ConvVariant> &v) {
@@ -259,6 +331,12 @@ namespace curf::engine::detail {
                                      (WN == 32 ? "" : "x" + std::to_string(WN)) + ".s" + std::to_string(STAGES) +
                                      (SWZ ? ".z" : "");
             v.push_back({"i8.mma." + tile, true, &sup_i8<BN>, &launch_i8<BM, BN, WM, STAGES, WN, SWZ>, true, true});
+        }
+        template <int BM, int BN, int WM, int STAGES, int WN = 32, bool SWZ = false> void add_sc(std::vector<ConvVariant> &v) {
+            const std::string tile = std::to_string(BM) + "x" + std::to_string(BN) + ".w" + std::to_string(WM) +
+                                     (WN == 32 ? "" : "x" + std::to_string(WN)) + ".s" + std::to_string(STAGES) +
+                                     (SWZ ? ".z" : "");
+            v.push_back({"i8.mma.sc." + tile, true, &sup_i8_sc<BN>, &launch_i8<BM, BN, WM, STAGES, WN, SWZ, true>, true, true});
         }
 
     } // namespace
@@ -283,6 +361,13 @@ namespace curf::engine::detail {
         add<64, 128, 32, 3, 32, true>(v);
         add<128, 32, 32, 3, 32, true>(v);
         add<256, 64, 64, 3, 32, true>(v);
+        // conv2 + 1x1 shortcut (the tiles that win for stage3's conv2 alone, and neighbours)
+        add_sc<64, 64, 32, 3, 32, true>(v);
+        add_sc<64, 128, 32, 3, 32, true>(v);
+        add_sc<128, 64, 32, 3, 32, true>(v);
+        add_sc<128, 128, 64, 3, 32, true>(v);
+        add_sc<64, 64, 32, 3>(v);
+        add_sc<64, 128, 32, 3>(v);
     }
 
 } // namespace curf::engine::detail

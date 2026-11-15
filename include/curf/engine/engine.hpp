@@ -65,6 +65,10 @@ namespace curf::engine {
         std::string stem_variant;
         float stem_fused_us = 0;
         bool stem = false;           // chosen (implies fused)
+        // INT8 block with a 1x1 shortcut: conv1, then conv2 with the shortcut fused in (a conv variant)
+        std::string sc_variant;
+        float sc_fused_us = 0;
+        bool sc = false;             // chosen (implies fused)
     };
 
     class Engine {

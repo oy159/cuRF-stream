@@ -398,7 +398,7 @@ namespace curf::engine {
             conv_direct<float, TL, Q, MINB, true><<<grid, 256, direct_smem(p, TL), s>>>(p);
         }
         bool sup_direct_i8(const ConvParams &p) {
-            return p.int8 && p.x_f32 && p.cin <= 8 && p.cout % 8 == 0 && direct_smem(p) <= 48 * 1024;
+            return p.int8 && p.x_f32 && !p.sc_x && p.cin <= 8 && p.cout % 8 == 0 && direct_smem(p) <= 48 * 1024;
         }
 
         template <int BM, int BN, bool Fused, class AccT> void launch_wmma(const ConvParams &p, cudaStream_t s) {
@@ -467,17 +467,20 @@ namespace curf::engine {
             }
         }
 
-        __global__ void linear_from_pool_kernel(const float *pool, const float *w, const float *bias, float *y, int cin,
-                                                int cout, float inv_len) {
-            extern __shared__ float mean[];
-            const int b = blockIdx.x;
-            for (int c = threadIdx.x; c < cin; c += blockDim.x) mean[c] = pool[b * cin + c] * inv_len;
-            __syncthreads();
-            for (int n = threadIdx.x; n < cout; n += blockDim.x) {
-                float s = bias[n];
-                for (int c = 0; c < cin; ++c) s += w[n * cin + c] * mean[c];
-                y[b * cout + n] = s;
-            }
+        // One warp per (sample, class): coalesced pool / weight rows, shuffle reduction. (The first version ran one
+        // block per sample with a thread per class - 10 of 128 threads busy on a 128-long serial FMA chain over
+        // strided weights: 28 us per batch of 512, 1.6% of the full-load GPU time.)
+        __global__ void linear_from_pool_kernel(const float *pool, const float *w, const float *bias, float *y, int batch,
+                                                int cin, int cout, float inv_len) {
+            const int task = static_cast<int>((blockIdx.x * blockDim.x + threadIdx.x) / 32), lane = threadIdx.x % 32;
+            if (task >= batch * cout) return;
+            const int b = task / cout, n = task - b * cout;
+            const float *pr = pool + static_cast<long long>(b) * cin, *wr = w + static_cast<long long>(n) * cin;
+            float s = 0.f;
+            for (int c = lane; c < cin; c += 32) s = fmaf(wr[c], pr[c], s);
+#pragma unroll
+            for (int o = 16; o > 0; o /= 2) s += __shfl_xor_sync(0xffffffffu, s, o);
+            if (lane == 0) y[task] = fmaf(s, inv_len, bias[n]);
         }
 
         __global__ void float_to_half_kernel(const float *src, __half *dst, std::size_t n) {
@@ -535,8 +538,8 @@ namespace curf::engine {
 
     void launch_linear_from_pool(const float *pool, const float *w, const float *bias, float *y, int batch, int cin,
                                  int cout, float inv_len, cudaStream_t s) {
-        linear_from_pool_kernel<<<batch, 128, static_cast<std::size_t>(cin) * sizeof(float), s>>>(pool, w, bias, y, cin,
-                                                                                                cout, inv_len);
+        linear_from_pool_kernel<<<static_cast<unsigned>((static_cast<long long>(batch) * cout + 7) / 8), 256, 0, s>>>(
+            pool, w, bias, y, batch, cin, cout, inv_len);
         CURF_CUDA_CHECK(cudaGetLastError());
     }
 

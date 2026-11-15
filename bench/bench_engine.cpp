@@ -147,9 +147,10 @@ int main(int argc, char **argv) {
         if (ops) {
             for (const auto &d : e.fusion_decisions())
                 std::printf("  {\"step\":\"%s\",\"batch\":%d,\"fusion\":\"%s\",\"variant\":\"%s\",\"fused_us\":%.2f,"
-                            "\"unfused_us\":%.2f,\"fused\":%s,\"stem_variant\":\"%s\",\"stem_fused_us\":%.2f,\"stem\":%s}\n",
+                            "\"unfused_us\":%.2f,\"fused\":%s,\"stem_variant\":\"%s\",\"stem_fused_us\":%.2f,\"stem\":%s,\"sc_variant\":\"%s\",\"sc_fused_us\":%.2f,\"sc\":%s}\n",
                             step.c_str(), d.bucket, d.block.c_str(), d.fused_variant.c_str(), d.fused_us, d.unfused_us,
-                            d.fused ? "true" : "false", d.stem_variant.c_str(), d.stem_fused_us, d.stem ? "true" : "false");
+                            d.fused ? "true" : "false", d.stem_variant.c_str(), d.stem_fused_us, d.stem ? "true" : "false",
+                            d.sc_variant.c_str(), d.sc_fused_us, d.sc ? "true" : "false");
             for (const auto &c : e.choices()) {
                 if (c.bucket != buckets.back()) continue;
                 std::printf("  {\"step\":\"%s\",\"batch\":%d,\"op\":\"%s\",\"variant\":\"%s\",\"us\":%.2f,\"tflops\":%.3f}\n",

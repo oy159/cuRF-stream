@@ -239,7 +239,9 @@ TEST_CASE("fused INT8 BasicBlocks match the golden", "[cuda][engine][int8][fusio
         cfg.cuda_graphs = false;
         cfg.reuse_memory = false;
         Engine e(d->model, cfg);
-        CHECK(e.steps() == (resident ? 8u : k2 ? 9u : 6u)); // stem + 4 blocks + head; unfused blocks as convs
+        // stem + 4 blocks + head; unfused blocks as convs (stage3 without a resident block: conv1 + conv2 with the
+        // shortcut fused in)
+        CHECK(e.steps() == (resident ? 7u : k2 ? 9u : 6u));
         upload(e, g, 0, n);
         e.run(n, nullptr);
         CURF_CUDA_CHECK(cudaDeviceSynchronize());
@@ -252,7 +254,7 @@ TEST_CASE("fused INT8 BasicBlocks match the golden", "[cuda][engine][int8][fusio
             CHECK(err < 0.12);
             ++checked;
         }
-        CHECK(checked == (resident ? 6 : k2 ? 7 : 4)); // stem out + 3 block outputs + the unfused blocks' inner tensors
+        CHECK(checked == (resident ? 5 : k2 ? 7 : 4)); // stem out + 3 block outputs + the unfused blocks' inner tensors
         const auto logits = e.read_tensor(d->model.output, n);
         int agree = 0;
         for (int i = 0; i < n; ++i) agree += argmax(&logits[i * c], c) == argmax(&g.logits[i * c], c);
@@ -323,6 +325,56 @@ TEST_CASE("INT8 stem fused into the first block matches the separate stem", "[cu
         int agree = 0;
         for (int i = 0; i < n; ++i) agree += argmax(&logits[i * c], c) == argmax(&g.logits[i * c], c);
         std::printf("  i8.block.stem.%s: %zu steps, top-1 %d/%d\n", tile.c_str(), fused->steps(), agree, n);
+        CHECK(agree >= n - 2);
+    }
+}
+
+TEST_CASE("INT8 conv2 with the shortcut fused in matches the separate shortcut", "[cuda][engine][int8][fusion]") {
+    const auto *d = data();
+    if (!d) SKIP("no converted model in " + kDir.string());
+    const auto &g = d->golden;
+    const int n = static_cast<int>(g.n_layer), c = static_cast<int>(g.classes);
+    std::uint32_t sc_out = kNoTensor;
+    for (const auto &op : d->model.ops)
+        if (op.name.find("stage3.0/shortcut") != std::string::npos) sc_out = op.out;
+    REQUIRE(sc_out != kNoTensor);
+    auto make = [&](const std::string &prefix, bool sc) {
+        EngineConfig cfg = int8_config(g, d->model);
+        cfg.buckets = {n};
+        cfg.variant_prefix = prefix;
+        cfg.block_prefix = "none"; // no block kernels: every BasicBlock as convs
+        if (!sc) cfg.exclude_prefixes.push_back("i8.mma.sc.");
+        cfg.calib_percentile = 1.0;
+        cfg.autotune = false;
+        cfg.cuda_graphs = false;
+        cfg.reuse_memory = false;
+        auto e = std::make_unique<Engine>(d->model, cfg);
+        upload(*e, g, 0, n);
+        e->run(n, nullptr);
+        CURF_CUDA_CHECK(cudaDeviceSynchronize());
+        return e;
+    };
+    const auto ref = make("i8.mma.64x64.w32.s3.z", false);
+    const auto ref_logits = ref->read_tensor(d->model.output, n);
+    for (const std::string tile : {"64x64.w32.s3.z", "64x128.w32.s3.z", "128x64.w32.s3.z", "128x128.w64.s3.z", "64x64.w32.s3",
+                                   "64x128.w32.s3"}) {
+        const auto e = make("i8.mma.sc." + tile, true); // other convs fall back to the plain i8.mma tiles
+        CHECK(e->steps() == ref->steps() - 1);
+        CHECK_FALSE(e->materialized(sc_out));
+        bool used = false;
+        for (const auto &ch : e->choices()) used = used || ch.variant.rfind("i8.mma.sc." + tile, 0) == 0; // ".s3" also matches ".s3.z"
+        CHECK(used);
+        // The fused shortcut is added in fp32 instead of being rounded to int8 first: logits move by about one
+        // int8 step of the residual, the class decisions do not.
+        const auto logits = e->read_tensor(d->model.output, n);
+        const double vs_ref = rel_err(logits, ref_logits.data(), logits.size());
+        const double vs_gold = rel_err(logits, g.activations[d->model.output].data(), logits.size());
+        int agree = 0;
+        for (int i = 0; i < n; ++i) agree += argmax(&logits[i * c], c) == argmax(&g.logits[i * c], c);
+        std::printf("  i8.mma.sc.%s: logits rel err vs separate shortcut %.2e, vs fp32 %.2e, top-1 %d/%d\n", tile.c_str(),
+                    vs_ref, vs_gold, agree, n);
+        CHECK(vs_ref < 0.05);
+        CHECK(vs_gold < 0.12);
         CHECK(agree >= n - 2);
     }
 }

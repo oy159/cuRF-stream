@@ -39,9 +39,15 @@ namespace curf::engine {
         const float *alpha = nullptr; // [cout]: weight scale[n] * input scale, dequantises the int32 accumulator
         float res_scale = 0.f;        // residual tensor's scale
         float y_inv_scale = 0.f;      // 1 / output tensor's scale
+        // INT8 1x1 shortcut fused in as a second GEMM (ConvVariant with shortcut support): instead of reading res,
+        // y = act(acc * alpha + bias + acc_sc * sc_alpha + sc_bias), acc_sc = sum_ci sc_x[b][l * sc_stride][ci] * sc_w8.
+        // sc_x int8 [batch][sc_lin][sc_cin] (sc_cin % 64 == 0), sc_w8 [cout][sc_kpad].
+        const std::int8_t *sc_x = nullptr, *sc_w8 = nullptr;
+        const float *sc_alpha = nullptr, *sc_bias = nullptr;
+        int sc_lin = 0, sc_cin = 0, sc_stride = 1, sc_kpad = 0;
 
         long long m() const { return static_cast<long long>(batch) * lout; }
-        double flops() const { return 2.0 * static_cast<double>(m()) * cout * cin * k; }
+        double flops() const { return 2.0 * static_cast<double>(m()) * cout * (cin * k + (sc_x ? sc_cin : 0)); }
     };
 
     struct ConvVariant {

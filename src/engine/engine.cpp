@@ -23,8 +23,10 @@ namespace curf::engine {
 
         // A BasicBlock that may run as one kernel: conv1 (a), conv2 (b, with the residual), shortcut (c).
         // s: the stem conv in front of it (fp32 graph input), if a stem-fused block variant can take it.
+        // sc: conv2 can run with the 1x1 shortcut fused in (INT8 conv variants "i8.mma.sc.*").
         struct Group {
             std::size_t a = kNone, b = kNone, c = kNone, s = kNone;
+            bool sc = false;
         };
 
         // One kernel launch of a bucket's execution plan.
@@ -33,10 +35,12 @@ namespace curf::engine {
             std::size_t op = 0;        // conv / head op; block: its conv2
             std::size_t group = kNone; // block only
             bool stem = false;         // block with the stem conv fused in front
+            bool sc = false;           // conv (a group's conv2) with the shortcut fused in
         };
 
-        // Per bucket and group: how the BasicBlock runs.
-        enum class Fuse : unsigned char { none, block, stem };
+        // Per bucket and group: how the BasicBlock runs (separate convs; one block kernel; block kernel with the
+        // stem in front; conv1, then conv2 with the shortcut fused in).
+        enum class Fuse : unsigned char { none, block, stem, shortcut };
 
     } // namespace
 
@@ -60,6 +64,7 @@ namespace curf::engine {
         std::vector<std::vector<const BlockVariant *>> block_choice; // [bucket][group]
         std::vector<std::vector<const BlockVariant *>> stem_choice;  // [bucket][group], stem-fused variant
         std::vector<std::vector<Fuse>> fuse_mode;                    // [bucket][group]
+        std::vector<std::vector<const ConvVariant *>> sc_choice;     // [bucket][group], conv2 + shortcut
         std::vector<cudaGraphExec_t> graphs;                         // [bucket]
         std::vector<OpChoice> choices;
         std::vector<FusionDecision> decisions;
@@ -83,7 +88,7 @@ namespace curf::engine {
         template <class T> const T *wptr(std::uint64_t off) const { return reinterpret_cast<const T *>(weights.get() + off); }
         std::size_t pool_channels() const { return head_op == kNone || pool_op == kNone ? 0 : model.ops[head_op].cin; }
 
-        ConvParams conv_params(std::size_t i, int batch) const {
+        ConvParams conv_params(std::size_t i, int batch, bool with_sc = false) const {
             const auto &op = model.ops[i];
             ConvParams p;
             p.x = ptr(op.in);
@@ -110,6 +115,21 @@ namespace curf::engine {
                 p.alpha = alpha.get() + alpha_off[i];
                 p.res_scale = op.res == kNoTensor ? 0.f : act_scale[op.res];
                 p.y_inv_scale = i == pool_op ? 0.f : 1.f / act_scale[op.out];
+                if (with_sc && group_of[i] != kNone && groups[group_of[i]].c != kNone) {
+                    const auto sc = groups[group_of[i]].c;
+                    const auto &c = model.ops[sc];
+                    p.res = nullptr;
+                    p.res_scale = 0.f;
+                    p.sc_x = static_cast<const std::int8_t *>(ptr(c.in));
+                    if (!p.sc_x) p.sc_x = reinterpret_cast<const std::int8_t *>(16); // shape check before allocation
+                    p.sc_w8 = w8.get() + w8_off[sc];
+                    p.sc_alpha = alpha.get() + alpha_off[sc];
+                    p.sc_bias = wptr<float>(c.b_off);
+                    p.sc_lin = static_cast<int>(tensor(c.in).length);
+                    p.sc_cin = static_cast<int>(c.cin);
+                    p.sc_stride = static_cast<int>(c.stride);
+                    p.sc_kpad = kpad8[sc];
+                }
             }
             return p;
         }
@@ -244,9 +264,18 @@ namespace curf::engine {
                     groups.back().s = is;
                     if (!any_variant(true)) groups.back().s = kNone;
                 }
-                if (groups.back().s == kNone && !any_variant(false)) { groups.pop_back(); continue; }
                 group_of[ia] = group_of[ib] = groups.size() - 1;
                 if (g.c != kNone) group_of[g.c] = groups.size() - 1;
+                if (cfg.int8 && g.c != kNone) { // conv2 with the shortcut fused in
+                    const auto cp = conv_params(ib, 1, true);
+                    for (const auto &v : conv_variants()) groups.back().sc = groups.back().sc || (allowed(v) && v.supported(cp));
+                }
+                if (groups.back().s == kNone && !groups.back().sc && !any_variant(false)) {
+                    group_of[ia] = group_of[ib] = kNone;
+                    if (g.c != kNone) group_of[g.c] = kNone;
+                    groups.pop_back();
+                    continue;
+                }
             }
         }
 
@@ -254,7 +283,10 @@ namespace curf::engine {
         void launch_step(const Step &st, std::size_t bi, int batch, cudaStream_t s) const {
             const auto &op = model.ops[st.op];
             switch (st.kind) {
-                case Step::Kind::conv: launch_conv(*conv_choice[bi][st.op], conv_params(st.op, batch), s); break;
+                case Step::Kind::conv:
+                    if (st.sc) launch_conv(*sc_choice[bi][st.group], conv_params(st.op, batch, true), s);
+                    else launch_conv(*conv_choice[bi][st.op], conv_params(st.op, batch), s);
+                    break;
                 case Step::Kind::block:
                     (st.stem ? stem_choice : block_choice)[bi][st.group]->launch(block_params(st.group, batch, st.stem), s);
                     break;
@@ -278,10 +310,10 @@ namespace curf::engine {
         }
 
         // ------------------------------------------------------------ kernel selection
-        std::string conv_key(std::size_t i, int batch) const {
+        std::string conv_key(std::size_t i, int batch, bool with_sc = false) const {
             const auto &op = model.ops[i];
             std::ostringstream k;
-            k << gpu << '|' << (cfg.int8 ? "I8" : "") << cfg.variant_prefix << '|';
+            k << gpu << '|' << (cfg.int8 ? "I8" : "") << (with_sc ? "SC" : "") << cfg.variant_prefix << '|';
             for (const auto &x : cfg.exclude_prefixes) k << '-' << x;
             k << '|' << op.cin << ',' << op.cout << ',' << op.k << ',' << op.stride << ',' << op.pad << ','
               << tensor(op.in).length << ',' << (op.res != kNoTensor) << op.relu << (op.in == model.input)
@@ -363,7 +395,10 @@ namespace curf::engine {
             for (std::size_t i = 0; i < model.ops.size(); ++i) {
                 const auto g = group_of[i];
                 if (stem_fused[i]) continue; // inside its block
-                if (g != kNone && mode[g] != Fuse::none) {
+                if (g != kNone && mode[g] == Fuse::shortcut) {
+                    if (i == groups[g].a) out.push_back({Step::Kind::conv, i});
+                    else if (i == groups[g].b) out.push_back({Step::Kind::conv, i, g, false, true});
+                } else if (g != kNone && mode[g] != Fuse::none) {
                     if (i == groups[g].b) out.push_back({Step::Kind::block, i, g, mode[g] == Fuse::stem}); // where conv2 was
                 } else if (model.ops[i].kind == OpKind::conv) {
                     out.push_back({Step::Kind::conv, i});
@@ -384,6 +419,7 @@ namespace curf::engine {
             conv_us.assign(buckets.size(), std::vector<float>(no, 0.f));
             block_choice.assign(buckets.size(), std::vector<const BlockVariant *>(groups.size(), nullptr));
             stem_choice = block_choice;
+            sc_choice.assign(buckets.size(), std::vector<const ConvVariant *>(groups.size(), nullptr));
             fuse_mode.assign(buckets.size(), std::vector<Fuse>(groups.size(), Fuse::none));
             steps.assign(buckets.size(), {});
             auto cached = [&](const std::string &key, auto find, auto pick, float &us) {
@@ -409,7 +445,7 @@ namespace curf::engine {
                     conv_us[bi][i] = us;
                 }
                 auto &mode = fuse_mode[bi];
-                std::vector<float> block_us(groups.size(), 0.f), stem_us(groups.size(), 0.f);
+                std::vector<float> block_us(groups.size(), 0.f), stem_us(groups.size(), 0.f), sc_us(groups.size(), 0.f);
                 auto find_block = [](const std::string &n) -> const BlockVariant * {
                     for (const auto &x : block_variants())
                         if (x.name == n) return &x;
@@ -427,6 +463,13 @@ namespace curf::engine {
                                                     [&](float &u) { return pick_block(ps, u); }, stem_us[g]);
                         if (stem_choice[bi][g]) mode[g] = Fuse::stem;
                     }
+                    if (groups[g].sc) {
+                        const auto pc = conv_params(groups[g].b, batch, true);
+                        sc_choice[bi][g] = cached(conv_key(groups[g].b, batch, true),
+                                                  [](const std::string &n) { return find_conv_variant(n); },
+                                                  [&](float &u) { return pick_conv(pc, u); }, sc_us[g]);
+                        if (sc_choice[bi][g] && mode[g] == Fuse::none) mode[g] = Fuse::shortcut;
+                    }
                 }
                 // Fusion decided in context: toggle one block at a time and time the whole network, alternating
                 // the two plans for three rounds (best of each). Per-kernel timings in isolation mislead here: an
@@ -443,8 +486,12 @@ namespace curf::engine {
                     std::vector<Fuse> options{Fuse::none};
                     if (block_choice[bi][g]) options.push_back(Fuse::block);
                     if (stem_choice[bi][g]) options.push_back(Fuse::stem);
+                    if (sc_choice[bi][g]) {
+                        options.push_back(Fuse::shortcut);
+                        d.sc_variant = sc_choice[bi][g]->name;
+                    }
                     if (options.size() > 1 && cfg.autotune) {
-                        float best[3] = {1e30f, 1e30f, 1e30f};
+                        float best[4] = {1e30f, 1e30f, 1e30f, 1e30f};
                         for (int r = 0; r < 3; ++r)
                             for (const Fuse o : options) {
                                 mode[g] = o;
@@ -459,9 +506,11 @@ namespace curf::engine {
                         d.unfused_us = best[0];
                         d.fused_us = best[1] < 1e29f ? best[1] : 0.f;
                         d.stem_fused_us = best[2] < 1e29f ? best[2] : 0.f;
+                        d.sc_fused_us = best[3] < 1e29f ? best[3] : 0.f;
                     }
                     d.fused = mode[g] != Fuse::none;
                     d.stem = mode[g] == Fuse::stem;
+                    d.sc = mode[g] == Fuse::shortcut;
                     decisions.push_back(d);
                 }
                 steps[bi] = make_steps(mode);
@@ -473,6 +522,11 @@ namespace curf::engine {
                         oc.variant = (st.stem ? stem_choice : block_choice)[bi][st.group]->name;
                         oc.us = (st.stem ? stem_us : block_us)[st.group];
                         oc.flops = block_params(st.group, batch, st.stem).flops();
+                    } else if (st.kind == Step::Kind::conv && st.sc) {
+                        oc.op = model.ops[groups[st.group].c].name + "+" + oc.op;
+                        oc.variant = sc_choice[bi][st.group]->name;
+                        oc.us = sc_us[st.group];
+                        oc.flops = conv_params(st.op, batch, true).flops();
                     } else if (st.kind == Step::Kind::conv) {
                         oc.variant = conv_choice[bi][st.op]->name;
                         oc.us = conv_us[bi][st.op];
@@ -506,6 +560,11 @@ namespace curf::engine {
                         if (g.b != pool_op) need[model.ops[g.b].out] = true;
                     } else if (st.kind == Step::Kind::linear_from_pool) {
                         need[model.ops[st.op].out] = true;
+                    } else if (st.sc) { // reads conv1's output and the block input, not the shortcut output
+                        const auto &op = model.ops[st.op];
+                        need[op.in] = true;
+                        need[model.ops[groups[st.group].c].in] = true;
+                        if (st.op != pool_op) need[op.out] = true;
                     } else {
                         mark_op(st.op);
                     }
