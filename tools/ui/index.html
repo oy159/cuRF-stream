@@ -36,7 +36,7 @@
   canvas { display: block; width: 100%; }
   canvas.wf { height: 250px; cursor: crosshair; }
   canvas.cls { height: 80px; margin-top: 3px; cursor: crosshair; }
-  canvas.labels { height: 34px; }
+  canvas.labels { height: 36px; }
   canvas.axis { height: 18px; }
   .sel { position: absolute; top: 0; bottom: 0; background: rgba(120, 170, 255, 0.15); border-left: 1px solid #7aa7ff;
          border-right: 1px solid #7aa7ff; pointer-events: none; display: none; }
@@ -69,6 +69,7 @@
   <div class="ctl">平滑
     <select id="tau"><option value="0.15">0.15 s</option><option value="0.5" selected>0.5 s</option><option value="2">2 s</option></select>
   </div>
+  <label class="ctl"><input type="checkbox" id="steady" checked>只看持续信号</label>
   <div class="ctl"><button id="reset">全带宽</button><span>在瀑布图上拖动可放大频段，双击复原</span></div>
 </div>
 <main id="streams"></main>
@@ -216,9 +217,9 @@ function onRow(row) {
     p.cctx.drawImage(p.coff, 0, 0, M, CROWS - 1, 0, 1, M, CROWS - 1); p.cctx.putImageData(p.crow, 0, 0);
     p.now = now;
     p.groups = group(p, now);
-    for (const g of p.groups) counts[g.cls]++;
-    p.info.textContent = `本底 ${f.toFixed(1)} dBFS · 跟踪 ${p.groups.length} 个信号`;
+    for (const g of p.groups) if (!(document.getElementById("steady").checked && g.bursty)) counts[g.cls]++;
     blit(p); drawLabels(p);
+    p.info.textContent = `本底 ${f.toFixed(1)} dBFS · 跟踪 ${p.groups.length} 个信号${p.hint || ""}`;
   }
   document.getElementById("t").textContent = row.t.toFixed(2) + " s";
   rateRows++;
@@ -233,46 +234,61 @@ function group(p, now) {
   for (let x = 0; x < M;) {
     if (!T.on[x] || T.cls[x] <= 0) { x++; continue; }
     const c = T.cls[x];
-    let e = x, pmax = -200, conf = 0, since = now, wsum = 0, xw = 0;
+    let e = x, pmax = -200, conf = 0, since = now, wsum = 0, xw = 0, act = 0;
     while (e < M && T.on[e] && T.cls[e] === c) {
       const lin = Math.pow(10, T.pw[e] / 10);
-      pmax = Math.max(pmax, T.pw[e]); conf += T.conf[e]; since = Math.min(since, T.since[e]); wsum += lin; xw += lin * e; e++;
+      pmax = Math.max(pmax, T.pw[e]); conf += T.conf[e]; since = Math.min(since, T.since[e]); wsum += lin; xw += lin * e;
+      act = Math.max(act, T.act[e]); e++;
     }
-    out.push({ x0: x, x1: e, xc: xw / wsum, cls: c, conf: conf / (e - x), snr: pmax - p.floor, age: now - since });
+    out.push({ x0: x, x1: e, xc: xw / wsum, cls: c, conf: conf / (e - x), snr: pmax - p.floor, age: now - since,
+               bursty: act < 0.8 }); // present in < 80 % of recent rows: a burst signal (e.g. WiFi), not a steady one
     x = e;
   }
   return out;
 }
 
+// Label strip: every signal gets a colour bar (class colour; bursty signals half transparent). The class name
+// is written where the gap to the neighbouring signals holds it - at full band ~100 signals share ~800 px,
+// so names appear once you zoom in. No greedy "first label that fits" choice: that made a different signal win the
+// space every row and the labels flicker.
 function drawLabels(p) {
   const [ctx, w, h] = fit(p.labels);
   ctx.clearRect(0, 0, w, h);
   ctx.textBaseline = "middle"; ctx.textAlign = "center";
-  let lastEnd = -1e9;
-  for (const g of p.groups) {
-    if (hidden.has(g.cls) || g.x1 <= view[0] || g.x0 >= view[1]) continue;
+  let named = 0, shown = 0;
+  const gs = visible(p), cx = gs.map(g => (xOf(g.x0, w) + xOf(g.x1, w)) / 2), lineEnd = [-Infinity, -Infinity];
+  gs.forEach((g, i) => {
     const x0 = xOf(g.x0, w), x1 = xOf(g.x1, w);
+    ctx.globalAlpha = g.bursty ? 0.45 : 1;
     ctx.fillStyle = color(g.cls);
-    ctx.fillRect(x0, h - 6, Math.max(2, x1 - x0 - 1), 6);
-    const t1 = name(g.cls), t2 = Math.round(g.conf * 100) + "%";
+    ctx.fillRect(x0 + 0.5, h - 10, Math.max(2, x1 - x0 - 1), 10);
+    ctx.globalAlpha = 1;
+    shown++;
+    // Names go on the first of two text lines where they do not overlap the previous name on that line.
+    // With the steady signals only (the default), the set of signals - and so the layout - does not change
+    // while the tracks are steady.
     ctx.font = "600 11px system-ui, sans-serif";
-    const tw = Math.max(ctx.measureText(t1).width, 26), cx = (x0 + x1) / 2;
-    if (cx - tw / 2 > lastEnd + 3 && cx + tw / 2 < w) { // only where it does not collide with the previous label
-      ctx.fillText(t1, cx, 8);
-      ctx.font = "10px ui-monospace, Menlo, monospace"; ctx.fillStyle = "#9aa4b0";
-      ctx.fillText(t2, cx, 20);
-      lastEnd = cx + tw / 2;
-    }
-  }
+    const t1 = name(g.cls), tw = ctx.measureText(t1).width + 4, a = cx[i] - tw / 2, b = cx[i] + tw / 2;
+    if (a >= 0 && b <= w)
+      for (let ln = 0; ln < 2; ln++)
+        if (a >= lineEnd[ln]) { ctx.fillText(t1, cx[i], ln ? 19 : 7); lineEnd[ln] = b; named++; break; }
+  });
+  p.hint = !shown || named === shown ? "" : named ? ` · 已标注 ${named}/${shown}，继续放大可看全部` : " · 颜色即类别，拖动放大显示类别名";
+}
+
+// Signals shown: not hidden by the legend, inside the view, and (optionally) not bursty.
+function visible(p) {
+  const steady = document.getElementById("steady").checked;
+  return p.groups.filter(g => !hidden.has(g.cls) && g.x1 > view[0] && g.x0 < view[1] && !(steady && g.bursty));
 }
 
 function drawList(p) {
-  const gs = p.groups.filter(g => !hidden.has(g.cls) && g.x1 > view[0] && g.x0 < view[1]);
+  const gs = visible(p);
   p.n.textContent = `${gs.length} 个`;
   const bw = meta.rate / meta.channels;
   p.rows.innerHTML = `<table><tr><th>频率 MHz</th><th>带宽 kHz</th><th>类别</th><th>置信</th><th>SNR</th><th>持续</th></tr>` +
     gs.map(g => `<tr data-x="${g.xc}"><td>${fmtMHz(g.xc)}</td><td>${Math.round((g.x1 - g.x0 + 1) * bw / 1e3)}</td>` +
-      `<td><i style="background:${color(g.cls)}"></i>${name(g.cls)}</td><td>${Math.round(g.conf * 100)}%</td>` +
+      `<td><i style="background:${color(g.cls)};opacity:${g.bursty ? 0.45 : 1}"></i>${name(g.cls)}${g.bursty ? " <span style=\"color:#7d8896\">突发</span>" : ""}</td><td>${Math.round(g.conf * 100)}%</td>` +
       `<td>${g.snr.toFixed(0)} dB</td><td>${g.age < 60 ? g.age.toFixed(1) + " s" : (g.age / 60).toFixed(1) + " min"}</td></tr>`).join("") +
     `</table>`;
   for (const tr of p.rows.querySelectorAll("tr[data-x]"))
@@ -342,6 +358,7 @@ async function start() {
   try { classes = await (await fetch("/classes")).json(); } catch { classes = []; }
   drawLegend();
   document.getElementById("reset").onclick = () => meta && setView(0, meta.channels);
+  document.getElementById("steady").onchange = () => { for (const p of panels) { drawList(p); drawLabels(p); } };
   const es = new EventSource("/feed");
   es.onmessage = ev => {
     const m = JSON.parse(ev.data);
