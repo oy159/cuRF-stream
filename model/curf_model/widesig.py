@@ -85,6 +85,7 @@ def emissions(x: np.ndarray, fs: float, source: str, nfft: int | None = None, th
         S[k] = np.abs(np.fft.fftshift(np.fft.fft(seg, axis=1), axes=1)) ** 2
     # Smooth over ~5 frames x 5 bins first: test signals of OFDM systems (LTE, NR, DAB) leave most resource
     # elements empty, and the raw cells would cut one carrier into thousands of fragments.
+    raw = S
     S = ndimage.uniform_filter(S, size=(smooth_t, smooth_f), mode="constant")
     floor = float(np.percentile(S, 5))
     mask = S > max(floor * 10 ** (thresh_db / 10), float(S.max()) * 10 ** (-range_db / 10))
@@ -118,7 +119,12 @@ def emissions(x: np.ndarray, fs: float, source: str, nfft: int | None = None, th
         bw = max((hi - lo + 1) * fs / nfft, fs / nfft)
         fc = float((f[lo] + f[min(hi, nfft - 1)]) / 2)
         snr = 10 * np.log10(p.max() / max(floor, 1e-30))
-        out.append(Emission(source, fc, float(bw), int(ts.start * hop), int((ts.stop - 1) * hop + nfft), float(snr)))
+        # time span from the unsmoothed in-band power: the smoothing widened it by ~2 frames on each side, which
+        # for short bursts (WiFi OFDM, 0.1-1 ms) would put many windows on silence labelled as the signal
+        e_t = raw[ts, lo:hi + 1].sum(1)
+        on = np.nonzero(e_t > 0.05 * np.percentile(e_t, 90))[0]
+        f0, f1 = (ts.start + on[0], ts.start + on[-1]) if len(on) else (ts.start, ts.stop - 1)
+        out.append(Emission(source, fc, float(bw), int(f0 * hop), int(f1 * hop + nfft), float(snr)))
     # pieces of one emission (same centre and width, overlapping or touching in time) become one
     out.sort(key=lambda e: (e.t0, e.fc))
     merged: list[Emission] = []

@@ -25,7 +25,7 @@ OFFLINE = Path.home() / "opt/onair-4.2.0/onair-offline"
 # OnAir mode id -> (modulation family, what it is). An id OnAir does not know falls back silently to a default
 # 9.143 MS/s test signal (seen for cell_lte, cdma, chv, is95, pmr): check the index for that rate / bandwidth.
 FAMILY = {
-    "wifi": ("ofdm", "802.11a/g/n 20 MHz"),
+    "wifi": ("dsss", "802.11b DSSS beacons, 1 Mbit/s DBPSK Barker-11 (OnAir's 2.4 GHz default; not OFDM)"),
     "cell": ("ofdm", "LTE downlink 10 MHz"),
     "nr": ("ofdm", "5G NR downlink"),
     "nbiot": ("ofdm", "NB-IoT 180 kHz"),
@@ -78,6 +78,23 @@ FAMILY = {
 }
 
 
+# Variants: one OnAir mode with generator options (SynthConfig::modeOpt / modeVal, see its <mode>_gen.h, or the
+# mode's own CLI flags) -> name: (OnAir id, extra arguments, family, what)
+VARIANTS = {
+    "wifi5": ("wifi", ["--sopt", "0", "1"], "ofdm", "802.11a non-HT OFDM 6 Mbit/s, 5 GHz beacons"),
+    "wifi6": ("wifi", ["--sopt", "0", "2"], "ofdm", "802.11ax-band non-HT OFDM, 6 GHz discovery frames"),
+    "cell5": ("cell", ["--sopt", "0", "1"], "ofdm", "LTE downlink 5 MHz"),
+    "cell1p4": ("cell", ["--sopt", "0", "2"], "ofdm", "LTE downlink 1.4 MHz"),
+    "cell20": ("cell", ["--sopt", "0", "3"], "ofdm", "LTE downlink 20 MHz"),
+    "dtmb16": ("dtmb", ["--sopt", "1", "2"], "ofdm", "DTMB 16QAM"),
+    "dvbs1": ("dvbs", ["--sopt", "0", "1", "--sval", "0", "1e6"], "psk", "DVB-S QPSK 1 Msym/s"),
+    "dvbs8psk": ("dvbs", ["--sopt", "1", "1", "--sval", "0", "2e6"], "psk", "DVB-S2 8PSK 2 Msym/s"),
+    "dvbs16apsk": ("dvbs", ["--sopt", "1", "2", "--sval", "0", "3e6"], "qam", "DVB-S2 16APSK 3 Msym/s"),
+    "dvbs32apsk": ("dvbs", ["--sopt", "1", "3", "--sopt", "2", "9"], "qam", "DVB-S2 32APSK 5/6, 5 Msym/s"),
+    # (--dvbc-qam / --dvbc-sr set the DVB-C receiver only: the test signal stays the default one)
+}
+
+
 def measure(stem: Path):
     g = json.loads(stem.with_suffix(".sigmf-meta").read_text())["global"]
     fs = g["core:sample_rate"]
@@ -102,7 +119,8 @@ def measure(stem: Path):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out", type=Path, required=True)
-    ap.add_argument("--ids", default=",".join(FAMILY))
+    ap.add_argument("--ids", default=",".join(list(FAMILY) + list(VARIANTS)))
+    ap.add_argument("--merge", action="store_true", help="update the rows of these ids in an existing index.json")
     ap.add_argument("--secs", type=float, default=2)
     ap.add_argument("--snr", type=float, default=60, help="OnAir's synthetic noise level (high: clean signal)")
     a = ap.parse_args()
@@ -112,7 +130,8 @@ def main():
         stem = a.out / mid
         for f in (stem.with_suffix(".cf32"), stem.with_suffix(".sigmf-meta"), stem.with_suffix(".sigmf-data")):
             f.unlink(missing_ok=True)
-        r = subprocess.run([str(OFFLINE), "onair-cli", "--synthetic", "--standard", mid, "--snr", f"{a.snr:g}",
+        oid, extra, fam, what = VARIANTS.get(mid, (mid, [], *FAMILY.get(mid, ("unknown", ""))))
+        r = subprocess.run([str(OFFLINE), "onair-cli", "--synthetic", "--standard", oid, *extra, "--snr", f"{a.snr:g}",
                             "--secs", f"{a.secs:g}", "--record", str(stem.with_suffix(".cf32"))],
                            capture_output=True, text=True, timeout=120 + 10 * a.secs)
         net = [l for l in (r.stdout + r.stderr).splitlines() if l.startswith("[nonet]")]
@@ -120,13 +139,16 @@ def main():
             print(json.dumps({"id": mid, "error": "no recording"}))
             continue
         fs, dur, obw, duty, pdr = measure(stem)
-        fam, what = FAMILY.get(mid, ("unknown", ""))
-        row = {"id": mid, "family": fam, "what": what, "fs_mhz": float(fs) / 1e6, "secs": round(dur, 2),
+        row = {"id": mid, "onair_id": oid, "args": extra, "family": fam, "what": what, "fs_mhz": float(fs) / 1e6, "secs": round(dur, 2),
                "obw_khz": None if obw is None else round(float(obw) / 1e3, 1), "duty": None if duty is None else round(float(duty), 3),
                "peak_to_quiet_db": None if pdr is None else round(float(pdr), 1), "network_blocked": len(net)}
         rows.append(row)
         print(json.dumps(row, ensure_ascii=False), flush=True)
-    (a.out / "index.json").write_text(json.dumps(rows, indent=1, ensure_ascii=False))
+    idx = a.out / "index.json"
+    if a.merge and idx.exists():
+        ids = {r["id"] for r in rows}
+        rows = [r for r in json.loads(idx.read_text()) if r["id"] not in ids] + rows
+    idx.write_text(json.dumps(rows, indent=1, ensure_ascii=False))
 
 
 if __name__ == "__main__":
