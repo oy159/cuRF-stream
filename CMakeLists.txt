@@ -60,6 +60,7 @@ target_compile_options(curf_warnings INTERFACE
 find_package(Threads REQUIRED)
 
 add_library(curf_core
+    src/adsb/decode.cpp
     src/engine/model.cpp
     src/reference/channelizer.cpp
     src/reference/unpack.cpp
@@ -88,6 +89,7 @@ endif()
 
 if(CURF_HAVE_CUDA)
     add_library(curf_cuda
+        src/kernels/adsb.cu
         src/kernels/unpack.cu
         src/kernels/psd.cu
         src/kernels/channelizer.cu

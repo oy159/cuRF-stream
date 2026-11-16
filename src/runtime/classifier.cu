@@ -22,10 +22,13 @@ namespace curf {
 
         // One thread per classified window: argmax and its softmax probability.
         __global__ void postprocess_kernel(const float *__restrict__ logits, int classes,
-                                           const std::uint32_t *__restrict__ active, const float *__restrict__ power,
-                                           unsigned first, unsigned n, unsigned M, WindowResult *__restrict__ out) {
+                                           const std::uint32_t *__restrict__ active, const std::uint32_t *__restrict__ count,
+                                           const float *__restrict__ power, unsigned first, unsigned n, unsigned M,
+                                           WindowResult *__restrict__ out) {
             const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
-            if (i >= n) return;
+            // Speculative launches cover entries past this window's real count; their `active` slots may never
+            // have been written (uninitialised memory), so they must not be used as indices.
+            if (i >= n || first + i >= *count) return;
             const float *l = logits + static_cast<std::size_t>(i) * classes;
             int best = 0;
             float mx = l[0];
@@ -164,7 +167,7 @@ namespace curf {
                 else w.stage.gather(w.buf.get(), first, c, eng.input(), comp_s);
                 eng.run(static_cast<int>(c), comp_s);
                 postprocess_kernel<<<(c + 127) / 128, 128, 0, comp_s>>>(
-                    eng.logits(), classes, w.stage.d_active(), w.stage.d_power(), first, c, M, w.d_res.get());
+                    eng.logits(), classes, w.stage.d_active(), w.stage.d_count(), w.stage.d_power(), first, c, M, w.d_res.get());
                 CURF_CUDA_CHECK(cudaGetLastError());
             }
             if (to > from)
@@ -201,6 +204,7 @@ namespace curf {
                     BlockCtx &b = *blk[retired % cfg.depth];
                     HostSlot &slot = ring.oldest_in_flight();
                     chan_ms += elapsed_ms(b.c0, b.c1);
+                    if (cfg.tap) cfg.tap->retire(retired % cfg.depth);
                     if (have_expected && slot.first_sample != expected) st.gap_frames += slot.first_sample - expected;
                     expected = slot.first_sample + slot.frames;
                     have_expected = true;
@@ -253,6 +257,7 @@ namespace curf {
                         CURF_CUDA_CHECK(cudaStreamWaitEvent(comp_s, b.h2d_done.e));
                         CURF_CUDA_CHECK(cudaEventRecord(b.c0.e, comp_s));
                         ch.run_wire(b.wire.get(), fmt.wire, w.buf.get() + part * F * M, comp_s, std::size_t{W} * M);
+                        if (cfg.tap) cfg.tap->enqueue(submitted % cfg.depth, b.wire.get(), slot->frames, slot->first_sample, comp_s);
                         CURF_CUDA_CHECK(cudaEventRecord(b.c1.e, comp_s));
                         if (part == bpw - 1) {
                             w.ready_at = slot->filled_at;

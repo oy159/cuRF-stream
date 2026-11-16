@@ -1,6 +1,6 @@
 """Evaluate a trained checkpoint and export the frozen model.
 
-    python model/export.py --ckpt model/artifacts/run1/best.pt --out model/artifacts/run1/export
+    python model/export.py --ckpt model/artifacts/run2/best.pt --out model/artifacts/run2/export
 
 Writes:
   metrics.json          accuracy overall / per SNR (2 dB bins) / per class, confusion matrix (SNR >= 10 dB)

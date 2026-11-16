@@ -10,6 +10,10 @@
 //                 [--ui-out PATH] [--ui-every N]   (display feed, see tools/ui_server.py)
 //                 [--noise-shape F] [--calibrate-noise F]  (front-end noise shape: use / measure with no signal)
 //                 [--dc-guard N]  (channels at DC never reported; omnicore default 1)
+//                 [--adsb [HZ]] [--adsb-stream N] [--adsb-threshold T]  (Mode S / ADS-B demodulator on the raw
+//                                                    samples of stream N, carrier HZ (default 1090e6); decoded
+//                                                    messages go to the display feed as {"adsb":{...}} lines.
+//                                                    Tune off the carrier, e.g. --freq 1080e6: DC carries LO leakage)
 //                 [--neighbor-db 6] [--band-mhz B]  (detection: leakage rejection; only report +- B/2 around the
 //                                                    centre - default the whole band, 52 MHz for omnicore)
 //   omnicore:     [--rx 1|2|1,2] [--serial S] [--freq HZ] [--gain DB] [--agc 0..3] [--iq-bits 12|8] [--bandwidth HZ]
@@ -20,6 +24,8 @@
 // (random phases), so exactly N channels per stream carry energy - the load knob. Prints one JSON line of
 // pipeline statistics; --print N also lists the results of the first N windows.
 
+#include "curf/adsb.hpp"
+#include "curf/cuda/adsb.hpp"
 #include "curf/engine/model.hpp"
 #include "curf/runtime/classifier.hpp"
 #include "curf/sources.hpp"
@@ -28,6 +34,7 @@
 #endif
 
 #include <algorithm>
+#include <deque>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -38,6 +45,86 @@
 #include <vector>
 
 using namespace curf;
+
+namespace {
+
+    // ADS-B on the side of the classifier: GPU demodulation per block, then on the host duplicate removal (one
+    // frame can be found by neighbouring start positions or both sides of a block boundary), address checks for
+    // the address/parity formats, field decoding and CPR positions.
+    struct AdsbTap final : BlockTap {
+        cuda::AdsbDemod demod;
+        adsb::Tracker tracker;
+        double fs;
+        std::FILE *ui;
+        std::deque<std::pair<std::uint64_t, std::array<std::uint8_t, 14>>> recent;
+        std::uint64_t frames = 0, extended = 0, corrected = 0, short_ok = 0, unknown_addr = 0, positions = 0, dups = 0,
+                      overflow = 0;
+        std::vector<cuda::AdsbFrame> buf;
+
+        AdsbTap(const cuda::AdsbConfig &c, const StreamFormat &f, std::size_t block, std::size_t slots, std::FILE *ui_)
+            : demod(c, f.wire, f.channels, block, slots), fs(f.sample_rate), ui(ui_) {}
+
+        void enqueue(std::size_t slot, const std::uint8_t *d_wire, std::size_t n, std::uint64_t first, cudaStream_t s) override {
+            demod.enqueue(d_wire, n, first, slot, s);
+        }
+
+        void retire(std::size_t slot) override {
+            const auto r = demod.results(slot);
+            if (demod.found(slot) > r.size()) overflow += demod.found(slot) - r.size();
+            buf.assign(r.begin(), r.end());
+            std::sort(buf.begin(), buf.end(), [](const auto &a, const auto &b) { return a.sample < b.sample; });
+            const auto window = static_cast<std::uint64_t>(4e-6 * fs);
+            for (const auto &f : buf) {
+                std::array<std::uint8_t, 14> key{};
+                std::copy(f.msg, f.msg + 14, key.begin());
+                while (!recent.empty() && recent.front().first + window < f.sample) recent.pop_front();
+                if (std::any_of(recent.begin(), recent.end(), [&](const auto &e) { return e.second == key; })) {
+                    ++dups;
+                    continue;
+                }
+                recent.emplace_back(f.sample, key);
+                const double t = static_cast<double>(f.sample) / fs;
+                const int df = adsb::downlink_format(f.msg);
+                std::uint32_t addr = 0;
+                if (df == 11 || df == 17 || df == 18) {
+                    if (df != 11) ++extended;
+                    else ++short_ok;
+                } else {
+                    if (!tracker.known(f.remainder, t)) {
+                        ++unknown_addr;
+                        continue;
+                    }
+                    addr = f.remainder;
+                    ++short_ok;
+                }
+                corrected += f.corrected;
+                ++frames;
+                const auto m = adsb::decode(f.msg, f.bits, addr);
+                const auto pos = tracker.position(m, t);
+                if (pos) ++positions;
+                if (ui) {
+                    const float db = 20 * std::log10(std::max(f.signal, 1e-9f));
+                    std::fprintf(ui, "{\"adsb\":%s}\n", adsb::to_json(m, t, db, pos, f.corrected != 0).c_str());
+                }
+            }
+            if (ui && !buf.empty()) std::fflush(ui);
+        }
+
+        std::string json() const {
+            char b[300];
+            std::snprintf(b, sizeof b,
+                          "\"adsb\":{\"frames\":%llu,\"extended\":%llu,\"short\":%llu,\"corrected\":%llu,\"positions\":%llu,"
+                          "\"aircraft\":%zu,\"unknown_address\":%llu,\"duplicates\":%llu,\"overflow\":%llu},",
+                          static_cast<unsigned long long>(frames), static_cast<unsigned long long>(extended),
+                          static_cast<unsigned long long>(short_ok), static_cast<unsigned long long>(corrected),
+                          static_cast<unsigned long long>(positions), tracker.size(),
+                          static_cast<unsigned long long>(unknown_addr), static_cast<unsigned long long>(dups),
+                          static_cast<unsigned long long>(overflow));
+            return b;
+        }
+    };
+
+} // namespace
 
 int main(int argc, char **argv) {
     std::string source = "synthetic", file, label, model_dir = CURF_MODEL_DIR;
@@ -60,6 +147,8 @@ int main(int argc, char **argv) {
     [[maybe_unused]] std::string tx_file;
     [[maybe_unused]] double tx_atten = 89.75;
     bool int8 = false;
+    double adsb_hz = 0;          // > 0: ADS-B demodulator on the side, carrier frequency
+    cuda::AdsbConfig adsb_cfg;
     bool fp32_input = false;     // INT8 engine, calibrated on the model directory's golden windows
     ClassifierConfig cfg;
     cfg.engine.tune_iters = 10;
@@ -116,6 +205,9 @@ int main(int argc, char **argv) {
         else if (a == "--print") print = std::stoull(next());
         else if (a == "--label") label = next();
         else if (a == "--int8") int8 = true;
+        else if (a == "--adsb") adsb_hz = i + 1 < argc && argv[i + 1][0] != '-' ? std::stod(next()) : 1090e6;
+        else if (a == "--adsb-stream") adsb_cfg.stream = static_cast<std::uint32_t>(std::stoul(next()));
+        else if (a == "--adsb-threshold") adsb_cfg.threshold = std::stof(next());
         else if (a == "--fp32-input") fp32_input = true;
         else if (a == "--calib-percentile") cfg.engine.calib_percentile = std::stod(next());
         else if (a == "--tune-cache") cfg.engine.tune_cache = next();
@@ -227,6 +319,20 @@ int main(int argc, char **argv) {
             if (!calibrate_path.empty() && w >= 4 && cal.size() < std::size_t{4096} * S * M) // first ~17 s
                 cal.insert(cal.end(), p, p + std::size_t{S} * M);
         };
+    std::unique_ptr<AdsbTap> adsb_tap;
+    if (adsb_hz > 0) {
+        adsb_cfg.sample_rate = fmt.sample_rate;
+        // ~15 MS/s after decimation (61.44 MS/s: 4); lower-rate recordings are used as they are
+        adsb_cfg.decimation = std::max<std::uint32_t>(1, static_cast<std::uint32_t>(std::lround(fmt.sample_rate / 15.36e6)));
+        adsb_cfg.offset_hz = adsb_hz - freq; // file / synthetic sources: --freq is the recording's centre
+        if (std::fabs(adsb_cfg.offset_hz) > fmt.sample_rate / 2 - 2e6) {
+            std::fprintf(stderr, "--adsb: %.6g MHz is outside the tuned band\n", adsb_hz / 1e6);
+            return 2;
+        }
+        adsb_tap = std::make_unique<AdsbTap>(adsb_cfg, fmt, cfg.block_frames, cfg.depth, ui);
+        cfg.tap = adsb_tap.get();
+        std::fprintf(stderr, "adsb: stream %u, carrier at %+.3f MHz from the centre\n", adsb_cfg.stream, adsb_cfg.offset_hz / 1e6);
+    }
     std::string line;
     const auto st = run_classifier(*src, model, cfg, [&](std::uint64_t w, std::uint64_t first, const WindowResult *r, std::size_t n) {
         if (ui) { // per channel: vote of this row's windows
@@ -328,6 +434,7 @@ int main(int argc, char **argv) {
         js.insert(1, b);
     }
 #endif
+    if (adsb_tap) js.insert(1, adsb_tap->json());
     if (ui) {
         std::fprintf(ui, "{\"end\":%s}\n", st.to_json().c_str());
         std::fclose(ui);

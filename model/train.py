@@ -1,6 +1,6 @@
 """Train the ResNet-1D modulation classifier on on-the-fly synthetic data.
 
-    python model/train.py --out model/artifacts/run1 --steps 30000
+    python model/train.py --out model/artifacts/run2 --steps 30000
 """
 
 from __future__ import annotations

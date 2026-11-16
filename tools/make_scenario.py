@@ -29,7 +29,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "model"))
 from curf_model.net import AmcResNet1D  # noqa: E402
-from curf_model.synth import CLASSES, Synth, SynthConfig  # noqa: E402
+from curf_model.synth import CLASSES, NARROW, Synth, SynthConfig  # noqa: E402
 
 FS, M, D, W, STREAMS = 61.44e6, 512, 256, 1024, 2
 
@@ -53,9 +53,9 @@ def make(args):
     out.mkdir(parents=True, exist_ok=True)
     nb = W * args.windows                 # baseband samples per channel
     n = nb * D                            # wideband samples per stream
-    classes = [c for c in CLASSES if c != "noise"]
+    classes = list(NARROW)  # one channel per signal: no noise, no wide slices
     rng = np.random.default_rng(args.seed)
-    synth = Synth(SynthConfig(length=nb, chunk=1), device=dev, seed=args.seed)
+    synth = Synth(SynthConfig(length=nb, chunk=1, channel_filter=False, broadcast_fm_prob=0.0), device=dev, seed=args.seed)
     ckpt = torch.load(args.ckpt, map_location=dev)
     model = AmcResNet1D(len(CLASSES)).to(dev).eval()
     model.load_state_dict(ckpt["model"])
@@ -143,7 +143,7 @@ def main():
     ap.add_argument("--snr", type=float, nargs=2, default=(5.0, 20.0))
     ap.add_argument("--noise-rms", type=float, default=0.01)
     ap.add_argument("--seed", type=int, default=5)
-    ap.add_argument("--ckpt", default=str(Path(__file__).resolve().parents[1] / "model/artifacts/run1/best.pt"))
+    ap.add_argument("--ckpt", default=str(Path(__file__).resolve().parents[1] / "model/artifacts/run2/best.pt"))
     args = ap.parse_args()
     if args.score:
         score(args)

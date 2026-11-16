@@ -51,6 +51,12 @@
   .rows th:nth-child(3), .rows td:nth-child(3) { text-align: left; }
   .rows tr:hover td { background: var(--hi); cursor: pointer; }
   .rows i { width: 9px; height: 9px; border-radius: 2px; display: inline-block; margin-right: 5px; }
+  #air { display: none; }
+  #air canvas { height: 300px; background: #10151b; border-radius: 4px; }
+  #air .rows { max-height: 300px; }
+  #air .rows th:nth-child(3), #air .rows td:nth-child(3) { text-align: right; }
+  #air .rows th:nth-child(-n+2), #air .rows td:nth-child(-n+2) { text-align: left; }
+  #air tr.sel td { background: var(--hi); }
   #end { margin: 0 16px 16px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px; font-family: var(--mono); font-size: 12px; color: var(--dim); white-space: pre-wrap; display: none; }
 </style>
 </head>
@@ -73,18 +79,27 @@
   <div class="ctl"><button id="reset">全带宽</button><span>在瀑布图上拖动可放大频段，双击复原</span></div>
 </div>
 <main id="streams"></main>
+<main><section class="stream" id="air" style="grid-template-columns: minmax(0, 1fr) minmax(0, 1.25fr)">
+  <div class="plots"><h2><span>ADS-B 1090 MHz</span><span class="info" id="air-info"></span></h2><canvas id="air-map"></canvas></div>
+  <div class="list"><h3><span>飞机</span><span class="n" id="air-n"></span></h3><div class="rows" id="air-rows"></div></div>
+</section></main>
 <div id="end"></div>
 <div class="tip" id="tip"></div>
 <script>
 "use strict";
-// Distinct hues (Tableau-like) for the 9 signal classes; index 0 is "noise".
-const PALETTE = ["#5c6672", "#4e9de6", "#f28e2b", "#59d0c4", "#edc948", "#e15759", "#b07aa1", "#8cd17d", "#ff9da7", "#d9d9d9"];
+// Distinct hues (Tableau-like) for the signal classes; index 0 is "noise", 10 is "wide" (slice of a signal wider
+// than one channel).
+const PALETTE = ["#5c6672", "#4e9de6", "#f28e2b", "#59d0c4", "#edc948", "#e15759", "#b07aa1", "#8cd17d", "#ff9da7", "#d9d9d9",
+                 "#9c755f"];
+// A narrowband class fits in one 120 kHz channel (two at a boundary, three for broadcast FM); a run of this many
+// adjacent tracked channels is one wideband signal whatever its per-channel labels say.
+const WIDE_RUN = 4;
 const ROWS = 250, CROWS = 80;     // waterfall / class-waterfall history in rows
 const SPAN_DB = 50;
 // Track hysteresis on the presence EMA (fraction of recent rows with a detection)
 const ON = 0.35, OFF = 0.12;
 
-let classes = [], meta = null, panels = [], counts = [], hidden = new Set();
+let classes = [], WIDE = -1, meta = null, panels = [], counts = [], hidden = new Set();
 let rowDt = 0.034, rateT0 = performance.now(), rateRows = 0, lastList = 0;
 let view = [0, 512];               // displayed column range (fft-shifted columns)
 
@@ -181,7 +196,9 @@ function onRow(row) {
   const tau = parseFloat(document.getElementById("tau").value);
   const d = Math.exp(-rowDt / tau);
   const det = panels.map(() => ({ cls: new Int16Array(M).fill(-1), prob: new Uint8Array(M) }));
-  for (const [s, k, c, pr] of row.r) { const x = col(k, M); det[s].cls[x] = c; det[s].prob[x] = pr; }
+  // Detected (energy above the floor) but noise-like: a slice of a wideband noise-like signal (OFDM, fast PSK/QAM),
+  // which the model cannot tell from noise inside one channel.
+  for (const [s, k, c, pr] of row.r) { const x = col(k, M); det[s].cls[x] = c === 0 && WIDE > 0 ? WIDE : c; det[s].prob[x] = pr; }
   const now = row.t;
   counts = new Array(C).fill(0);
   for (const p of panels) {
@@ -228,19 +245,28 @@ function onRow(row) {
   if (t - lastList > 250) { lastList = t; for (const p of panels) drawList(p); drawLegend(); } // lists at 4 Hz
 }
 
-// Adjacent tracked columns with the same class form one signal (a wideband signal spans several channels).
+// Adjacent tracked columns form one signal. With a model that has the "wide" class, a whole run of adjacent
+// tracked channels is one signal: >= WIDE_RUN channels is a wideband signal; a shorter run is one narrowband
+// signal plus its skirts in the neighbouring channels (2x oversampled channelizer), named by its strongest channel
+// - the skirts look like the edge of a wide signal to the model and would otherwise show up as extra "wide" ones.
+// Without it (older models), adjacent columns of the same class form one signal.
 function group(p, now) {
   const T = p.trk, M = meta.channels, out = [];
+  const tracked = x => T.on[x] && T.cls[x] > 0;
   for (let x = 0; x < M;) {
-    if (!T.on[x] || T.cls[x] <= 0) { x++; continue; }
-    const c = T.cls[x];
+    if (!tracked(x)) { x++; continue; }
+    let r = x, peak = x;
+    while (r < M && tracked(r)) { if (T.pw[r] > T.pw[peak]) peak = r; r++; }
+    const run = WIDE > 0;
+    const c = !run ? T.cls[x] : r - x >= WIDE_RUN ? WIDE : T.cls[peak];
     let e = x, pmax = -200, conf = 0, since = now, wsum = 0, xw = 0, act = 0;
-    while (e < M && T.on[e] && T.cls[e] === c) {
+    while (e < M && tracked(e) && (run || T.cls[e] === c)) {
       const lin = Math.pow(10, T.pw[e] / 10);
       pmax = Math.max(pmax, T.pw[e]); conf += T.conf[e]; since = Math.min(since, T.since[e]); wsum += lin; xw += lin * e;
       act = Math.max(act, T.act[e]); e++;
     }
-    out.push({ x0: x, x1: e, xc: xw / wsum, cls: c, conf: conf / (e - x), snr: pmax - p.floor, age: now - since,
+    out.push({ x0: x, x1: e, xc: xw / wsum, cls: c, conf: run && c !== WIDE ? T.conf[peak] : conf / (e - x),
+               snr: pmax - p.floor, age: now - since,
                bursty: act < 0.8 }); // present in < 80 % of recent rows: a burst signal (e.g. WiFi), not a steady one
     x = e;
   }
@@ -341,6 +367,67 @@ function hookMouse(p, cv) {
   cv.addEventListener("dblclick", () => setView(0, meta.channels));
 }
 
+// ADS-B: one entry per ICAO address from the {"adsb": {...}} lines (sample time t in seconds).
+const air = new Map();
+let airT = 0, airMsgs = 0, airPick = null, airDirty = false;
+function onAdsb(a) {
+  airT = Math.max(airT, a.t); airMsgs++;
+  let e = air.get(a.icao);
+  if (!e) air.set(a.icao, e = { icao: a.icao, n: 0, trail: [], first: a.t });
+  e.n++; e.last = a.t; e.sig = a.sig;
+  for (const k of ["call", "alt", "gs", "trk", "vr", "sq"]) if (a[k] !== undefined) e[k] = a[k];
+  if (a.lat !== undefined) { e.lat = a.lat; e.lon = a.lon; e.trail.push([a.lat, a.lon]); if (e.trail.length > 400) e.trail.shift(); }
+  document.getElementById("air").style.display = "grid";
+  airDirty = true;
+}
+function drawAir() {
+  if (!airDirty) return;
+  airDirty = false;
+  const live = [...air.values()].filter(e => airT - e.last < 120).sort((a, b) => b.last - a.last);
+  document.getElementById("air-n").textContent = `${live.length} 架（2 分钟内） · 共 ${air.size}`;
+  document.getElementById("air-info").textContent = `${airMsgs} 条消息`;
+  const fmt = (v, d = 0) => v === undefined ? "" : (+v).toFixed(d);
+  const el = document.getElementById("air-rows");
+  el.innerHTML = `<table><tr><th>ICAO</th><th>呼号</th><th>高度 ft</th><th>速度 kt</th><th>航向</th><th>升降 ft/min</th><th>应答码</th><th>位置</th><th>消息</th><th>信号</th><th>最近</th></tr>` +
+    live.map(e => `<tr data-i="${e.icao}" class="${e.icao === airPick ? "sel" : ""}"><td>${e.icao}</td><td>${e.call || ""}</td><td>${fmt(e.alt)}</td><td>${fmt(e.gs)}</td>` +
+      `<td>${fmt(e.trk)}</td><td>${fmt(e.vr)}</td><td>${e.sq || ""}</td><td>${e.lat !== undefined ? e.lat.toFixed(3) + ", " + e.lon.toFixed(3) : ""}</td>` +
+      `<td>${e.n}</td><td>${fmt(e.sig)} dB</td><td>${(airT - e.last).toFixed(0)} s</td></tr>`).join("") + `</table>`;
+  for (const tr of el.querySelectorAll("tr[data-i]")) tr.onclick = () => { airPick = airPick === tr.dataset.i ? null : tr.dataset.i; airDirty = true; drawAir(); };
+
+  // map: equirectangular around the positions seen, cos(lat) scaled, 1-degree grid
+  const [ctx, w, h] = fit(document.getElementById("air-map"));
+  ctx.clearRect(0, 0, w, h);
+  const pos = [...air.values()].filter(e => e.trail.length);
+  ctx.font = "12px system-ui, sans-serif"; ctx.textBaseline = "middle";
+  if (!pos.length) { ctx.fillStyle = "#7d8896"; ctx.textAlign = "center"; ctx.fillText("还没有位置报文（需要同一架飞机的奇偶 CPR 帧对）", w / 2, h / 2); return; }
+  let la0 = 90, la1 = -90, lo0 = 180, lo1 = -180;
+  for (const e of pos) for (const [la, lo] of e.trail) { la0 = Math.min(la0, la); la1 = Math.max(la1, la); lo0 = Math.min(lo0, lo); lo1 = Math.max(lo1, lo); }
+  const k = Math.cos((la0 + la1) / 2 * Math.PI / 180), pad = 0.15;
+  let spanLa = Math.max(la1 - la0, 0.2), spanLo = Math.max((lo1 - lo0) * k, 0.2);
+  const sc = Math.min(w / spanLo, h / spanLa) / (1 + 2 * pad), cla = (la0 + la1) / 2, clo = (lo0 + lo1) / 2;
+  const X = lo => w / 2 + (lo - clo) * k * sc, Y = la => h / 2 - (la - cla) * sc;
+  ctx.strokeStyle = "#262e38"; ctx.fillStyle = "#4d5866"; ctx.lineWidth = 1; ctx.textAlign = "left";
+  const step = spanLa > 4 ? 1 : spanLa > 1 ? 0.5 : 0.1;
+  for (let la = Math.ceil((cla - h / 2 / sc) / step) * step; la < cla + h / 2 / sc; la += step) {
+    ctx.beginPath(); ctx.moveTo(0, Y(la)); ctx.lineTo(w, Y(la)); ctx.stroke(); ctx.fillText(la.toFixed(1) + "°N", 4, Y(la) - 7);
+  }
+  for (let lo = Math.ceil((clo - w / 2 / sc / k) / step) * step; lo < clo + w / 2 / sc / k; lo += step) {
+    ctx.beginPath(); ctx.moveTo(X(lo), 0); ctx.lineTo(X(lo), h); ctx.stroke(); ctx.fillText(lo.toFixed(1) + "°E", X(lo) + 3, h - 8);
+  }
+  for (const e of pos) {
+    const fresh = airT - e.last < 60, pick = e.icao === airPick;
+    ctx.globalAlpha = fresh ? 1 : 0.35;
+    ctx.strokeStyle = pick ? "#ffd166" : "#4e79a7"; ctx.lineWidth = pick ? 2 : 1.2;
+    ctx.beginPath(); e.trail.forEach(([la, lo], i) => i ? ctx.lineTo(X(lo), Y(la)) : ctx.moveTo(X(lo), Y(la))); ctx.stroke();
+    const x = X(e.lon), y = Y(e.lat), a = (e.trk || 0) * Math.PI / 180;
+    ctx.save(); ctx.translate(x, y); ctx.rotate(a); ctx.fillStyle = pick ? "#ffd166" : "#e8edf3";
+    ctx.beginPath(); ctx.moveTo(0, -8); ctx.lineTo(5, 6); ctx.lineTo(0, 3); ctx.lineTo(-5, 6); ctx.closePath(); ctx.fill(); ctx.restore();
+    ctx.fillStyle = "#d8dee6"; ctx.fillText(`${e.call || e.icao}${e.alt !== undefined ? "  " + e.alt + " ft" : ""}`, x + 10, y);
+  }
+  ctx.globalAlpha = 1;
+}
+setInterval(drawAir, 500);
+
 function setState(cls, text) {
   const el = document.getElementById("state");
   el.className = "kv " + cls; el.innerHTML = `状态 <b>${text}</b>`;
@@ -356,6 +443,7 @@ function onEnd(st) {
 
 async function start() {
   try { classes = await (await fetch("/classes")).json(); } catch { classes = []; }
+  WIDE = classes.indexOf("wide");
   drawLegend();
   document.getElementById("reset").onclick = () => meta && setView(0, meta.channels);
   document.getElementById("steady").onchange = () => { for (const p of panels) { drawList(p); drawLabels(p); } };
@@ -371,6 +459,7 @@ async function start() {
       build();
       setState("live", "运行中");
     } else if (m.end) onEnd(m.end);
+    else if (m.adsb) onAdsb(m.adsb);
     else if (meta) onRow(m);
   };
   es.onerror = () => setState("wait", "连接中断，重连中");

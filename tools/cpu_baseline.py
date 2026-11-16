@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """CPU baselines for the P3 load table (run on the CUDA host, i5-11400H, AVX-512).
 
-    python tools/cpu_baseline.py --onnx model/artifacts/run1/export/amc_fp32.onnx
+    python tools/cpu_baseline.py --onnx model/artifacts/run2/export/amc_fp32.onnx
 
 1. Inference: ONNX Runtime CPU (MLAS kernels, all cores) on the same fp32 graph, windows/s per batch size.
 2. Channelizer: the PyTorch implementation of tools/channelizer_torch.py on the CPU (MKL FFT), as x real time

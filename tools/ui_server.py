@@ -27,7 +27,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_METRICS = ROOT / "model/artifacts/run1/export/metrics.json"
+DEFAULT_METRICS = ROOT / "model/artifacts/run2/export/metrics.json"
 
 
 class Hub:
@@ -70,13 +70,18 @@ class Hub:
             self.clients.remove(q)
 
 
-def run_live(hub: Hub, cmd: list[str]):
+def run_live(hub: Hub, cmd: list[str], tee: Path | None = None):
     r, w = os.pipe()
     proc = subprocess.Popen(cmd + ["--ui-out", f"/dev/fd/{w}"], pass_fds=(w,))
     os.close(w)
+    out = open(tee, "w", buffering=1) if tee else None
     with os.fdopen(r, "r") as f:
         for line in f:
+            if out:
+                out.write(line)
             hub.publish(line.strip())
+    if out:
+        out.close()
     rc = proc.wait()
     print(f"curf_classify exited with {rc}; still serving the last state", file=sys.stderr)
 
@@ -153,6 +158,7 @@ def main():
     ap.add_argument("--replay", type=Path, help="recorded --ui-out feed instead of a live command")
     ap.add_argument("--speed", type=float, default=1.0)
     ap.add_argument("--loop", action="store_true")
+    ap.add_argument("--tee", type=Path, help="live mode: also save the feed to this file (replayable)")
     ap.add_argument("--metrics", type=Path, default=DEFAULT_METRICS, help="model metrics.json with the class names")
     ap.add_argument("cmd", nargs=argparse.REMAINDER, help="-- curf_classify ... (live mode)")
     a = ap.parse_args()
@@ -166,7 +172,7 @@ def main():
         Handler.classes = json.loads(a.metrics.read_text())["classes"]
     except OSError:
         Handler.classes = []
-    target = (lambda: run_replay(hub, a.replay, a.speed, a.loop)) if a.replay else (lambda: run_live(hub, cmd))
+    target = (lambda: run_replay(hub, a.replay, a.speed, a.loop)) if a.replay else (lambda: run_live(hub, cmd, a.tee))
     threading.Thread(target=target, daemon=True).start()
     srv = ThreadingHTTPServer((a.bind, a.port), Handler)
     srv.daemon_threads = True

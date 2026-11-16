@@ -32,16 +32,16 @@ EDGE_MHZ, DC_GUARD = 25.0, 4
 def make(a):
     import torch
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "model"))
-    from curf_model.synth import CLASSES, Synth, SynthConfig
+    from curf_model.synth import CLASSES, NARROW, Synth, SynthConfig
 
     dev = torch.device("cuda")
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
     nb = W * a.windows
     n = nb * D
-    classes = [c for c in CLASSES if c != "noise"]
+    classes = list(NARROW)  # one channel per signal: no noise, no wide slices
     rng = np.random.default_rng(a.seed)
-    synth = Synth(SynthConfig(length=nb, chunk=1), device=dev, seed=a.seed)
+    synth = Synth(SynthConfig(length=nb, chunk=1, channel_filter=False, broadcast_fm_prob=0.0), device=dev, seed=a.seed)
     X = torch.zeros(n, dtype=torch.complex64, device=dev)
     labels = []
     for k in range(M):

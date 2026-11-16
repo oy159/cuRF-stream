@@ -27,6 +27,16 @@
 
 namespace curf {
 
+    // Optional extra GPU work on every raw block (e.g. a protocol demodulator on the wideband samples). enqueue is
+    // called in block order on the compute stream right after the block's channelizer pass, with the device copy
+    // of its wire frames; retire(slot) once that work has completed (host thread, block order). slot < depth.
+    struct BlockTap {
+        virtual ~BlockTap() = default;
+        virtual void enqueue(std::size_t slot, const std::uint8_t *d_wire, std::size_t frames, std::uint64_t first_sample,
+                             cudaStream_t stream) = 0;
+        virtual void retire(std::size_t slot) = 0;
+    };
+
     struct ClassifierConfig {
         ChannelizerConfig channelizer;                 // 512 channels, 8 taps / phase
         std::size_t block_frames = std::size_t{1} << 17; // samples per stream per ring slot
@@ -43,6 +53,7 @@ namespace curf {
         // channel [streams][channels] (linear, full scale = 1; channel k at k * fs / channels, k >= channels / 2
         // negative) and the per-stream noise floor. Setting it adds a 4 KB D2H per window (for displays).
         std::function<void(std::uint64_t window, const float *power, const float *floor)> on_power;
+        BlockTap *tap = nullptr;
     };
 
     struct WindowResult {
