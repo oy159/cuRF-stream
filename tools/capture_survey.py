@@ -43,7 +43,10 @@ BANDS = {
 def record(raw: Path, freq: float, gain: float, a) -> float:
     """One och capture; returns the share of clipped samples."""
     cmd = [str(OCH), "rx", "--file", str(raw), "--overwrite", "--sample-rate", f"{RATE / 1e6:g}M", "--channels", str(a.rx),
-           "--format", "sc16", "--lo-frequency", f"{freq / 1e6:g}M", "--gain", f"{gain:g}", "--seconds", f"{a.seconds:g}"]
+           "--format", "sc16", "--lo-frequency", f"{freq / 1e6:g}M", "--gain", f"{gain:g}", "--seconds", f"{a.seconds:g}",
+           # always explicit: och keeps the device's last analogue bandwidth otherwise (it was 18 MHz, which cut
+           # everything beyond +-9 MHz of the 61.44 MS/s band and looked like a "hump" around the LO)
+           "--bandwidth", "56M"]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
         raise RuntimeError(f"och rx failed:\n{r.stdout}\n{r.stderr}")
@@ -55,9 +58,11 @@ def capture(name: str, freq: float, note: str, a) -> dict:
     out = a.out / name
     raw = out.with_suffix(".sc16")
     gain = a.gain
+    if a.gains_from:
+        gain = json.loads((a.gains_from / f"{name}.sigmf-meta").read_text())["global"]["curf:gain_db"]
     t0 = dt.datetime.now(dt.timezone.utc)
     clip = record(raw, freq, gain, a)
-    while clip > 1e-6 and gain - 10 >= 0:
+    while clip > 1e-6 and gain - 10 >= 0 and not a.gains_from:
         gain -= 10
         t0 = dt.datetime.now(dt.timezone.utc)
         clip = record(raw, freq, gain, a)
@@ -77,6 +82,7 @@ def capture(name: str, freq: float, note: str, a) -> dict:
             "core:description": note,
             "curf:band": name,
             "curf:gain_db": gain,
+            "curf:rf_bandwidth_hz": 56e6,
             "curf:clipped": clip,
             "curf:rx": a.rx,
             "curf:och": och_meta[:4],
@@ -96,6 +102,8 @@ def main():
     ap.add_argument("--gain", type=float, default=40)
     ap.add_argument("--rx", type=int, choices=(1, 2), default=2)
     ap.add_argument("--min-free-gb", type=float, default=20, help="refuse to record below this much free disk")
+    ap.add_argument("--gains-from", type=Path, help="use each band's gain from these captures (e.g. noise references "
+                    "on the terminated RX1 for a set of RX2 captures); no automatic gain reduction")
     a = ap.parse_args()
     names = [b.strip() for b in a.bands.split(",") if b.strip()]
     for n in names:

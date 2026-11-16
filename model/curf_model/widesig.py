@@ -65,7 +65,8 @@ def load_sigmf(meta_path: Path) -> tuple[np.ndarray, float]:
 
 def emissions(x: np.ndarray, fs: float, source: str, nfft: int | None = None, thresh_db: float = 20.0,
               range_db: float = 45.0, min_cells: int = 4, smooth_t: int = 5, smooth_f: int = 5,
-              rel_db: float = 25.0) -> list[Emission]:
+              rel_db: float = 25.0, floor_pct: float = 5.0, noise_psd: np.ndarray | None = None,
+              merge_gap_s: float = 0.0, absorb_narrow: bool = True) -> list[Emission]:
     """Bursts / carriers of a clean recording as connected time-frequency components.
 
     A cell belongs to an emission when it is thresh_db over the noise floor (5th percentile) and within range_db
@@ -85,9 +86,11 @@ def emissions(x: np.ndarray, fs: float, source: str, nfft: int | None = None, th
         S[k] = np.abs(np.fft.fftshift(np.fft.fft(seg, axis=1), axes=1)) ** 2
     # Smooth over ~5 frames x 5 bins first: test signals of OFDM systems (LTE, NR, DAB) leave most resource
     # elements empty, and the raw cells would cut one carrier into thousands of fragments.
+    if noise_psd is not None:  # whiten by the receiver's own noise spectrum (a capture with no input signal)
+        S /= noise_psd[None, :]
     raw = S
     S = ndimage.uniform_filter(S, size=(smooth_t, smooth_f), mode="constant")
-    floor = float(np.percentile(S, 5))
+    floor = float(np.percentile(S, floor_pct))
     mask = S > max(floor * 10 ** (thresh_db / 10), float(S.max()) * 10 ** (-range_db / 10))
     # bridge OFDM nulls / pilots, PPM gaps and the gaps between FSK tones; one emission stays one component
     mask = ndimage.binary_closing(mask, structure=np.ones((3, 5), bool))
@@ -130,7 +133,8 @@ def emissions(x: np.ndarray, fs: float, source: str, nfft: int | None = None, th
     merged: list[Emission] = []
     for e in out:
         for m in merged:
-            if (e.t0 <= m.t1 + nfft and m.t0 <= e.t1 + nfft and abs(e.fc - m.fc) < 0.25 * max(e.bw, m.bw)
+            gap = nfft + int(merge_gap_s * fs)  # real captures: LTE leaves whole subframes nearly empty at low load
+            if (e.t0 <= m.t1 + gap and m.t0 <= e.t1 + gap and abs(e.fc - m.fc) < 0.25 * max(e.bw, m.bw)
                     and 0.67 < e.bw / m.bw < 1.5):
                 m.t0, m.t1, m.bw = min(m.t0, e.t0), max(m.t1, e.t1), max(m.bw, e.bw)
                 break
@@ -140,11 +144,18 @@ def emissions(x: np.ndarray, fs: float, source: str, nfft: int | None = None, th
     # a narrow piece overlapping a much wider emission in time, inside or next to it in frequency, is part of it
     keep = []
     for e in out:
-        part = any(E is not e and E.bw > 3 * e.bw and abs(e.fc - E.fc) < E.bw and e.t0 < E.t1 and E.t0 < e.t1
+        part = absorb_narrow and any(E is not e and E.bw > 3 * e.bw and abs(e.fc - E.fc) < E.bw and e.t0 < E.t1 and E.t0 < e.t1
                    for E in out)
         if not part:
             keep.append(e)
     return keep
+
+
+def noise_spectrum(x: np.ndarray, nfft: int, frames: int = 4000) -> np.ndarray:
+    """Median power per bin (fftshifted) of a capture with no signal, for emissions(noise_psd=...)."""
+    n = min(frames, len(x) // nfft)
+    seg = x[: n * nfft].reshape(n, nfft) * np.hanning(nfft).astype(np.float32)
+    return np.median(np.abs(np.fft.fftshift(np.fft.fft(seg, axis=1), axes=1)) ** 2, axis=0).astype(np.float32)
 
 
 def extract(x: np.ndarray, fs: float, e: Emission, L: int, rng: np.random.Generator,
