@@ -234,6 +234,61 @@ TEST_CASE("stage 2 chunks more than 64 requests without losing model windows", "
     CHECK(stats.skipped_ring == 0); CHECK(stats.skipped_busy == 0);
 }
 
+TEST_CASE("stage 2 rechecks a connected wide burst after narrow fragment tracks", "[cuda][stage2][components]") {
+    const std::filesystem::path dir = CURF_S2_MODEL_DIR;
+    if (!std::filesystem::exists(dir / "s2.curf")) SKIP("no stage-2 model");
+    const auto model = engine::Model::load(dir / "s2.curf");
+    bool established = false;
+    SECTION("narrow history cannot permanently partition the wide burst") {}
+    SECTION("two established wide neighbours keep their own tracks") { established = true; }
+    constexpr unsigned windows = 12;
+    std::mt19937 rng(108);
+    std::normal_distribution<double> noise(0, .01);
+    std::vector<std::complex<double>> samples(windows * kWindowSamples);
+    for (auto &x : samples) x = {noise(rng), noise(rng)};
+    const auto wire = pack(samples);
+    SignalStageConfig cfg;
+    cfg.drop_when_busy = false;
+    cfg.engine.buckets = {1,4,16,64}; cfg.engine.autotune = false;
+    std::vector<SignalResult> got;
+    SignalStage stage(cfg, model, {WireFormat::packed12, 1, kFs}, kBlock,
+                      [&](const SignalResult &r) { got.push_back(r); });
+    cuda::DeviceBuffer<std::uint8_t> d(kBlock * 3);
+    for (unsigned w = 0; w < windows; ++w) {
+        for (unsigned b = 0; b < 2; ++b) {
+            const std::size_t first = (std::size_t{w} * 2 + b) * kBlock;
+            CURF_CUDA_CHECK(cudaMemcpy(d.get(), wire.data() + first * 3, d.bytes(), cudaMemcpyHostToDevice));
+            stage.enqueue(0, d.get(), kBlock, first, nullptr);
+            CURF_CUDA_CHECK(cudaDeviceSynchronize());
+        }
+        std::vector<WindowResult> det;
+        for (unsigned k = 24; k <= 144; ++k) {
+            const bool initial = established ? (k <= 83 || k >= 87) : (k <= 28 || k >= 140);
+            if (w >= 3 || initial) det.push_back({0,k,0,0,1e-3f});
+        }
+        stage.on_window(w, std::uint64_t{w} * kWindowSamples, det.data(), det.size());
+        stage.flush();
+    }
+    const auto stats = stage.stats();
+    CHECK(stats.skipped_capacity == 0); CHECK(stats.skipped_busy == 0); CHECK(stats.skipped_ring == 0);
+    if (established) {
+        CHECK(stats.component_probes == 0);
+        CHECK(std::none_of(got.begin(),got.end(),[](const auto &r) { return r.bw_hz > 12e6; }));
+    } else {
+        CHECK(stats.component_probes >= 1);
+        auto wide = std::find_if(got.begin(),got.end(),[](const auto &r) { return r.bw_hz > 12e6; });
+        REQUIRE(wide != got.end());
+        CHECK(std::abs(wide->fc_hz - 84*120e3) < 240e3);
+        CHECK(wide->fs_hz >= 2*wide->bw_hz);
+        // The original fragment results remain independently inspectable.
+        std::vector<std::uint32_t> original;
+        for (const auto &r : got) if (r.window < 3) original.push_back(r.track);
+        CHECK(std::any_of(got.begin(),got.end(),[&](const auto &r) {
+            return r.window >= 3 && std::find(original.begin(),original.end(),r.track) != original.end();
+        }));
+    }
+}
+
 TEST_CASE("detection-only pipeline drives stage 2 without a stage-1 engine", "[cuda][stage2][classifier]") {
     const std::filesystem::path dir = CURF_S2_MODEL_DIR;
     if (!std::filesystem::exists(dir / "s2.curf")) SKIP("no stage-2 model");

@@ -203,6 +203,7 @@ namespace curf {
           << ",\"skipped_capacity\":" << skipped_capacity << ",\"tracks\":" << tracks
           << ",\"skipped_signals\":" << skipped_signals << ",\"skipped_tracks\":" << skipped_tracks
           << ",\"skipped_workspace\":" << skipped_workspace
+          << ",\"component_probes\":" << component_probes
           << ",\"wide\":" << wide << ",\"narrow\":" << narrow << ",\"wide_latency_ms\":";
         percentiles(wide_latency_ms); o << ",\"narrow_latency_ms\":"; percentiles(narrow_latency_ms);
         o << "}"; return o.str();
@@ -236,6 +237,7 @@ namespace curf {
         // tracks
         struct Track {
             bool used = false;
+            bool component_probe = false; // full coarse component, independent of fragment associations
             std::uint32_t stream = 0;
             int lo = 0, hi = 0;                 // last coarse band, signed channels
             std::uint64_t last_seen = 0, last_done = ~std::uint64_t{0}, last_class = 0;
@@ -356,7 +358,7 @@ namespace curf {
             ++ring_next;
         }
 
-        int match_track(std::uint32_t stream, int lo, int hi, std::uint64_t w) {
+        int match_track(std::uint32_t stream, int lo, int hi, std::uint64_t w, bool component_probe = false) {
             int free_slot = -1;
             for (std::size_t i = 0; i < tracks.size(); ++i) {
                 Track &t = tracks[i];
@@ -365,11 +367,20 @@ namespace curf {
                     if (free_slot < 0) free_slot = static_cast<int>(i);
                     continue;
                 }
-                if (t.last_seen != w && t.stream == stream && lo <= t.hi + 1 && t.lo <= hi + 1) return static_cast<int>(i);
+                if (t.last_seen != w && t.stream == stream && t.component_probe == component_probe &&
+                    lo <= t.hi + 1 && t.lo <= hi + 1) {
+                    if (component_probe) {
+                        const int overlap = std::max(0, std::min(hi,t.hi) - std::max(lo,t.lo) + 1);
+                        const int extent = std::max(hi,t.hi) - std::min(lo,t.lo) + 1;
+                        if (overlap < .7 * extent) continue;
+                    }
+                    return static_cast<int>(i);
+                }
             }
             if (free_slot >= 0) {
                 tracks[free_slot] = Track{};
                 tracks[free_slot].used = true;
+                tracks[free_slot].component_probe = component_probe;
                 tracks[free_slot].stream = stream;
                 ++st.tracks;
             }
@@ -414,7 +425,7 @@ namespace curf {
                 std::vector<Prior> prior;
                 for (unsigned id = 0; id < tracks.size(); ++id) {
                     const auto &tr = tracks[id];
-                    if (tr.used && tr.w && tr.stream == stream && w - tr.last_seen <= cfg.track_timeout_windows)
+                    if (tr.used && !tr.component_probe && tr.w && tr.stream == stream && w - tr.last_seen <= cfg.track_timeout_windows)
                         prior.push_back({id, tr.lo, tr.hi});
                 }
                 // Work on complete current coarse components. A sole known carrier owns the entire component,
@@ -434,6 +445,29 @@ namespace curf {
                         if (id >= 0) submit(static_cast<unsigned>(id),lo,hi);
                         else { ++st.skipped_capacity; ++st.skipped_tracks; }
                     } else {
+                        // Early narrow fragments must not permanently partition a later wide burst.
+                        // Probe the complete *currently connected* component, without joining separate
+                        // detections or stealing existing carrier tracks. Established wide neighbours
+                        // do not qualify: a new probe must span at least three times every prior extent.
+                        int largest = 0;
+                        for (const auto &m : matches) largest = std::max(largest, m.hi - m.lo + 1);
+                        bool continuing_probe = false;
+                        for (const auto &tr : tracks) {
+                            if (!tr.used || !tr.component_probe || tr.stream != stream ||
+                                w - tr.last_seen > cfg.track_timeout_windows) continue;
+                            const int overlap = std::max(0, std::min(hi,tr.hi) - std::max(lo,tr.lo) + 1);
+                            const int extent = std::max(hi,tr.hi) - std::min(lo,tr.lo) + 1;
+                            if (overlap >= .7 * extent) { continuing_probe = true; break; }
+                        }
+                        if (matches.size() >= 2 && hi - lo + 1 >= 64 &&
+                            (hi - lo + 1 >= 3 * largest || continuing_probe)) {
+                            const int id = match_track(stream, lo, hi, w, true);
+                            if (id >= 0) {
+                                const auto before = sig.size();
+                                submit(static_cast<unsigned>(id), lo, hi);
+                                st.component_probes += sig.size() > before;
+                            } else { ++st.skipped_capacity; ++st.skipped_tracks; }
+                        }
                         int begin = lo;
                         for (std::size_t i = 0; i < matches.size(); ++i) {
                             const int end = i+1 == matches.size() ? hi : std::clamp((matches[i].hi + matches[i+1].lo)/2, begin, hi);

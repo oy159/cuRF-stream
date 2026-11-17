@@ -67,6 +67,7 @@ namespace curf {
         std::uint64_t windows = 0, signals = 0, classified = 0, skipped_busy = 0, skipped_ring = 0, tracks = 0;
         std::uint64_t skipped_capacity = 0, narrow = 0, wide = 0;
         std::uint64_t skipped_signals = 0, skipped_tracks = 0, skipped_workspace = 0;
+        std::uint64_t component_probes = 0; // connected wide components rechecked despite old narrow fragments
         cuda::Percentiles narrow_latency_ms, wide_latency_ms;
         std::string to_json() const;
     };
