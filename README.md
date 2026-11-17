@@ -260,6 +260,7 @@ python3 tools/ui_server.py --port 8080 -- build/cuda-release/bench/curf_classify
 | `tools/run_signal_checks.py` | M2 信号级回放、双路 300 秒实时验收（见 [链路与复现说明](docs/m2-pipeline.md)） |
 | `tools/run_display_checks.py` | M3 频段策略、真实模型回放与 ADS-B 联动检查（见 [显示策略说明](docs/m3-display.md)） |
 | `tools/run_room_checks.py` | M4 开发 / 验收种子分离的随机 RF 场景、负样本控制和标签错误率检查（见 [验收口径](docs/m4-evaluation.md)） |
+| `tools/check_display_reduction.py` | 同一冻结 M4 feed 的完整 / 显示判决对照，检查突发覆盖、全部命名保留与原始计数一致性 |
 | `tools/run_live_checks.py` | M5 只接收实采长测、完整模型记录与有界显示合并、驱动与二级运行检查（见 [最终复验](docs/m5-dsss.md)） |
 | `tools/record_live_demo.cjs` | 可选 Playwright / Chrome 实采界面录像，依据实验 manifest 匹配频率与接收路 |
 | `tools/check_dsss_capture.py` | 独立于模型的 Barker-11 相干能量检查，支持 DSSS / OFDM 对照（见 [M5 复验](docs/m5-dsss.md)） |

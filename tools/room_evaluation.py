@@ -28,7 +28,7 @@ def strict_match(r,e):
     return match(r,e,time_fraction=.05)
 
 
-def evaluate_case(directory, config, write_feed=True, processed=False):
+def evaluate_case(directory, config, write_feed=True, processed=False, feed_path=None):
     directory=Path(directory)
     truth=json.loads((directory/"truth.json").read_text())
     if truth.get("version") != 2 or any("stream" not in e or "protocol" not in e for e in truth["truth"]):
@@ -44,9 +44,12 @@ def evaluate_case(directory, config, write_feed=True, processed=False):
         carrier=carriers.get(e["source_id"],{})
         by_stream[e["stream"]].append({**e,"carrier_fc":e.get("carrier_fc",carrier.get("fc",e["fc"])),
                                       "carrier_bw":e.get("carrier_bw",carrier.get("bw",e["bw"]))})
+    feed_path=Path(feed_path) if feed_path is not None else directory/"raw.feed"
+    if write_feed and feed_path.resolve()==(directory/"display.feed").resolve():
+        raise ValueError("cannot overwrite the input feed")
     output=(directory/"display.feed").open("w") if write_feed else None
     try:
-        with (directory/"raw.feed").open() as f:
+        with feed_path.open() as f:
             for line in f:
                 row=json.loads(line)
                 if "meta" in row:

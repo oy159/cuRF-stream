@@ -38,14 +38,14 @@ def check(source, out, interval=.2):
             shutil.copy2(case/name, target/name)
         inputs[case.name] = {name: digest(case/name) for name in ("raw.feed", "truth.json", "runtime.json")}
         reducer = DisplayReducer(interval)
-        with (case/"raw.feed").open() as src, (target/"raw.feed").open("w") as dst:
+        with (case/"raw.feed").open() as src, (target/"display.feed").open("w") as dst:
             for line in src:
                 for row in reducer.push(json.loads(line)):
                     dst.write(json.dumps(row, separators=(",", ":"))+"\n")
             for row in reducer.flush():
                 dst.write(json.dumps(row, separators=(",", ":"))+"\n")
         full.append(evaluate_case(case, config, write_feed=False))
-        reduced.append(evaluate_case(target, config, processed=True))
+        reduced.append(evaluate_case(target, config, write_feed=False, processed=True, feed_path=target/"display.feed"))
         sampling[case.name] = reducer.stats()
     baseline = summarize(full, "full-frozen-feed")
     display = summarize(reduced, "post-policy-display-regression")
