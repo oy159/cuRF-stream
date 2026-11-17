@@ -29,7 +29,7 @@ from pathlib import Path
 import numpy as np
 
 from curf_model.widesig import (FAMILIES, ONAIR_TO_FAMILY, Emission, emissions, extract, impair, load_sigmf,
-                                noise_window)
+                                noise_window, runtime_rate)
 
 CUT = 0.75  # train / val boundary, fraction of each recording
 
@@ -84,7 +84,7 @@ def make(task: dict) -> dict:
         e = parts[rng.choice(len(parts), p=w)]
         y, b_est = extract(x, fs, e, L, rng)
         s = rng.uniform(lo, hi)
-        y = impair(y, max(2 * b_est, 8e3), s, rng)
+        y = impair(y, runtime_rate(b_est), s, rng, bw=b_est)
         xs[i] = np.stack([y.real, y.imag])
         lbw[i], snr[i] = np.log10(b_est), s
     return {"x": xs, "log_bw": lbw, "snr": snr, **{k: task[k] for k in ("y", "mode_idx")}}

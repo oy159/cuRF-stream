@@ -158,11 +158,27 @@ def noise_spectrum(x: np.ndarray, nfft: int, frames: int = 4000) -> np.ndarray:
     return np.median(np.abs(np.fft.fftshift(np.fft.fft(seg, axis=1), axes=1)) ** 2, axis=0).astype(np.float32)
 
 
+RUNTIME_BIN_HZ = 61.44e6 / 2 ** 18  # FFT bin of the runtime extraction (src/runtime/signal_stage.cu)
+
+
+def runtime_rate(b_est: float, bin_hz: float = RUNTIME_BIN_HZ, nf: int = 2 ** 18) -> float:
+    """Extraction rate the runtime picks for a bandwidth estimate: W bins, the smallest of {2^m, 1.5 * 2^m}
+    (16 <= W <= nf) with W >= 2 B / bin, so fs_n = W * bin is 2..3 B (and at least 3.75 kHz)."""
+    need = 2 * b_est / bin_hz
+    w = 16
+    while True:
+        if w >= need or w >= nf:
+            return min(w, nf) * bin_hz
+        if w + w // 2 >= need:
+            return (w + w // 2) * bin_hz
+        w *= 2
+
+
 def extract(x: np.ndarray, fs: float, e: Emission, L: int, rng: np.random.Generator,
-            bw_err=(0.7, 1.4), fc_err: float = 0.1, min_fs: float = 8e3) -> tuple[np.ndarray, float]:
+            bw_err=(0.7, 1.4), fc_err: float = 0.1, min_fs: float = 0.0) -> tuple[np.ndarray, float]:
     """The runtime's extraction with its estimation errors: returns (L complex samples at fs_n, B estimate)."""
     b_est = e.bw * float(np.exp(rng.uniform(np.log(bw_err[0]), np.log(bw_err[1]))))
-    fs_n = max(2 * b_est, min_fs)
+    fs_n = max(runtime_rate(b_est), min_fs)
     fc = e.fc + rng.uniform(-fc_err, fc_err) * e.bw
     n0 = int(np.ceil(L / fs_n * fs)) + 1
     span = e.t1 - e.t0
@@ -180,7 +196,7 @@ def extract(x: np.ndarray, fs: float, e: Emission, L: int, rng: np.random.Genera
     return y.astype(np.complex64), b_est
 
 
-def impair(y: np.ndarray, fs_n: float, snr_db: float, rng: np.random.Generator) -> np.ndarray:
+def impair(y: np.ndarray, fs_n: float, snr_db: float, rng: np.random.Generator, bw: float | None = None) -> np.ndarray:
     L = len(y)
     active = np.abs(y) ** 2
     thr = active.max() * 1e-2
@@ -202,8 +218,9 @@ def impair(y: np.ndarray, fs_n: float, snr_db: float, rng: np.random.Generator) 
     mu = np.cos(phi) + 1j * eps * np.sin(phi)
     nu = eps * np.cos(phi) - 1j * np.sin(phi)
     y = mu * y + 0.5 * nu * np.conj(y)
-    # white noise: SNR is in-band (B = fs_n / 2), so the noise over fs_n is twice the in-band noise
-    n_tot = 2 * 10 ** (-snr_db / 10)
+    # white noise: SNR is in-band (over the bandwidth estimate bw; fs_n / 2 when not given), so the noise over
+    # fs_n is fs_n / bw times the in-band noise
+    n_tot = (fs_n / bw if bw else 2.0) * 10 ** (-snr_db / 10)
     noise = (rng.normal(size=L) + 1j * rng.normal(size=L)) * np.sqrt(n_tot / 2)
     y = y + noise + (rng.normal() + 1j * rng.normal()) * rng.uniform(0, 0.05) * np.sqrt(n_tot)
     return (y / np.sqrt(np.mean(np.abs(y) ** 2))).astype(np.complex64)
