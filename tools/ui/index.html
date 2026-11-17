@@ -8,9 +8,25 @@
   :root {
     --bg: #0d1014; --panel: #151a20; --line: #262e38; --text: #d8dee6; --dim: #7d8896; --hi: #1f2730;
     --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    --sans: system-ui, -apple-system, "PingFang SC", sans-serif;
+    --focus: #7aa7ff; --scroll-thumb: #536173; --scroll-track: #151a20; --scroll-hover: #7d8896; --scroll-active: #a7b9d0;
   }
   * { box-sizing: border-box; }
-  body { margin: 0; background: var(--bg); color: var(--text); font: 13px/1.4 system-ui, -apple-system, "PingFang SC", sans-serif; }
+  html { scrollbar-color: var(--scroll-thumb) var(--scroll-track); scrollbar-width: auto; }
+  * { scrollbar-color: var(--scroll-thumb) var(--scroll-track); }
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-track { background: var(--scroll-track); }
+  ::-webkit-scrollbar-thumb { background: var(--scroll-thumb); border: 2px solid var(--scroll-track); border-radius: 5px; }
+  ::-webkit-scrollbar-thumb:hover { background: var(--scroll-hover); }
+  ::-webkit-scrollbar-thumb:active { background: var(--scroll-active); }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 13px/1.4 var(--sans); font-variant-numeric: tabular-nums; }
+  button, select, summary { cursor: pointer; }
+  button { font: inherit; color: var(--text); background: var(--panel); border: 1px solid var(--line); border-radius: 4px; min-height: 28px; }
+  button:hover, select:hover { background: var(--hi); }
+  button:active { border-color: var(--focus); }
+  :focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+  button:disabled, select:disabled { cursor: default; opacity: .5; }
+  [hidden] { display: none !important; }
   header { display: flex; flex-wrap: wrap; gap: 6px 22px; align-items: baseline; padding: 10px 16px; border-bottom: 1px solid var(--line); }
   header h1 { font-size: 15px; margin: 0; font-weight: 600; }
   .kv { color: var(--dim); font-family: var(--mono); font-size: 12px; }
@@ -38,20 +54,41 @@
   canvas.cls { height: 80px; margin-top: 3px; cursor: crosshair; }
   canvas.labels { height: 36px; }
   canvas.axis { height: 18px; }
-  .sel { position: absolute; top: 0; bottom: 0; background: rgba(120, 170, 255, 0.15); border-left: 1px solid #7aa7ff;
+  .plots > .sel { position: absolute; top: 0; bottom: 0; background: rgba(120, 170, 255, 0.15); border-left: 1px solid #7aa7ff;
          border-right: 1px solid #7aa7ff; pointer-events: none; display: none; }
   .tip { position: fixed; pointer-events: none; background: #0b0e12ee; border: 1px solid var(--line); border-radius: 4px;
          padding: 6px 8px; font: 12px/1.5 var(--mono); color: var(--text); display: none; z-index: 10; white-space: pre; }
   .list { border-left: 1px solid var(--line); padding-left: 10px; min-width: 0; display: flex; flex-direction: column; }
   .list h3 { margin: 0 0 4px; font-size: 12px; font-weight: 600; color: var(--dim); display: flex; justify-content: space-between; }
-  .rows { overflow-y: auto; max-height: 360px; font: 12px/1.6 var(--mono); }
+  .rows { overflow: auto; max-height: 360px; min-height: 110px; scrollbar-gutter: stable; font: 12px/1.6 var(--mono); }
   .rows table { width: 100%; border-collapse: collapse; }
   .rows th { text-align: right; color: var(--dim); font-weight: 500; position: sticky; top: 0; background: var(--panel); padding: 0 4px; }
   .rows td { text-align: right; padding: 0 4px; white-space: nowrap; }
   .rows th:nth-child(3), .rows td:nth-child(3) { text-align: left; }
-  .rows tr:hover td { background: var(--hi); cursor: pointer; }
+  .rows tr:hover td { background: var(--hi); }
+  .rows .freq-action { border: 0; padding: 0 3px; color: var(--focus); font: inherit; background: transparent; white-space: nowrap; }
+  .rows .inspect-action { padding: 1px 5px; font: inherit; white-space: nowrap; }
+  .signal-sub { color: var(--dim); font-size: 11px; }
+  .empty { color: var(--dim); padding: 18px 5px; font: 12px/1.7 var(--sans); }
+  .policy-bar { margin: 0 16px; min-height: 38px; display: flex; flex-wrap: wrap; gap: 4px 24px; align-items: center; color: var(--dim); font-size: 12px; }
+  .policy-bar b { color: var(--text); font-weight: 500; }
+  .notice { margin: 4px 16px; padding: 8px 10px; border: 1px solid #e0b050; border-radius: 4px; }
+  .notice button { margin-left: 12px; }
+  .engineering { grid-column: 1 / -1; min-width: 0; }
+  body[data-view="demo"] .engineering { display: none; }
+  body[data-view="engineering"] .demo-only { display: none; }
+  details { border-top: 1px solid var(--line); padding-top: 7px; }
+  summary { color: var(--dim); min-height: 28px; }
+  .inspection { margin: 0; padding: 8px; background: var(--bg); max-height: 320px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font: 12px/1.6 var(--mono); }
+  .engine-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; }
+  .policy-detail { margin: 0 16px 8px; }
+  @media (max-width: 700px) { .engine-grid { grid-template-columns: minmax(0, 1fr); } header, .bar { gap: 8px 12px; } }
+  @media (forced-colors: active) { * { scrollbar-color: auto; } :focus-visible { outline-color: Highlight; } }
+  @media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto !important; } }
   .rows i { width: 9px; height: 9px; border-radius: 2px; display: inline-block; margin-right: 5px; }
   #air { display: none; }
+  #air { grid-template-columns: minmax(0, 1fr) minmax(0, 1.25fr); }
+  @media (max-width: 1000px) { #air { grid-template-columns: minmax(0, 1fr); } }
   #air canvas { height: 300px; background: #10151b; border-radius: 4px; }
   #air .rows { max-height: 300px; }
   #air .rows th:nth-child(3), #air .rows td:nth-child(3) { text-align: right; }
@@ -60,10 +97,10 @@
   #end { margin: 0 16px 16px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px; font-family: var(--mono); font-size: 12px; color: var(--dim); white-space: pre-wrap; display: none; }
 </style>
 </head>
-<body>
+<body data-view="demo">
 <header>
   <h1>cuRF-Stream</h1>
-  <span class="kv" id="state">状态 <b>等待数据</b></span>
+  <span class="kv" id="state" role="status" aria-live="polite">状态 <b>等待数据</b></span>
   <span class="kv">源 <b id="src">-</b></span>
   <span class="kv">采样率 <b id="rate">-</b></span>
   <span class="kv">中心频率 <b id="fc">-</b></span>
@@ -71,401 +108,26 @@
   <span class="kv">行/秒 <b id="rps">-</b></span>
 </header>
 <div class="bar">
+  <label class="ctl" for="mode">视图
+    <select id="mode"><option value="demo">演示视图</option><option value="engineering">工程视图</option></select>
+  </label>
   <div class="legend" id="legend"></div>
-  <div class="ctl">平滑
+  <label class="ctl" for="tau">逐信道平滑
     <select id="tau"><option value="0.15">0.15 s</option><option value="0.5" selected>0.5 s</option><option value="2">2 s</option></select>
-  </div>
-  <label class="ctl"><input type="checkbox" id="steady" checked>只看持续信号</label>
-  <div class="ctl"><button id="reset">全带宽</button><span>在瀑布图上拖动可放大频段，双击复原</span></div>
+  </label>
+  <label class="ctl"><input type="checkbox" id="steady">只看持续信号</label>
+  <div class="ctl"><button id="zoom-in" disabled>放大</button><button id="zoom-out" disabled>缩小</button><button id="reset" disabled>全带宽</button><span>也可拖动瀑布图，或点击信号频率</span></div>
 </div>
+<div class="policy-bar"><span id="policy-note">等待信号级数据；演示识别结合频段规划。</span><span id="policy-counts">累计记录：—</span></div>
+<div class="notice" id="feed-error" role="alert" hidden><span></span><button id="reconnect" disabled>重新连接</button></div>
+<details class="engineering policy-detail"><summary>策略参数与抑制计数</summary><pre class="inspection" id="policy-detail">等待策略信息</pre></details>
 <main id="streams"></main>
-<main><section class="stream" id="air" style="grid-template-columns: minmax(0, 1fr) minmax(0, 1.25fr)">
-  <div class="plots"><h2><span>ADS-B 1090 MHz</span><span class="info" id="air-info"></span></h2><canvas id="air-map"></canvas></div>
+<div style="padding:0 16px 14px"><section class="stream" id="air">
+  <div class="plots"><h2><span>ADS-B 1090 MHz · CRC 通过</span><span class="info" id="air-info"></span></h2><button id="air-focus" disabled>定位接收频段</button><canvas id="air-map" role="img" aria-label="已通过 CRC 的飞机位置与航迹；详细数值见飞机表"></canvas></div>
   <div class="list"><h3><span>飞机</span><span class="n" id="air-n"></span></h3><div class="rows" id="air-rows"></div></div>
-</section></main>
+</section></div>
 <div id="end"></div>
 <div class="tip" id="tip"></div>
-<script>
-"use strict";
-// Distinct hues (Tableau-like) for the signal classes; index 0 is "noise", 10 is "wide" (slice of a signal wider
-// than one channel).
-const PALETTE = ["#5c6672", "#4e9de6", "#f28e2b", "#59d0c4", "#edc948", "#e15759", "#b07aa1", "#8cd17d", "#ff9da7", "#d9d9d9",
-                 "#9c755f"];
-// A narrowband class fits in one 120 kHz channel (two at a boundary, three for broadcast FM); a run of this many
-// adjacent tracked channels is one wideband signal whatever its per-channel labels say.
-const WIDE_RUN = 4;
-const ROWS = 250, CROWS = 80;     // waterfall / class-waterfall history in rows
-const SPAN_DB = 50;
-// Track hysteresis on the presence EMA (fraction of recent rows with a detection)
-const ON = 0.35, OFF = 0.12;
-
-let classes = [], WIDE = -1, meta = null, panels = [], counts = [], hidden = new Set();
-let rowDt = 0.034, rateT0 = performance.now(), rateRows = 0, lastList = 0;
-let view = [0, 512];               // displayed column range (fft-shifted columns)
-
-const LUT = (() => {
-  const stops = [[0, 6, 8, 14], [0.25, 20, 40, 110], [0.5, 30, 140, 150], [0.75, 235, 200, 70], [1, 255, 255, 240]];
-  const lut = new Uint8ClampedArray(256 * 3);
-  for (let i = 0; i < 256; i++) {
-    const x = i / 255; let k = 0;
-    while (k < stops.length - 2 && x > stops[k + 1][0]) k++;
-    const [x0, r0, g0, b0] = stops[k], [x1, r1, g1, b1] = stops[k + 1], u = (x - x0) / (x1 - x0);
-    lut[3 * i] = r0 + (r1 - r0) * u; lut[3 * i + 1] = g0 + (g1 - g0) * u; lut[3 * i + 2] = b0 + (b1 - b0) * u;
-  }
-  return lut;
-})();
-const RGB = PALETTE.map(c => [1, 3, 5].map(i => parseInt(c.slice(i, i + 2), 16)));
-const color = c => PALETTE[c % PALETTE.length];
-const name = c => classes[c] || "c" + c;
-const col = (k, M) => (k + M / 2) % M;                       // channel -> display column (left edge = -fs/2)
-const colHz = x => (x - meta.channels / 2) * meta.rate / meta.channels; // display column -> offset Hz
-const fmtMHz = x => ((meta.freq + colHz(x)) / 1e6).toFixed(2);
-
-function newTrack(M, C) {
-  return { act: new Float32Array(M), on: new Uint8Array(M), since: new Float64Array(M),
-           score: new Float32Array(M * C), pw: new Float32Array(M).fill(-200), cls: new Int16Array(M).fill(-1),
-           conf: new Float32Array(M) };
-}
-
-function build() {
-  const root = document.getElementById("streams");
-  root.innerHTML = "";
-  panels = [];
-  const M = meta.channels;
-  view = [0, M];
-  rowDt = meta.every * meta.window * M / (2 * meta.rate); // 2x-oversampled bank: channel rate 2 fs / M
-  for (let s = 0; s < meta.streams; s++) {
-    const el = document.createElement("section");
-    el.className = "stream";
-    el.innerHTML = `<div class="plots"><h2><span>RX${(meta.rx || [])[s] || s + 1}</span><span class="info"></span></h2>
-        <canvas class="axis"></canvas><canvas class="labels"></canvas><canvas class="wf"></canvas><canvas class="cls"></canvas>
-        <div class="sel"></div></div>
-      <div class="list"><h3><span>信号列表</span><span class="n"></span></h3><div class="rows"></div></div>`;
-    root.appendChild(el);
-    const [axis, labels, wf, cls] = el.querySelectorAll("canvas");
-    const off = document.createElement("canvas"); off.width = M; off.height = ROWS;
-    const coff = document.createElement("canvas"); coff.width = M; coff.height = CROWS;
-    const p = { s, axis, labels, wf, cls, off, coff, info: el.querySelector(".info"), rows: el.querySelector(".rows"),
-                n: el.querySelector(".n"), sel: el.querySelector(".sel"), plots: el.querySelector(".plots"),
-                octx: off.getContext("2d"), cctx: coff.getContext("2d"), row: new ImageData(M, 1), crow: new ImageData(M, 1),
-                trk: newTrack(M, Math.max(classes.length, 16)), floor: null, last: null, groups: [] };
-    p.octx.fillStyle = "#06080e"; p.octx.fillRect(0, 0, M, ROWS);
-    p.cctx.fillStyle = "#0b0e13"; p.cctx.fillRect(0, 0, M, CROWS);
-    for (const c of [wf, cls]) hookMouse(p, c);
-    panels.push(p);
-  }
-  redrawAll();
-}
-
-function fit(cv) {
-  const r = devicePixelRatio || 1, w = Math.round(cv.clientWidth * r), h = Math.round(cv.clientHeight * r);
-  if (cv.width !== w || cv.height !== h) { cv.width = w; cv.height = h; }
-  const ctx = cv.getContext("2d");
-  ctx.setTransform(r, 0, 0, r, 0, 0);
-  return [ctx, cv.clientWidth, cv.clientHeight];
-}
-const xOf = (x, w) => (x - view[0]) / (view[1] - view[0]) * w;       // column -> CSS px
-const colAt = (px, w) => Math.floor(view[0] + px / w * (view[1] - view[0]));
-
-function drawAxis(p) {
-  const [ctx, w, h] = fit(p.axis);
-  ctx.clearRect(0, 0, w, h);
-  ctx.fillStyle = "#7d8896"; ctx.strokeStyle = "#39424e"; ctx.font = "11px ui-monospace, Menlo, monospace"; ctx.textBaseline = "top";
-  const ticks = Math.max(2, Math.min(8, Math.floor(w / 90)));
-  for (let i = 0; i <= ticks; i++) {
-    const x = view[0] + (view[1] - view[0]) * i / ticks, px = i / ticks * w;
-    ctx.beginPath(); ctx.moveTo(px + 0.5, h - 4); ctx.lineTo(px + 0.5, h); ctx.stroke();
-    ctx.textAlign = i === 0 ? "left" : i === ticks ? "right" : "center";
-    ctx.fillText(meta.freq ? fmtMHz(x) : (colHz(x) >= 0 ? "+" : "") + (colHz(x) / 1e6).toFixed(2), px, 1);
-  }
-}
-
-function blit(p) {
-  for (const [cv, src, rows] of [[p.wf, p.off, ROWS], [p.cls, p.coff, CROWS]]) {
-    const [ctx, w, h] = fit(cv);
-    ctx.imageSmoothingEnabled = false;
-    ctx.drawImage(src, view[0], 0, view[1] - view[0], rows, 0, 0, w, h);
-  }
-}
-
-function redrawAll() { for (const p of panels) { drawAxis(p); blit(p); drawLabels(p); } }
-
-// One feed row: update tracks, push one waterfall row, redraw.
-function onRow(row) {
-  const M = meta.channels, C = Math.max(classes.length, 16);
-  const tau = parseFloat(document.getElementById("tau").value);
-  const d = Math.exp(-rowDt / tau);
-  const det = panels.map(() => ({ cls: new Int16Array(M).fill(-1), prob: new Uint8Array(M) }));
-  // Detected (energy above the floor) but noise-like: a slice of a wideband noise-like signal (OFDM, fast PSK/QAM),
-  // which the model cannot tell from noise inside one channel.
-  for (const [s, k, c, pr] of row.r) { const x = col(k, M); det[s].cls[x] = c === 0 && WIDE > 0 ? WIDE : c; det[s].prob[x] = pr; }
-  const now = row.t;
-  counts = new Array(C).fill(0);
-  for (const p of panels) {
-    const s = p.s, T = p.trk, D = det[s];
-    const f = row.f[s];
-    p.floor = p.floor === null ? f : p.floor + 0.05 * (f - p.floor);
-    const lo = p.floor - 6, scale = 255 / (SPAN_DB + 6), pd = p.row.data, cd = p.crow.data;
-    for (let k = 0; k < M; k++) {
-      const x = col(k, M), pw = row.p[s * M + k];
-      const v = Math.max(0, Math.min(255, (pw - lo) * scale)) | 0;
-      pd[4 * x] = LUT[3 * v]; pd[4 * x + 1] = LUT[3 * v + 1]; pd[4 * x + 2] = LUT[3 * v + 2]; pd[4 * x + 3] = 255;
-      T.pw[x] = pw;
-    }
-    for (let x = 0; x < M; x++) {
-      const c = D.cls[x], hit = c >= 0;
-      T.act[x] = d * T.act[x] + (hit ? 1 - d : 0);
-      for (let j = 0; j < C; j++) T.score[x * C + j] *= d;
-      if (hit) T.score[x * C + c] += D.prob[x] / 100;
-      if (!T.on[x] && T.act[x] > ON) { T.on[x] = 1; T.since[x] = now; }
-      else if (T.on[x] && T.act[x] < OFF) T.on[x] = 0;
-      let best = -1, bs = 0, tot = 0;
-      for (let j = 0; j < C; j++) { const v = T.score[x * C + j]; tot += v; if (v > bs) { bs = v; best = j; } }
-      T.cls[x] = best; T.conf[x] = tot > 0 ? bs / tot : 0;
-      // class waterfall: tracked channels in their (smoothed) class colour, raw detections faint
-      if (T.on[x] && best > 0 && !hidden.has(best)) {
-        const [r, g, b] = RGB[best % RGB.length], a = 0.35 + 0.65 * T.conf[x];
-        cd[4 * x] = r * a; cd[4 * x + 1] = g * a; cd[4 * x + 2] = b * a;
-      } else if (hit) { cd[4 * x] = 40; cd[4 * x + 1] = 46; cd[4 * x + 2] = 54; }
-      else { cd[4 * x] = 11; cd[4 * x + 1] = 14; cd[4 * x + 2] = 19; }
-      cd[4 * x + 3] = 255;
-    }
-    p.octx.drawImage(p.off, 0, 0, M, ROWS - 1, 0, 1, M, ROWS - 1); p.octx.putImageData(p.row, 0, 0);
-    p.cctx.drawImage(p.coff, 0, 0, M, CROWS - 1, 0, 1, M, CROWS - 1); p.cctx.putImageData(p.crow, 0, 0);
-    p.now = now;
-    p.groups = group(p, now);
-    for (const g of p.groups) if (!(document.getElementById("steady").checked && g.bursty)) counts[g.cls]++;
-    blit(p); drawLabels(p);
-    p.info.textContent = `本底 ${f.toFixed(1)} dBFS · 跟踪 ${p.groups.length} 个信号${p.hint || ""}`;
-  }
-  document.getElementById("t").textContent = row.t.toFixed(2) + " s";
-  rateRows++;
-  const t = performance.now();
-  if (t - rateT0 > 1000) { document.getElementById("rps").textContent = (rateRows * 1000 / (t - rateT0)).toFixed(1); rateT0 = t; rateRows = 0; }
-  if (t - lastList > 250) { lastList = t; for (const p of panels) drawList(p); drawLegend(); } // lists at 4 Hz
-}
-
-// Adjacent tracked columns form one signal. With a model that has the "wide" class, a whole run of adjacent
-// tracked channels is one signal: >= WIDE_RUN channels is a wideband signal; a shorter run is one narrowband
-// signal plus its skirts in the neighbouring channels (2x oversampled channelizer), named by its strongest channel
-// - the skirts look like the edge of a wide signal to the model and would otherwise show up as extra "wide" ones.
-// Without it (older models), adjacent columns of the same class form one signal.
-function group(p, now) {
-  const T = p.trk, M = meta.channels, out = [];
-  const tracked = x => T.on[x] && T.cls[x] > 0;
-  for (let x = 0; x < M;) {
-    if (!tracked(x)) { x++; continue; }
-    let r = x, peak = x;
-    while (r < M && tracked(r)) { if (T.pw[r] > T.pw[peak]) peak = r; r++; }
-    const run = WIDE > 0;
-    const c = !run ? T.cls[x] : r - x >= WIDE_RUN ? WIDE : T.cls[peak];
-    let e = x, pmax = -200, conf = 0, since = now, wsum = 0, xw = 0, act = 0;
-    while (e < M && tracked(e) && (run || T.cls[e] === c)) {
-      const lin = Math.pow(10, T.pw[e] / 10);
-      pmax = Math.max(pmax, T.pw[e]); conf += T.conf[e]; since = Math.min(since, T.since[e]); wsum += lin; xw += lin * e;
-      act = Math.max(act, T.act[e]); e++;
-    }
-    out.push({ x0: x, x1: e, xc: xw / wsum, cls: c, conf: run && c !== WIDE ? T.conf[peak] : conf / (e - x),
-               snr: pmax - p.floor, age: now - since,
-               bursty: act < 0.8 }); // present in < 80 % of recent rows: a burst signal (e.g. WiFi), not a steady one
-    x = e;
-  }
-  return out;
-}
-
-// Label strip: every signal gets a colour bar (class colour; bursty signals half transparent). The class name
-// is written where the gap to the neighbouring signals holds it - at full band ~100 signals share ~800 px,
-// so names appear once you zoom in. No greedy "first label that fits" choice: that made a different signal win the
-// space every row and the labels flicker.
-function drawLabels(p) {
-  const [ctx, w, h] = fit(p.labels);
-  ctx.clearRect(0, 0, w, h);
-  ctx.textBaseline = "middle"; ctx.textAlign = "center";
-  let named = 0, shown = 0;
-  const gs = visible(p), cx = gs.map(g => (xOf(g.x0, w) + xOf(g.x1, w)) / 2), lineEnd = [-Infinity, -Infinity];
-  gs.forEach((g, i) => {
-    const x0 = xOf(g.x0, w), x1 = xOf(g.x1, w);
-    ctx.globalAlpha = g.bursty ? 0.45 : 1;
-    ctx.fillStyle = color(g.cls);
-    ctx.fillRect(x0 + 0.5, h - 10, Math.max(2, x1 - x0 - 1), 10);
-    ctx.globalAlpha = 1;
-    shown++;
-    // Names go on the first of two text lines where they do not overlap the previous name on that line.
-    // With the steady signals only (the default), the set of signals - and so the layout - does not change
-    // while the tracks are steady.
-    ctx.font = "600 11px system-ui, sans-serif";
-    const t1 = name(g.cls), tw = ctx.measureText(t1).width + 4, a = cx[i] - tw / 2, b = cx[i] + tw / 2;
-    if (a >= 0 && b <= w)
-      for (let ln = 0; ln < 2; ln++)
-        if (a >= lineEnd[ln]) { ctx.fillText(t1, cx[i], ln ? 19 : 7); lineEnd[ln] = b; named++; break; }
-  });
-  p.hint = !shown || named === shown ? "" : named ? ` · 已标注 ${named}/${shown}，继续放大可看全部` : " · 颜色即类别，拖动放大显示类别名";
-}
-
-// Signals shown: not hidden by the legend, inside the view, and (optionally) not bursty.
-function visible(p) {
-  const steady = document.getElementById("steady").checked;
-  return p.groups.filter(g => !hidden.has(g.cls) && g.x1 > view[0] && g.x0 < view[1] && !(steady && g.bursty));
-}
-
-function drawList(p) {
-  const gs = visible(p);
-  p.n.textContent = `${gs.length} 个`;
-  const bw = meta.rate / meta.channels;
-  p.rows.innerHTML = `<table><tr><th>频率 MHz</th><th>带宽 kHz</th><th>类别</th><th>置信</th><th>SNR</th><th>持续</th></tr>` +
-    gs.map(g => `<tr data-x="${g.xc}"><td>${fmtMHz(g.xc)}</td><td>${Math.round((g.x1 - g.x0 + 1) * bw / 1e3)}</td>` +
-      `<td><i style="background:${color(g.cls)};opacity:${g.bursty ? 0.45 : 1}"></i>${name(g.cls)}${g.bursty ? " <span style=\"color:#7d8896\">突发</span>" : ""}</td><td>${Math.round(g.conf * 100)}%</td>` +
-      `<td>${g.snr.toFixed(0)} dB</td><td>${g.age < 60 ? g.age.toFixed(1) + " s" : (g.age / 60).toFixed(1) + " min"}</td></tr>`).join("") +
-    `</table>`;
-  for (const tr of p.rows.querySelectorAll("tr[data-x]"))
-    tr.onclick = () => { const x = parseFloat(tr.dataset.x), half = 24; setView(x - half, x + half); };
-}
-
-function drawLegend() {
-  const el = document.getElementById("legend");
-  el.innerHTML = classes.map((n, c) => c === 0 ? "" :
-    `<span class="chip${hidden.has(c) ? " off" : ""}" data-c="${c}"><i style="background:${color(c)}"></i>${n} <b>${counts[c] || 0}</b></span>`).join("");
-  for (const ch of el.querySelectorAll(".chip"))
-    ch.onclick = () => { const c = +ch.dataset.c; hidden.has(c) ? hidden.delete(c) : hidden.add(c); drawLegend(); for (const p of panels) { drawList(p); drawLabels(p); } };
-}
-
-function setView(a, b) {
-  const M = meta.channels;
-  a = Math.max(0, Math.floor(a)); b = Math.min(M, Math.ceil(b));
-  if (b - a < 8) { const c = (a + b) / 2; a = Math.max(0, Math.floor(c - 4)); b = Math.min(M, a + 8); }
-  view = [a, b];
-  redrawAll();
-  for (const p of panels) drawList(p);
-}
-
-function hookMouse(p, cv) {
-  const tip = document.getElementById("tip");
-  let drag = null;
-  cv.addEventListener("mousedown", e => { drag = e.offsetX; });
-  cv.addEventListener("mousemove", e => {
-    const w = cv.clientWidth, x = colAt(e.offsetX, w);
-    if (drag !== null) {
-      const a = Math.min(drag, e.offsetX), b = Math.max(drag, e.offsetX);
-      Object.assign(p.sel.style, { display: "block", left: a + "px", width: (b - a) + "px", top: cv.offsetTop + "px", height: cv.offsetHeight + "px" });
-    }
-    const T = p.trk, M = meta.channels;
-    if (x < 0 || x >= M) return;
-    const k = (x + M / 2) % M;
-    tip.style.display = "block";
-    tip.style.left = (e.clientX + 14) + "px"; tip.style.top = (e.clientY + 12) + "px";
-    tip.textContent = `${fmtMHz(x)} MHz  (信道 ${k})\n功率 ${T.pw[x].toFixed(0)} dBFS · 高于本底 ${(T.pw[x] - p.floor).toFixed(0)} dB\n` +
-      (T.on[x] && T.cls[x] > 0 ? `${name(T.cls[x])}  置信 ${Math.round(T.conf[x] * 100)}%  已持续 ${(p.now - T.since[x]).toFixed(1)} s` : "未跟踪");
-  });
-  cv.addEventListener("mouseleave", () => { tip.style.display = "none"; });
-  addEventListener("mouseup", e => {
-    if (drag === null) return;
-    const w = cv.clientWidth, a = Math.min(drag, e.offsetX), b = Math.max(drag, e.offsetX);
-    p.sel.style.display = "none";
-    if (e.target === cv && b - a > 6) setView(colAt(a, w), colAt(b, w) + 1);
-    drag = null;
-  });
-  cv.addEventListener("dblclick", () => setView(0, meta.channels));
-}
-
-// ADS-B: one entry per ICAO address from the {"adsb": {...}} lines (sample time t in seconds).
-const air = new Map();
-let airT = 0, airMsgs = 0, airPick = null, airDirty = false;
-function onAdsb(a) {
-  airT = Math.max(airT, a.t); airMsgs++;
-  let e = air.get(a.icao);
-  if (!e) air.set(a.icao, e = { icao: a.icao, n: 0, trail: [], first: a.t });
-  e.n++; e.last = a.t; e.sig = a.sig;
-  for (const k of ["call", "alt", "gs", "trk", "vr", "sq"]) if (a[k] !== undefined) e[k] = a[k];
-  if (a.lat !== undefined) { e.lat = a.lat; e.lon = a.lon; e.trail.push([a.lat, a.lon]); if (e.trail.length > 400) e.trail.shift(); }
-  document.getElementById("air").style.display = "grid";
-  airDirty = true;
-}
-function drawAir() {
-  if (!airDirty) return;
-  airDirty = false;
-  const live = [...air.values()].filter(e => airT - e.last < 120).sort((a, b) => b.last - a.last);
-  document.getElementById("air-n").textContent = `${live.length} 架（2 分钟内） · 共 ${air.size}`;
-  document.getElementById("air-info").textContent = `${airMsgs} 条消息`;
-  const fmt = (v, d = 0) => v === undefined ? "" : (+v).toFixed(d);
-  const el = document.getElementById("air-rows");
-  el.innerHTML = `<table><tr><th>ICAO</th><th>呼号</th><th>高度 ft</th><th>速度 kt</th><th>航向</th><th>升降 ft/min</th><th>应答码</th><th>位置</th><th>消息</th><th>信号</th><th>最近</th></tr>` +
-    live.map(e => `<tr data-i="${e.icao}" class="${e.icao === airPick ? "sel" : ""}"><td>${e.icao}</td><td>${e.call || ""}</td><td>${fmt(e.alt)}</td><td>${fmt(e.gs)}</td>` +
-      `<td>${fmt(e.trk)}</td><td>${fmt(e.vr)}</td><td>${e.sq || ""}</td><td>${e.lat !== undefined ? e.lat.toFixed(3) + ", " + e.lon.toFixed(3) : ""}</td>` +
-      `<td>${e.n}</td><td>${fmt(e.sig)} dB</td><td>${(airT - e.last).toFixed(0)} s</td></tr>`).join("") + `</table>`;
-  for (const tr of el.querySelectorAll("tr[data-i]")) tr.onclick = () => { airPick = airPick === tr.dataset.i ? null : tr.dataset.i; airDirty = true; drawAir(); };
-
-  // map: equirectangular around the positions seen, cos(lat) scaled, 1-degree grid
-  const [ctx, w, h] = fit(document.getElementById("air-map"));
-  ctx.clearRect(0, 0, w, h);
-  const pos = [...air.values()].filter(e => e.trail.length);
-  ctx.font = "12px system-ui, sans-serif"; ctx.textBaseline = "middle";
-  if (!pos.length) { ctx.fillStyle = "#7d8896"; ctx.textAlign = "center"; ctx.fillText("还没有位置报文（需要同一架飞机的奇偶 CPR 帧对）", w / 2, h / 2); return; }
-  let la0 = 90, la1 = -90, lo0 = 180, lo1 = -180;
-  for (const e of pos) for (const [la, lo] of e.trail) { la0 = Math.min(la0, la); la1 = Math.max(la1, la); lo0 = Math.min(lo0, lo); lo1 = Math.max(lo1, lo); }
-  const k = Math.cos((la0 + la1) / 2 * Math.PI / 180), pad = 0.15;
-  let spanLa = Math.max(la1 - la0, 0.2), spanLo = Math.max((lo1 - lo0) * k, 0.2);
-  const sc = Math.min(w / spanLo, h / spanLa) / (1 + 2 * pad), cla = (la0 + la1) / 2, clo = (lo0 + lo1) / 2;
-  const X = lo => w / 2 + (lo - clo) * k * sc, Y = la => h / 2 - (la - cla) * sc;
-  ctx.strokeStyle = "#262e38"; ctx.fillStyle = "#4d5866"; ctx.lineWidth = 1; ctx.textAlign = "left";
-  const step = spanLa > 4 ? 1 : spanLa > 1 ? 0.5 : 0.1;
-  for (let la = Math.ceil((cla - h / 2 / sc) / step) * step; la < cla + h / 2 / sc; la += step) {
-    ctx.beginPath(); ctx.moveTo(0, Y(la)); ctx.lineTo(w, Y(la)); ctx.stroke(); ctx.fillText(la.toFixed(1) + "°N", 4, Y(la) - 7);
-  }
-  for (let lo = Math.ceil((clo - w / 2 / sc / k) / step) * step; lo < clo + w / 2 / sc / k; lo += step) {
-    ctx.beginPath(); ctx.moveTo(X(lo), 0); ctx.lineTo(X(lo), h); ctx.stroke(); ctx.fillText(lo.toFixed(1) + "°E", X(lo) + 3, h - 8);
-  }
-  for (const e of pos) {
-    const fresh = airT - e.last < 60, pick = e.icao === airPick;
-    ctx.globalAlpha = fresh ? 1 : 0.35;
-    ctx.strokeStyle = pick ? "#ffd166" : "#4e79a7"; ctx.lineWidth = pick ? 2 : 1.2;
-    ctx.beginPath(); e.trail.forEach(([la, lo], i) => i ? ctx.lineTo(X(lo), Y(la)) : ctx.moveTo(X(lo), Y(la))); ctx.stroke();
-    const x = X(e.lon), y = Y(e.lat), a = (e.trk || 0) * Math.PI / 180;
-    ctx.save(); ctx.translate(x, y); ctx.rotate(a); ctx.fillStyle = pick ? "#ffd166" : "#e8edf3";
-    ctx.beginPath(); ctx.moveTo(0, -8); ctx.lineTo(5, 6); ctx.lineTo(0, 3); ctx.lineTo(-5, 6); ctx.closePath(); ctx.fill(); ctx.restore();
-    ctx.fillStyle = "#d8dee6"; ctx.fillText(`${e.call || e.icao}${e.alt !== undefined ? "  " + e.alt + " ft" : ""}`, x + 10, y);
-  }
-  ctx.globalAlpha = 1;
-}
-setInterval(drawAir, 500);
-
-function setState(cls, text) {
-  const el = document.getElementById("state");
-  el.className = "kv " + cls; el.innerHTML = `状态 <b>${text}</b>`;
-}
-
-function onEnd(st) {
-  setState("ended", "已结束");
-  const el = document.getElementById("end");
-  el.style.display = "block";
-  const keys = ["wall_s", "x_realtime", "windows", "classified", "dropped_frames", "gap_frames", "latency_ms"];
-  el.textContent = "运行统计  " + keys.filter(k => k in st).map(k => `${k}=${JSON.stringify(st[k])}`).join("  ");
-}
-
-async function start() {
-  try { classes = await (await fetch("/classes")).json(); } catch { classes = []; }
-  WIDE = classes.indexOf("wide");
-  drawLegend();
-  document.getElementById("reset").onclick = () => meta && setView(0, meta.channels);
-  document.getElementById("steady").onchange = () => { for (const p of panels) { drawList(p); drawLabels(p); } };
-  const es = new EventSource("/feed");
-  es.onmessage = ev => {
-    const m = JSON.parse(ev.data);
-    if (m.meta) {
-      meta = m.meta;
-      document.getElementById("src").textContent = meta.source;
-      document.getElementById("rate").textContent = (meta.rate / 1e6).toFixed(2) + " MSPS × " + meta.streams;
-      document.getElementById("fc").textContent = meta.freq ? (meta.freq / 1e6).toFixed(3) + " MHz" : "基带（相对频率）";
-      document.getElementById("end").style.display = "none";
-      build();
-      setState("live", "运行中");
-    } else if (m.end) onEnd(m.end);
-    else if (m.adsb) onAdsb(m.adsb);
-    else if (meta) onRow(m);
-  };
-  es.onerror = () => setState("wait", "连接中断，重连中");
-  addEventListener("resize", () => meta && redrawAll());
-}
-start();
-</script>
+<script src="/app.js"></script>
 </body>
 </html>

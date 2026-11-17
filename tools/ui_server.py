@@ -16,6 +16,7 @@ and {"end": {stats}} at the end.
 """
 
 import argparse
+from collections import OrderedDict, deque
 import json
 import os
 import queue
@@ -26,6 +27,8 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from signal_policy import SignalPolicy, finite, load_config, load_spurs
+
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_METRICS = ROOT / "model/artifacts/run2/export/metrics.json"
 
@@ -33,35 +36,104 @@ DEFAULT_METRICS = ROOT / "model/artifacts/run2/export/metrics.json"
 class Hub:
     """Fan-out of feed lines to the connected browsers; keeps meta / last end for late joiners."""
 
-    def __init__(self):
+    def __init__(self, policy=None, reprocess=False):
         self.lock = threading.Lock()
         self.clients: list[queue.Queue] = []
         self.meta: str | None = None
         self.end: str | None = None
         self.rows = 0
+        self.policy = policy or SignalPolicy()
+        self.processed = False
+        self.reprocess = reprocess
+        self.last_row = None
+        self.power_history = deque(maxlen=250)
+        self.signals = OrderedDict()
+        self.aircraft = OrderedDict()
+        self.error = None
+        self.now = 0
+        self.latest_stats = None
 
     def publish(self, line: str):
-        if line.startswith('{"meta"'):
-            if line == self.meta:  # replay loop: same stream again, keep the browsers' history
-                return
-            self.meta, self.end = line, None
-        elif line.startswith('{"end"'):
-            self.end = line
-        else:
-            self.rows += 1
-            self.end = None
         with self.lock:
+            message = json.loads(line)
+            if not isinstance(message, dict):
+                raise ValueError("feed record must be an object")
+            is_meta = "meta" in message
+            if is_meta:
+                self.processed = "policy" in message["meta"] and not self.reprocess
+                self.end = self.last_row = self.error = None
+                self.signals.clear()
+                self.power_history.clear()
+                self.aircraft.clear()
+                self.now = 0
+                self.latest_stats = None
+            if not self.processed:
+                message = self.policy.process(message)
+            line = json.dumps(message, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+            if "policy_stats" in message:
+                self.latest_stats = json.dumps({"policy_stats": message["policy_stats"]}, separators=(",", ":"))
+            if is_meta:
+                self.meta = line
+            elif "end" in message:
+                self.end = line
+            elif "error" in message:
+                self.error = line
+            else:
+                self.rows += 1
+                self.end = None
+                if "p" in message:
+                    self.last_row = line
+                    self.power_history.append(line)
+                    self.now = max(self.now, message.get("t", 0))
+                d = message.get("display", {})
+                if "uid" in d:
+                    self.now = max(self.now, d["t"])
+                    self.signals[d["uid"]] = (line, d["t"], d.get("ttl_s", 3))
+                    self.signals.move_to_end(d["uid"])
+                    while len(self.signals) > 512:
+                        self.signals.popitem(last=False)
+                a = message.get("adsb")
+                if a and not message.get("adsb_rejected") and a.get("crc_ok") is True:
+                    self.aircraft[a["icao"]] = line
+                    self.aircraft.move_to_end(a["icao"])
+                    while len(self.aircraft) > 128:
+                        self.aircraft.popitem(last=False)
             for q in self.clients:
-                if q.qsize() < 64:  # a slow browser skips rows instead of growing a backlog
-                    q.put(line)
+                if is_meta:
+                    while not q.empty():
+                        try:
+                            q.get_nowait()
+                        except queue.Empty:
+                            break
+                if not q.full():  # preserve atomic raw + policy records, with a bounded backlog
+                    q.put_nowait(line)
+        return line
 
     def subscribe(self) -> queue.Queue:
-        q: queue.Queue = queue.Queue()
+        q: queue.Queue = queue.Queue(maxsize=1024)
         with self.lock:
+            seen = set()
+
+            def add(line):
+                if line not in seen:
+                    q.put_nowait(line)
+                    seen.add(line)
+
             if self.meta:
-                q.put(self.meta)
+                add(self.meta)
+            for line in self.power_history:
+                add(line)
+            for line, t, ttl in self.signals.values():
+                if self.now - t <= ttl:
+                    add(line)
+            for line in self.aircraft.values():
+                add(line)
+            if self.latest_stats:
+                add(self.latest_stats)
             if self.end:
-                q.put(self.end)
+                add(self.end)
+            if self.error:
+                add(self.error)
             self.clients.append(q)
         return q
 
@@ -77,27 +149,37 @@ def run_live(hub: Hub, cmd: list[str], tee: Path | None = None):
     out = open(tee, "w", buffering=1) if tee else None
     with os.fdopen(r, "r") as f:
         for line in f:
+            published = hub.publish(line.strip())
             if out:
-                out.write(line)
-            hub.publish(line.strip())
+                out.write(published + "\n")
     if out:
         out.close()
     rc = proc.wait()
+    if rc:
+        hub.publish(json.dumps({"error": {"message": f"采集程序退出，状态码 {rc}；请检查终端日志。"}}))
     print(f"curf_classify exited with {rc}; still serving the last state", file=sys.stderr)
 
 
 def run_replay(hub: Hub, path: Path, speed: float, loop: bool):
     while True:
         t0 = w0 = None
+        meta = {}
         with open(path) as f:
             for line in f:
                 line = line.strip()
                 if not line:
                     continue
-                if line.startswith('{"w"'):
-                    # pace by the sample time of the row: a file source's feed is not produced in real time
-                    head = line[: line.index(',"p"')] + "}"
-                    t = json.loads(head)["t"]
+                row = json.loads(line)
+                if "meta" in row:
+                    meta = row["meta"]
+                t = row.get("t")
+                if "sig" in row:
+                    sig = row["sig"]
+                    hop = meta.get("window", 1024)*meta.get("channels", 512)/2/meta.get("rate", 61.44e6)
+                    t = sig.get("t", (sig.get("w", 0)+1)*hop)
+                elif "adsb" in row:
+                    t = row["adsb"].get("t")
+                if finite(t):
                     if t0 is None:
                         t0, w0 = time.monotonic(), t
                     delay = t0 + (t - w0) / speed - time.monotonic()
@@ -127,6 +209,10 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path in ("/", "/index.html"):
             self._send((ROOT / "tools/ui/index.html").read_bytes(), "text/html; charset=utf-8")
+        elif self.path.split("?", 1)[0] in ("/", "/index.html"):
+            self._send((ROOT / "tools/ui/index.html").read_bytes(), "text/html; charset=utf-8")
+        elif self.path == "/app.js":
+            self._send((ROOT / "tools/ui/app.js").read_bytes(), "text/javascript; charset=utf-8")
         elif self.path == "/classes":
             self._send(json.dumps(self.classes).encode(), "application/json")
         elif self.path == "/feed":
@@ -160,19 +246,31 @@ def main():
     ap.add_argument("--loop", action="store_true")
     ap.add_argument("--tee", type=Path, help="live mode: also save the feed to this file (replayable)")
     ap.add_argument("--metrics", type=Path, default=DEFAULT_METRICS, help="model metrics.json with the class names")
+    ap.add_argument("--policy", type=Path, help="JSON overrides for the signal display policy")
+    ap.add_argument("--spurs", type=Path, help="50 ohm spur table; used only with matching receiver settings")
     ap.add_argument("cmd", nargs=argparse.REMAINDER, help="-- curf_classify ... (live mode)")
     a = ap.parse_args()
     cmd = a.cmd[1:] if a.cmd[:1] == ["--"] else a.cmd
     if bool(a.replay) == bool(cmd):
         ap.error("give either --replay FEED or -- COMMAND")
+    if not finite(a.speed) or a.speed <= 0:
+        ap.error("--speed must be positive and finite")
 
-    hub = Hub()
+    hub = Hub(SignalPolicy(load_config(a.policy), load_spurs(a.spurs)), reprocess=bool(a.policy or a.spurs))
     Handler.hub = hub
     try:
         Handler.classes = json.loads(a.metrics.read_text())["classes"]
     except OSError:
         Handler.classes = []
-    target = (lambda: run_replay(hub, a.replay, a.speed, a.loop)) if a.replay else (lambda: run_live(hub, cmd, a.tee))
+    def target():
+        try:
+            if a.replay:
+                run_replay(hub, a.replay, a.speed, a.loop)
+            else:
+                run_live(hub, cmd, a.tee)
+        except (OSError, ValueError, KeyError) as e:
+            print(f"feed failed: {e}", file=sys.stderr)
+            hub.publish(json.dumps({"error": {"message": "数据流读取失败；请检查 feed 格式与终端日志。"}}))
     threading.Thread(target=target, daemon=True).start()
     srv = ThreadingHTTPServer((a.bind, a.port), Handler)
     srv.daemon_threads = True
