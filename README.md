@@ -256,6 +256,8 @@ python3 tools/ui_server.py --port 8080 -- build/cuda-release/bench/curf_classify
 | `curf_bench_unpack` / `curf_bench_pcie` | 解包 kernel 带宽；H2D / D2H 与大页的关系 |
 | `curf_pipeline` | P1 流水线吞吐、stream 重叠、延迟 |
 | `curf_bench_channelizer` | 多相信道化 |
+| `curf_check_extraction` | 已知信号参数的 IQ 提取、连续 CPU 参考对齐与导出（见 [M2 验证说明](docs/m2-extraction.md)） |
+| `tools/run_signal_checks.py` | M2 信号级回放、双路 300 秒实时验收（见 [链路与复现说明](docs/m2-pipeline.md)） |
 | `curf_bench_engine` | 引擎优化阶梯、逐层耗时（`--ops`）、ncu 采集（`--profile`）、库基线 |
 | `curf_classify` | 端到端：吞吐、延迟分位、丢样、准确率 |
 
