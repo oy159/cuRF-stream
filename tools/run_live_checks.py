@@ -175,6 +175,7 @@ def main():
     ap.add_argument("--bind", default="127.0.0.1")
     ap.add_argument("--revision", help="declared source revision; actual files are independently hashed")
     ap.add_argument("--neighbor-db", type=float, default=6, help="spectral neighbour rejection; 0 disables it")
+    ap.add_argument("--ism-center-mhz", type=float, default=2440, help="2.4 GHz trial centre; keep target carriers inside the usable 44 MHz span")
     ap.add_argument("--max-signals", type=int, default=64)
     ap.add_argument("--max-tracks", type=int, default=256)
     ap.add_argument("--scratch-mib", type=int, default=32)
@@ -194,16 +195,19 @@ def main():
         ap.error("display interval must be 0 or 50..1000 ms")
     if not 0 <= a.neighbor_db <= 30:
         ap.error("neighbour rejection must be in 0..30 dB")
+    if not 2400 <= a.ism_center_mhz <= 2483.5:
+        ap.error("ISM trial centre must be in 2400..2483.5 MHz")
     if not 1 <= a.max_signals <= 512 or not a.max_signals <= a.max_tracks <= 4096 or not 8 <= a.scratch_mib <= 512:
         ap.error("invalid stage-2 capacity")
     if not 1 <= a.pending <= 8 or a.dual and a.dual_only:
         ap.error("require pending 1..8 and at most one dual mode")
     a.out.mkdir(parents=True, exist_ok=True)
-    plan = [{"name": n, "freq": PROFILES[n][0], "gain": PROFILES[n][1], "threshold": PROFILES[n][2],
+    profiles = {**PROFILES, "ism24": (a.ism_center_mhz*1e6, *PROFILES["ism24"][1:])}
+    plan = [{"name": n, "freq": profiles[n][0], "gain": profiles[n][1], "threshold": profiles[n][2],
              "neighbor_db": a.neighbor_db, "rx": [2]} for n in names]
     if a.dual or a.dual_only:
-        plan.append({**plan[0], "name": "dual_ism24", "freq": PROFILES["ism24"][0], "gain": PROFILES["ism24"][1],
-                     "threshold": PROFILES["ism24"][2], "rx": [1, 2]})
+        plan.append({**plan[0], "name": "dual_ism24", "freq": profiles["ism24"][0], "gain": profiles["ism24"][1],
+                     "threshold": profiles["ism24"][2], "rx": [1, 2]})
     if a.dual_only:
         plan = plan[-1:]
     if shutil.disk_usage(a.out).free < 3*2**30+len(plan)*a.max_feed_mib*2**20:
