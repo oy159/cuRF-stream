@@ -14,6 +14,7 @@ set(CURF_MODEL_DIR "${PROJECT_SOURCE_DIR}/model/artifacts/run2/export" CACHE PAT
 
 add_executable(curf_tests_cpu
     test_adsb.cpp
+    test_extraction.cpp
     test_reference.cpp
     test_sources.cpp
     test_host_ring.cpp
@@ -25,6 +26,8 @@ catch_discover_tests(curf_tests_cpu TEST_PREFIX "cpu.")
 if(CURF_HAVE_CUDA)
     add_executable(curf_tests_cuda
         test_adsb_cuda.cpp
+        test_extraction_cuda.cpp
+        test_extraction_bank_cuda.cpp
         test_unpack_cuda.cpp
         test_pipeline_cuda.cpp
         test_engine_cuda.cpp
