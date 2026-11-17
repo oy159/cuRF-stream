@@ -28,6 +28,7 @@ import numpy as np
 from scipy.signal import resample_poly
 
 from curf_model.widesig import FAMILIES, ONAIR_TO_FAMILY, load_sigmf
+from curf_model.scoring import match
 
 FS = 61.44e6
 CUT = 0.75
@@ -132,21 +133,6 @@ def make(a):
         pack12(x).tofile(a.out / f"scene_{sc}.p12")
         print(json.dumps({"scene": sc, "sources": placed, "peak": float(peak)}), flush=True)
     (a.out / "truth.json").write_text(json.dumps({"version": 2, "secs": a.secs, "scenes": a.scenes, "truth": truth}, indent=1))
-
-
-def match(s, e):
-    # Require overlap in both frequency and source time. Very wide merged detections cannot match a narrow carrier.
-    if min(s["bw"], e["bw"]) <= 0 or max(s["bw"], e["bw"]) > 4 * min(s["bw"], e["bw"]):
-        return 0.0
-    flo = max(s["f"] - s["bw"]/2, e["fc"] - e["bw"]/2)
-    fhi = min(s["f"] + s["bw"]/2, e["fc"] + e["bw"]/2)
-    overlap = max(0.0, fhi - flo)
-    if overlap < .5 * min(s["bw"], e["bw"]):
-        return 0.0
-    dt = max(0.0, min(s["t1"], e["t1"]) - max(s["t0"], e["t0"]))
-    if dt < .25 * min(s["t1"] - s["t0"], e["t1"] - e["t0"]) or dt <= 0:
-        return 0.0
-    return overlap / (s["bw"] + e["bw"] - overlap) * dt / (s["t1"] - s["t0"])
 
 
 def score(a):
