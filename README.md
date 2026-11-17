@@ -4,6 +4,9 @@
 
 数据来自自研 USB3 SDR 及其传输层 OmniCore-SDR-Host。GPU 侧依次做解包、多相信道化、能量检测，再用**自研推理引擎**（手写 Tensor Core / INT8 kernel，不依赖 TensorRT）完成识别。整条链路跑在一块 60 W 的 RTX 3050 笔记本 GPU 上。
 
+**当前 M5 识别质量未通过**：实采仍有大量未识别候选和已知载波的长时间标签空窗。下列吞吐与零丢样结果属于运行指标，
+识别修复进展及失败对照见 [M5 识别质量复查](docs/m5-recognition.md)。
+
 <!-- TODO: 实时界面录屏 docs/img/demo.gif（瀑布图 + 识别标注 + 角落常驻 MS/s、丢样数、p99 延迟） -->
 
 | | |
