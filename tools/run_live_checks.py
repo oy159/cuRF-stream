@@ -85,13 +85,14 @@ def summarize_feed(path):
                        for k, n in labels.most_common(30)]}
 
 
-def record_case(binary, model, out, case, seconds, hub, max_bytes=2**30, capacities=(64, 256, 32), tune_cache=None, display_interval=0):
+def record_case(binary, model, out, case, seconds, hub, max_bytes=2**30, capacities=(64, 256, 32), tune_cache=None, display_interval=0, pending=3):
     out.mkdir()
     cmd = [str(binary.resolve()), "--source", "omnicore", "--rx", ",".join(map(str, case["rx"])),
            "--freq", str(case["freq"]), "--gain", str(case["gain"]), "--threshold-db", str(case["threshold"]),
            "--neighbor-db", str(case.get("neighbor_db", 6)),
            "--stage2-max-signals", str(capacities[0]), "--stage2-max-tracks", str(capacities[1]),
            "--stage2-scratch-mib", str(capacities[2]),
+           "--stage2-pending", str(pending),
            "--bandwidth", "56e6", "--band-mhz", "44", "--stage2", str(model.resolve()), "--seconds", str(seconds)]
     if case["name"] == "adsb":
         cmd += ["--adsb", "1090e6", "--adsb-stream", "0", "--adsb-threshold", "1.6"]
@@ -169,6 +170,7 @@ def main():
     ap.add_argument("--seconds", type=float, default=300)
     ap.add_argument("--bands", default=",".join(PROFILES))
     ap.add_argument("--dual", action="store_true", help="also run a full-rate dual-RX 2.4 GHz case")
+    ap.add_argument("--dual-only", action="store_true", help="run only the dual-RX 2.4 GHz case")
     ap.add_argument("--port", type=int, default=8085)
     ap.add_argument("--bind", default="127.0.0.1")
     ap.add_argument("--revision", help="declared source revision; actual files are independently hashed")
@@ -176,6 +178,7 @@ def main():
     ap.add_argument("--max-signals", type=int, default=64)
     ap.add_argument("--max-tracks", type=int, default=256)
     ap.add_argument("--scratch-mib", type=int, default=32)
+    ap.add_argument("--pending", type=int, default=3, help="bounded stage-2 windows in flight (1..8)")
     ap.add_argument("--tune-cache", type=Path, help="stage-2 kernel tuning cache; preserves the engine's cache validation")
     ap.add_argument("--max-feed-mib", type=int, default=1024, help="hard per-case capture limit; exceeding it stops reception")
     ap.add_argument("--display-interval-ms", type=int, default=0, help="0: complete pipe feed; otherwise file-backed display coalescing, full model records retained")
@@ -193,12 +196,16 @@ def main():
         ap.error("neighbour rejection must be in 0..30 dB")
     if not 1 <= a.max_signals <= 256 or not a.max_signals <= a.max_tracks <= 4096 or not 8 <= a.scratch_mib <= 512:
         ap.error("invalid stage-2 capacity")
+    if not 1 <= a.pending <= 8 or a.dual and a.dual_only:
+        ap.error("require pending 1..8 and at most one dual mode")
     a.out.mkdir(parents=True, exist_ok=True)
     plan = [{"name": n, "freq": PROFILES[n][0], "gain": PROFILES[n][1], "threshold": PROFILES[n][2],
              "neighbor_db": a.neighbor_db, "rx": [2]} for n in names]
-    if a.dual:
+    if a.dual or a.dual_only:
         plan.append({**plan[0], "name": "dual_ism24", "freq": PROFILES["ism24"][0], "gain": PROFILES["ism24"][1],
                      "threshold": PROFILES["ism24"][2], "rx": [1, 2]})
+    if a.dual_only:
+        plan = plan[-1:]
     if shutil.disk_usage(a.out).free < 3*2**30+len(plan)*a.max_feed_mib*2**20:
         ap.error("need the planned maximum feed sizes plus 3 GiB of free space")
     config = load_config()
@@ -210,6 +217,7 @@ def main():
     manifest = {"version": 1, "created_utc": utc(), "revision": a.revision, "seconds": a.seconds, "cases": plan,
                 "policy": config, "max_feed_bytes": a.max_feed_mib*2**20,
                 "capacities": [a.max_signals, a.max_tracks, a.scratch_mib],
+                "pending": a.pending,
                 "display_interval_ms": a.display_interval_ms,
                 "tune_cache": str(a.tune_cache) if a.tune_cache else None,
                 "initial_tune_cache_sha256": digest(a.tune_cache) if a.tune_cache and a.tune_cache.exists() else None,
@@ -241,7 +249,7 @@ def main():
         for case in plan:
             print(f"starting {case['name']} RX{case['rx']} for {a.seconds:g}s", flush=True)
             result = record_case(a.bin, a.model, a.out/case["name"], case, a.seconds, hub, a.max_feed_mib*2**20,
-                                 (a.max_signals, a.max_tracks, a.scratch_mib), a.tune_cache, a.display_interval_ms/1000)
+                                 (a.max_signals, a.max_tracks, a.scratch_mib), a.tune_cache, a.display_interval_ms/1000, a.pending)
             results.append(result)
             write_json(a.out/"progress.json", results)
             print(json.dumps({"case": case["name"], "runtime_passed": result["runtime_passed"],

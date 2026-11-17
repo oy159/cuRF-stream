@@ -173,6 +173,7 @@ int main(int argc, char **argv) {
     bool stage2_int8 = false;
     std::string stage2_tune_cache;
     std::uint32_t stage2_max_signals = 64, stage2_max_tracks = 256;
+    std::uint32_t stage2_pending = 3;
     std::size_t stage2_scratch_mib = 32;
     bool stage1_classify = false;
     double adsb_hz = 0;          // > 0: ADS-B demodulator on the side, carrier frequency
@@ -240,6 +241,7 @@ int main(int argc, char **argv) {
         else if (a == "--stage2-max-signals") stage2_max_signals = static_cast<std::uint32_t>(std::stoul(next()));
         else if (a == "--stage2-max-tracks") stage2_max_tracks = static_cast<std::uint32_t>(std::stoul(next()));
         else if (a == "--stage2-scratch-mib") stage2_scratch_mib = std::stoull(next());
+        else if (a == "--stage2-pending") stage2_pending = static_cast<std::uint32_t>(std::stoul(next()));
         else if (a == "--stage1-classify") stage1_classify = true;
         else if (a == "--adsb-stream") adsb_cfg.stream = static_cast<std::uint32_t>(std::stoul(next()));
         else if (a == "--adsb-threshold") adsb_cfg.threshold = std::stof(next());
@@ -250,8 +252,8 @@ int main(int argc, char **argv) {
     }
 
     if (!stage2_max_signals || stage2_max_signals > 256 || stage2_max_tracks < stage2_max_signals ||
-        stage2_max_tracks > 4096 || stage2_scratch_mib < 8 || stage2_scratch_mib > 512) {
-        std::fprintf(stderr, "invalid stage-2 capacities: signals 1..256, tracks signals..4096, scratch 8..512 MiB\n");
+        stage2_max_tracks > 4096 || stage2_scratch_mib < 8 || stage2_scratch_mib > 512 || !stage2_pending || stage2_pending > 8) {
+        std::fprintf(stderr, "invalid stage-2 capacities: signals 1..256, tracks signals..4096, scratch 8..512 MiB, pending 1..8\n");
         return 2;
     }
 
@@ -404,6 +406,7 @@ int main(int argc, char **argv) {
         sc.window_frames = cfg.window;
         sc.max_signals = stage2_max_signals;
         sc.max_tracks = stage2_max_tracks;
+        sc.pending = stage2_pending;
         sc.scratch_complex = stage2_scratch_mib * (std::size_t{1} << 20) / sizeof(cf32);
         sc.drop_when_busy = cfg.drop_when_full;
         sc.engine.buckets = {1, 4, 16, 64};

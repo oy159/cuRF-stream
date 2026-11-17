@@ -289,6 +289,51 @@ TEST_CASE("stage 2 rechecks a connected wide burst after narrow fragment tracks"
     }
 }
 
+TEST_CASE("stage 2 retains model results across bounded in-flight windows", "[cuda][stage2][pending]") {
+    const std::filesystem::path dir = CURF_S2_MODEL_DIR;
+    if (!std::filesystem::exists(dir / "s2.curf")) SKIP("no stage-2 model");
+    const auto model = engine::Model::load(dir / "s2.curf");
+    SignalStageConfig cfg;
+    SECTION("three pending windows") { cfg.pending = 3; }
+    SECTION("eight pending windows") { cfg.pending = 8; }
+    cfg.scratch_complex = 1u << 20;
+    cfg.reclassify_windows = 1; cfg.drop_when_busy = false;
+    cfg.engine.buckets = {1,4,16,64}; cfg.engine.autotune = false;
+    constexpr unsigned windows = 12;
+    std::mt19937 rng(109);
+    std::normal_distribution<double> noise(0, .01);
+    std::vector<std::complex<double>> samples(windows*kWindowSamples);
+    for (auto &x : samples) x = {noise(rng),noise(rng)};
+    const auto wire = pack(samples);
+    std::vector<SignalResult> got;
+    SignalStage stage(cfg,model,{WireFormat::packed12,1,kFs},kBlock,
+                      [&](const SignalResult &r) { got.push_back(r); });
+    cuda::DeviceBuffer<std::uint8_t> d(kBlock*3);
+    std::vector<WindowResult> det;
+    for (auto k : channels_of(0,1e6)) det.push_back({0,k,0,0,1e-3f});
+    for (unsigned w = 0; w < windows; ++w) {
+        for (unsigned b = 0; b < 2; ++b) {
+            const std::size_t first = (std::size_t{w}*2+b)*kBlock;
+            CURF_CUDA_CHECK(cudaMemcpy(d.get(),wire.data()+first*3,d.bytes(),cudaMemcpyHostToDevice));
+            stage.enqueue(0,d.get(),kBlock,first,nullptr);
+            CURF_CUDA_CHECK(cudaDeviceSynchronize());
+        }
+        // Deliberately defer retire/flush: several pending slots own different
+        // spectra, staging buffers and host outputs at the same time.
+        stage.on_window(w,std::uint64_t{w}*kWindowSamples,det.data(),det.size());
+    }
+    stage.flush();
+    REQUIRE(got.size() == windows);
+    for (unsigned w = 0; w < windows; ++w) {
+        CHECK(got[w].window == w);
+        double sum = 0;
+        for (auto p : got[w].probs) { CHECK(std::isfinite(p)); sum += p; }
+        CHECK(std::abs(sum-1) < 1e-5);
+    }
+    const auto stats = stage.stats();
+    CHECK(stats.skipped_busy == 0); CHECK(stats.skipped_ring == 0); CHECK(stats.skipped_capacity == 0);
+}
+
 TEST_CASE("detection-only pipeline drives stage 2 without a stage-1 engine", "[cuda][stage2][classifier]") {
     const std::filesystem::path dir = CURF_S2_MODEL_DIR;
     if (!std::filesystem::exists(dir / "s2.curf")) SKIP("no stage-2 model");
