@@ -4,6 +4,9 @@ M3 的软件链路已接通：原始 `sig` → 可解释的显示判决 → 演�
 `tools/signal_policy.py` 中实现，实时 SSE 和离线评估共用同一份代码。模型、训练权重和原始
 13 类概率没有被显示策略改写。真实 50 Ω 杂散校准仍待硬件条件具备后采集。
 
+下文门限是 M3 当时的验收记录。M4 已加入 SNR / 带宽 / WiFi 信道栅格证据并调整门限，当前策略见
+[M4 说明](m4-evaluation.md) 与 `tools/policy/default.json`。
+
 ## Feed 和运行
 
 新版 `curf_classify --stage2` 输出 version-2 元数据，声明信号类别顺序、是否运行逐信道分类、
@@ -114,6 +117,9 @@ python tools/run_display_checks.py --bin build/cuda-release/bench/curf_classify 
   --emissions ~/dataset/ds_v5/emissions.json --out ~/dataset/m3_checks
 ```
 
+以下是 M3 当时的 GPU + run4 固定种子结果。当前 `run_display_checks.py` 会把旧生成器的任意
+基带 WiFi 中心对应到真实 RF 信道栅格，并记录调谐频率；它使用当前默认策略，结果可能与历史记录不同。
+
 实际 GPU + run4 的固定种子接入检查：
 
 | 独立场景 | 已命名 / 未识别 | 已命名调制族错误 |
@@ -134,5 +140,5 @@ Python 策略 / feed 检查共 22 个，原有场景评分 4 个。浏览器检�
 概率、逐信道详情、键盘选择器、空筛选、未识别、ADS-B 联动及 390 / 1280 px 布局；设计静态
 审计无错误。记录保存在 `docs/results/m3_*`，完整源数据在远端 `~/dataset/m3_checks`。
 
-这些是 **M3 软件接入检查**，不是 M4 的随机场景 <2% 验收。M4 还需要扩大随机频点、功率、
-突发时序、噪声与错误类别注入，并同时检查已命名错误和未识别比例；M5 实采仍未进行。
+这些是 **M3 软件接入检查**。M4 的随机频点、功率、突发时序、噪声与错误类别注入检查及其
+已命名错误率、未识别比例见 [M4 验收记录](m4-evaluation.md)；M5 实采仍未进行。

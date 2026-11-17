@@ -259,6 +259,8 @@ python3 tools/ui_server.py --port 8080 -- build/cuda-release/bench/curf_classify
 | `curf_check_extraction` | 已知信号参数的 IQ 提取、连续 CPU 参考对齐与导出（见 [M2 验证说明](docs/m2-extraction.md)） |
 | `tools/run_signal_checks.py` | M2 信号级回放、双路 300 秒实时验收（见 [链路与复现说明](docs/m2-pipeline.md)） |
 | `tools/run_display_checks.py` | M3 频段策略、真实模型回放与 ADS-B 联动检查（见 [显示策略说明](docs/m3-display.md)） |
+| `tools/run_room_checks.py` | M4 开发 / 验收种子分离的随机 RF 场景、负样本控制和标签错误率检查（见 [验收口径](docs/m4-evaluation.md)） |
+| `model/make_room_scene.py` | 分块生成 61.44 MS/s 室内 packed12 场景，保留每个 RX 的包级真值与源文件哈希 |
 | `curf_bench_engine` | 引擎优化阶梯、逐层耗时（`--ops`）、ncu 采集（`--profile`）、库基线 |
 | `curf_classify` | 端到端：吞吐、延迟分位、丢样、准确率 |
 
