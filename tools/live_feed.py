@@ -65,15 +65,15 @@ class DisplayReducer:
 def capture_file_feed(cmd, out, hub, max_bytes, interval, max_pending):
     """Child writes raw JSON directly; display processing cannot block its pipe.
 
-    Linux prlimit bounds the raw file to 3/4 of the per-case budget. The display
-    writer checks its 1/4 quota before each write. Both originals remain on error.
+    Linux prlimit bounds the raw file to half the per-case budget. The display
+    writer checks the other half before each write. Both originals remain on error.
     """
     prlimit = shutil.which("prlimit")
     if not prlimit:
         raise RuntimeError("file-backed live display requires Linux prlimit")
     raw, display = out/"raw.feed", out/"display.feed"
     raw.touch(exist_ok=False)
-    raw_limit = max_bytes * 3 // 4
+    raw_limit = max_bytes // 2
     display_limit = max_bytes - raw_limit
     reducer = DisplayReducer(interval, max_pending)
     written = unread_peak = lines = 0

@@ -81,5 +81,5 @@ class FileFeedTests(unittest.TestCase):
             p = Path(directory)
             with self.assertRaisesRegex(RuntimeError,"limit|incomplete|receiver"):
                 self.run_fake(p,1024)
-            self.assertLessEqual((p/"raw.feed").stat().st_size, 768)
-            self.assertLessEqual((p/"display.feed").stat().st_size, 256)
+            self.assertLessEqual((p/"raw.feed").stat().st_size, 512)
+            self.assertLessEqual((p/"display.feed").stat().st_size, 512)
