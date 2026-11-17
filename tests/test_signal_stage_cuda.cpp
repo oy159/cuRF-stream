@@ -280,10 +280,13 @@ TEST_CASE("stage 2 rechecks a connected wide burst after narrow fragment tracks"
     const std::filesystem::path dir = CURF_S2_MODEL_DIR;
     if (!std::filesystem::exists(dir / "s2.curf")) SKIP("no stage-2 model");
     const auto model = engine::Model::load(dir / "s2.curf");
-    bool established = false;
+    bool established = false, split = false, neighbour = false, single = false;
     SECTION("narrow history cannot permanently partition the wide burst") {}
     SECTION("two established wide neighbours keep their own tracks") { established = true; }
-    constexpr unsigned windows = 12;
+    SECTION("separate narrow detections return after the wide burst") { split = true; }
+    SECTION("a disconnected narrow neighbour remains independent") { neighbour = true; }
+    SECTION("a single narrow history must not anchor a later wide extraction") { single = true; }
+    constexpr unsigned windows = 18;
     std::mt19937 rng(108);
     std::normal_distribution<double> noise(0, .01);
     std::vector<std::complex<double>> samples(windows * kWindowSamples);
@@ -305,9 +308,10 @@ TEST_CASE("stage 2 rechecks a connected wide burst after narrow fragment tracks"
         }
         std::vector<WindowResult> det;
         for (unsigned k = 24; k <= 144; ++k) {
-            const bool initial = established ? (k <= 83 || k >= 87) : (k <= 28 || k >= 140);
-            if (w >= 3 || initial) det.push_back({0,k,0,0,1e-3f});
+            const bool initial = established ? (k <= 83 || k >= 87) : (k <= 28 || (!single && k >= 140));
+            if ((w >= 3 && (!split || w < 12)) || initial) det.push_back({0,k,0,0,1e-3f});
         }
+        if (neighbour) for (unsigned k = 180; k <= 184; ++k) det.push_back({0,k,0,0,1e-3f});
         stage.on_window(w, std::uint64_t{w} * kWindowSamples, det.data(), det.size());
         stage.flush();
     }
@@ -322,11 +326,17 @@ TEST_CASE("stage 2 rechecks a connected wide burst after narrow fragment tracks"
         REQUIRE(wide != got.end());
         CHECK(std::abs(wide->fc_hz - 84*120e3) < 240e3);
         CHECK(wide->fs_hz >= 2*wide->bw_hz);
-        // The original fragment results remain independently inspectable.
+        // A connected wide component must not also generate arbitrary partition labels.
         std::vector<std::uint32_t> original;
-        for (const auto &r : got) if (r.window < 3) original.push_back(r.track);
-        CHECK(std::any_of(got.begin(),got.end(),[&](const auto &r) {
-            return r.window >= 3 && std::find(original.begin(),original.end(),r.track) != original.end();
+        for (const auto &r : got) if (r.window < 3 && r.fc_hz < 20e6) original.push_back(r.track);
+        CHECK(std::none_of(got.begin(),got.end(),[&](const auto &r) {
+            return r.window >= 3 && r.window < 12 && std::find(original.begin(),original.end(),r.track) != original.end();
+        }));
+        if (split) CHECK(std::any_of(got.begin(),got.end(),[&](const auto &r) {
+            return r.window >= 12 && std::find(original.begin(),original.end(),r.track) != original.end();
+        }));
+        if (neighbour) CHECK(std::any_of(got.begin(),got.end(),[](const auto &r) {
+            return r.window >= 12 && std::abs(r.fc_hz - 182*120e3) < 240e3 && r.bw_hz < 1e6;
         }));
     }
 }

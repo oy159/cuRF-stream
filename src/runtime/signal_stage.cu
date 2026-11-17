@@ -372,7 +372,7 @@ namespace curf {
                     if (component_probe) {
                         const int overlap = std::max(0, std::min(hi,t.hi) - std::max(lo,t.lo) + 1);
                         const int extent = std::max(hi,t.hi) - std::min(lo,t.lo) + 1;
-                        if (overlap < .7 * extent) continue;
+                        if (overlap < .85 * extent) continue;
                     }
                     return static_cast<int>(i);
                 }
@@ -404,7 +404,16 @@ namespace curf {
                 std::sort(v.begin(), v.end());
                 auto submit = [&](unsigned id, int lo, int hi) {
                     auto &tr = tracks[id];
-                    if (tr.last_seen == w && tr.w) { tr.lo = std::min(tr.lo,lo); tr.hi = std::max(tr.hi,hi); return; }
+                    if (tr.last_seen == w && tr.w) {
+                        tr.lo = std::min(tr.lo,lo); tr.hi = std::max(tr.hi,hi);
+                        if (tr.w >= L) for (auto &s : sig) if (s.track == id) {
+                            const int bpc = static_cast<int>(4 * nf / cfg.channels);
+                            const int k0 = std::max((tr.lo-1)*bpc-bpc/2,-static_cast<int>(2*nf));
+                            const int k1 = std::min((tr.hi+1)*bpc+bpc/2,static_cast<int>(2*nf)-1);
+                            s.band = BandReq{stream,k0,static_cast<unsigned>(k1-k0+1)};
+                        }
+                        return;
+                    }
                     tr.lo = lo; tr.hi = hi; tr.last_seen = w;
                     const bool narrow = tr.w && tr.w < L;
                     if (!narrow && tr.classified_once && w - tr.last_class < cfg.reclassify_windows) return;
@@ -435,7 +444,7 @@ namespace curf {
                     std::size_t b = a;
                     while (b + 1 < v.size() && v[b+1].first <= v[b].first + 2) ++b;
                     const int lo = v[a].first, hi = v[b].first;
-                    a = b + 1;
+                    a = b+1;
                     std::vector<Prior> matches;
                     for (const auto &tr : prior)
                         if (lo <= tr.hi && tr.lo <= hi) matches.push_back(tr);
@@ -446,9 +455,10 @@ namespace curf {
                         else { ++st.skipped_capacity; ++st.skipped_tracks; }
                     } else {
                         // Early narrow fragments must not permanently partition a later wide burst.
-                        // Probe the complete *currently connected* component, without joining separate
-                        // detections or stealing existing carrier tracks. Established wide neighbours
-                        // do not qualify: a new probe must span at least three times every prior extent.
+                        // Classify the complete *currently connected* component once. Its narrow
+                        // historical partitions are not independent detections in this window.
+                        // Keep them dormant so a later split can recover separate carriers. Established
+                        // wide neighbours do not qualify: a new component must span >=3x every prior.
                         int largest = 0;
                         for (const auto &m : matches) largest = std::max(largest, m.hi - m.lo + 1);
                         bool continuing_probe = false;
@@ -457,15 +467,18 @@ namespace curf {
                                 w - tr.last_seen > cfg.track_timeout_windows) continue;
                             const int overlap = std::max(0, std::min(hi,tr.hi) - std::max(lo,tr.lo) + 1);
                             const int extent = std::max(hi,tr.hi) - std::min(lo,tr.lo) + 1;
-                            if (overlap >= .7 * extent) { continuing_probe = true; break; }
+                            if (overlap >= .85 * extent) { continuing_probe = true; break; }
                         }
-                        if (matches.size() >= 2 && hi - lo + 1 >= 64 &&
-                            (hi - lo + 1 >= 3 * largest || continuing_probe)) {
+                        if (hi - lo + 1 >= 64 && (continuing_probe ||
+                            (hi - lo + 1 >= 3 * largest))) {
                             const int id = match_track(stream, lo, hi, w, true);
                             if (id >= 0) {
                                 const auto before = sig.size();
                                 submit(static_cast<unsigned>(id), lo, hi);
                                 st.component_probes += sig.size() > before;
+                                // Do not refresh fragment last_seen or submit their arbitrary slices.
+                                // When the detector separates them again they are eligible as before.
+                                continue;
                             } else { ++st.skipped_capacity; ++st.skipped_tracks; }
                         }
                         int begin = lo;
