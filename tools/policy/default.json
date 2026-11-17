@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "confidence": 0.85,
+  "raw_confidence": 0.80,
+  "allowed_mass": 0.85,
+  "margin": 0.20,
+  "other_confidence": 0.94,
+  "hold_confidence": 0.70,
+  "confirmations": 3,
+  "release_observations": 2,
+  "vote_seconds": 3.0,
+  "hold_seconds": 0.30,
+  "max_carriers": 512,
+  "spur_action": "mark",
+  "bands": [
+    {"name": "ADS-B 1090", "lo_mhz": 1088, "hi_mhz": 1092, "allow": [], "protocol": "adsb", "decoder_only": true},
+    {"name": "2.4 GHz ISM", "lo_mhz": 2400, "hi_mhz": 2483.5, "allow": ["ofdm", "dsss", "fsk"], "protocol": "ism24"},
+    {"name": "5 GHz WLAN", "lo_mhz": 5150, "hi_mhz": 5850, "allow": ["ofdm"], "protocol": "wlan5"},
+    {"name": "FM broadcast", "lo_mhz": 87.5, "hi_mhz": 108, "allow": ["fm"], "protocol": "fm"},
+    {"name": "B1 DL", "lo_mhz": 2110, "hi_mhz": 2170, "allow": ["ofdm", "fsk"], "protocol": "cellular"},
+    {"name": "B3 DL", "lo_mhz": 1805, "hi_mhz": 1880, "allow": ["ofdm", "fsk"], "protocol": "cellular", "gsm": true},
+    {"name": "B8 DL", "lo_mhz": 925, "hi_mhz": 960, "allow": ["ofdm", "fsk"], "protocol": "cellular", "gsm": true},
+    {"name": "B34 TDD", "lo_mhz": 2010, "hi_mhz": 2025, "allow": ["ofdm", "fsk"], "protocol": "cellular"},
+    {"name": "B39 TDD", "lo_mhz": 1880, "hi_mhz": 1920, "allow": ["ofdm", "fsk"], "protocol": "cellular"},
+    {"name": "B40 TDD", "lo_mhz": 2300, "hi_mhz": 2400, "allow": ["ofdm", "fsk"], "protocol": "cellular"},
+    {"name": "B41 / n41", "lo_mhz": 2496, "hi_mhz": 2690, "allow": ["ofdm", "fsk"], "protocol": "lte_nr"},
+    {"name": "n78", "lo_mhz": 3300, "hi_mhz": 3800, "allow": ["ofdm"], "protocol": "nr"},
+    {"name": "n79", "lo_mhz": 4400, "hi_mhz": 5000, "allow": ["ofdm"], "protocol": "nr"}
+  ]
+}
