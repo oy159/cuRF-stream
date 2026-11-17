@@ -260,8 +260,9 @@ python3 tools/ui_server.py --port 8080 -- build/cuda-release/bench/curf_classify
 | `tools/run_signal_checks.py` | M2 信号级回放、双路 300 秒实时验收（见 [链路与复现说明](docs/m2-pipeline.md)） |
 | `tools/run_display_checks.py` | M3 频段策略、真实模型回放与 ADS-B 联动检查（见 [显示策略说明](docs/m3-display.md)） |
 | `tools/run_room_checks.py` | M4 开发 / 验收种子分离的随机 RF 场景、负样本控制和标签错误率检查（见 [验收口径](docs/m4-evaluation.md)） |
-| `tools/run_live_checks.py` | M5 只接收的实采长测、实时网页、有界 feed、驱动与二级运行检查（见 [试跑记录](docs/m5-live.md)） |
+| `tools/run_live_checks.py` | M5 只接收实采长测、完整模型记录与有界显示合并、驱动与二级运行检查（见 [最终复验](docs/m5-dsss.md)） |
 | `tools/record_live_demo.cjs` | 可选 Playwright / Chrome 实采界面录像，依据实验 manifest 匹配频率与接收路 |
+| `tools/check_dsss_capture.py` | 独立于模型的 Barker-11 相干能量检查，支持 DSSS / OFDM 对照（见 [M5 复验](docs/m5-dsss.md)） |
 | `model/make_room_scene.py` | 分块生成 61.44 MS/s 室内 packed12 场景，保留每个 RX 的包级真值与源文件哈希 |
 | `curf_bench_engine` | 引擎优化阶梯、逐层耗时（`--ops`）、ncu 采集（`--profile`）、库基线 |
 | `curf_classify` | 端到端：吞吐、延迟分位、丢样、准确率 |
