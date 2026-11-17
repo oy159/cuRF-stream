@@ -54,8 +54,10 @@ namespace curf {
         std::vector<float> probs;     // softmax over the stage-2 classes
         float power_db = 0;           // mean power of the window before normalisation (dBFS)
         double t0_s = 0, t1_s = 0;   // model window in source sample time, FIR delay removed
+        double source_time_s = 0;    // end of the final raw hop, including a nonzero source origin or gaps
         double processing_ms = 0;    // final raw hop ready on host -> stage-2 result
         double observation_ms = 0;   // L / extracted rate; reported separately from processing
+        float activity_fraction = -1; // fraction of sampled L-point segments above 20% of peak energy; -1: span too short
         bool narrow = false;
     };
 

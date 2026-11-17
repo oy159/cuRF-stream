@@ -105,7 +105,7 @@ namespace curf {
         // engine input row [L][3] per window: strongest L-sample segment of src, unit RMS, bandwidth channel;
         // also the segment's mean power (full scale)
         __global__ void window_kernel(const WinReq *__restrict__ req, std::uint32_t L, float *__restrict__ in,
-                                      float *__restrict__ power, std::uint32_t *__restrict__ starts) {
+                                      float *__restrict__ power, std::uint32_t *__restrict__ starts, float *__restrict__ activity) {
             const WinReq r = req[blockIdx.x];
             __shared__ float e[kCand];
             __shared__ std::uint32_t best_start;
@@ -128,6 +128,9 @@ namespace curf {
                     if (e[c] > e[bi]) bi = c;
                 best_start = min(bi * stride, span);
                 starts[blockIdx.x] = best_start;
+                unsigned active = 0;
+                for (unsigned c = 0; c < n; ++c) if (e[c] >= .2f * e[bi]) ++active;
+                activity[blockIdx.x] = r.len >= 2 * L && e[bi] > 0 ? static_cast<float>(active) / n : -1.f;
             }
             __syncthreads();
             float acc = 0.f;
@@ -268,8 +271,8 @@ namespace curf {
             PinnedBuffer<WinReq> h_win;
             DeviceBuffer<std::uint32_t> d_start;
             PinnedBuffer<std::uint32_t> h_start;
-            DeviceBuffer<float> d_probs, d_power;
-            PinnedBuffer<float> h_probs, h_power, h_input;
+            DeviceBuffer<float> d_probs, d_power, d_activity;
+            PinnedBuffer<float> h_probs, h_power, h_input, h_activity;
             std::unique_ptr<Event> a_done, b_done;
             std::vector<SignalResult> out; // filled in phase B, probabilities after b_done
         };
@@ -320,8 +323,10 @@ namespace curf {
                 p.h_start = PinnedBuffer<std::uint32_t>(ms);
                 p.d_probs = DeviceBuffer<float>(ms * classes);
                 p.d_power = DeviceBuffer<float>(ms);
+                p.d_activity = DeviceBuffer<float>(ms);
                 p.h_probs = PinnedBuffer<float>(ms * classes);
                 p.h_power = PinnedBuffer<float>(ms);
+                p.h_activity = PinnedBuffer<float>(ms);
                 if (cfg.on_input) p.h_input = PinnedBuffer<float>(ms * L * 3);
                 p.a_done = std::make_unique<Event>();
                 p.b_done = std::make_unique<Event>();
@@ -573,6 +578,7 @@ namespace curf {
                 res.window = p.window; res.stream = p.sig[it.sig].band.stream; res.track = p.sig[it.sig].track;
                 res.fc_hz = it.kc * bin_hz / 4; res.bw_hz = it.bw; res.fs_hz = it.w * bin_hz;
                 res.narrow = it.w < L; res.observation_ms = 1000.0 * L / res.fs_hz;
+                res.source_time_s = (static_cast<double>(p.first) + nf) / fs;
                 double start = static_cast<double>(p.first);
                 tr.bw = it.bw; tr.estimate_window = p.window;
                 if (it.w >= L) {
@@ -610,7 +616,7 @@ namespace curf {
             if (!windows.empty()) {
                 std::copy(windows.begin(), windows.end(), p.h_win.get());
                 CURF_CUDA_CHECK(cudaMemcpyAsync(p.d_win.get(), p.h_win.get(), windows.size() * sizeof(WinReq), cudaMemcpyHostToDevice, s2));
-                window_kernel<<<static_cast<unsigned>(windows.size()), 256, 0, s2>>>(p.d_win.get(), L, eng.input(), p.d_power.get(), p.d_start.get());
+                window_kernel<<<static_cast<unsigned>(windows.size()), 256, 0, s2>>>(p.d_win.get(), L, eng.input(), p.d_power.get(), p.d_start.get(), p.d_activity.get());
                 CURF_CUDA_CHECK(cudaGetLastError());
                 if (!carry.empty()) {
                     append_kernel<<<dim3(4, static_cast<unsigned>(carry.size())), 256, 0, s2>>>(p.d_append.get() + append.size());
@@ -623,6 +629,7 @@ namespace curf {
                 CURF_CUDA_CHECK(cudaGetLastError());
                 CURF_CUDA_CHECK(cudaMemcpyAsync(p.h_probs.get(), p.d_probs.get(), windows.size() * classes * sizeof(float), cudaMemcpyDeviceToHost, s2));
                 CURF_CUDA_CHECK(cudaMemcpyAsync(p.h_power.get(), p.d_power.get(), windows.size() * sizeof(float), cudaMemcpyDeviceToHost, s2));
+                CURF_CUDA_CHECK(cudaMemcpyAsync(p.h_activity.get(), p.d_activity.get(), windows.size() * sizeof(float), cudaMemcpyDeviceToHost, s2));
                 CURF_CUDA_CHECK(cudaMemcpyAsync(p.h_start.get(), p.d_start.get(), windows.size() * sizeof(std::uint32_t), cudaMemcpyDeviceToHost, s2));
             }
             CURF_CUDA_CHECK(cudaEventRecord(p.b_done->e, s2));
@@ -637,6 +644,7 @@ namespace curf {
                 r.cls = static_cast<std::uint32_t>(std::max_element(pr, pr + classes) - pr);
                 r.prob = pr[r.cls];
                 r.power_db = 10.f * std::log10(std::max(p.h_power[i], 1e-20f));
+                r.activity_fraction = p.h_activity[i];
                 r.t0_s += p.h_start[i] / r.fs_hz;
                 r.t1_s += p.h_start[i] / r.fs_hz;
                 r.processing_ms = std::chrono::duration<double, std::milli>(Clock::now() - p.ready_at).count();

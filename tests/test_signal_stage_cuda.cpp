@@ -85,6 +85,8 @@ TEST_CASE("stage 2 finds centre and bandwidth of wide and narrow signals", "[cud
         x[k] += std::complex<double>(nd(rng), nd(rng));
     }
     const auto wire = pack(x);
+    constexpr std::uint64_t source_origin = std::uint64_t{1} << 30;
+    const double origin_s = static_cast<double>(source_origin) / kFs;
 
     SignalStageConfig cfg;
     cfg.engine.buckets = {1, 4, 16, 64};
@@ -101,13 +103,13 @@ TEST_CASE("stage 2 finds centre and bandwidth of wide and narrow signals", "[cud
         for (int b = 0; b < 2; ++b) {
             const std::size_t first = (std::size_t{static_cast<unsigned>(w)} * 2 + b) * kBlock;
             CURF_CUDA_CHECK(cudaMemcpy(d.get(), wire.data() + first * 3, d.bytes(), cudaMemcpyHostToDevice));
-            st.enqueue(0, d.get(), kBlock, first, nullptr);
+            st.enqueue(0, d.get(), kBlock, source_origin + first, nullptr);
             CURF_CUDA_CHECK(cudaDeviceSynchronize());
         }
         std::vector<WindowResult> det;
         for (auto c : wide_ch) det.push_back({0, c, 0, 0, 1e-3f});
         for (auto c : nar_ch) det.push_back({0, c, 0, 0, 1e-2f});
-        st.on_window(static_cast<std::uint64_t>(w), std::uint64_t{static_cast<unsigned>(w)} * kWindowSamples, det.data(), det.size());
+        st.on_window(static_cast<std::uint64_t>(w), source_origin + std::uint64_t{static_cast<unsigned>(w)} * kWindowSamples, det.data(), det.size());
         st.flush();
     }
     REQUIRE(!got.empty());
@@ -122,6 +124,8 @@ TEST_CASE("stage 2 finds centre and bandwidth of wide and narrow signals", "[cud
         CHECK(r.bw_hz < 1.25 * bw_wide);
         CHECK(r.fs_hz >= 2 * r.bw_hz * 0.99);
         CHECK(r.fs_hz < 3.01 * r.bw_hz);
+        CHECK(r.activity_fraction >= 0.f);
+        CHECK(r.activity_fraction <= 1.f);
     }
     for (const auto &r : by[false]) {
         INFO("narrow: fc " << r.fc_hz << " bw " << r.bw_hz << " fs " << r.fs_hz << " class " << r.cls);
@@ -132,8 +136,10 @@ TEST_CASE("stage 2 finds centre and bandwidth of wide and narrow signals", "[cud
     }
     for (const auto &r : by[false]) {
         CHECK(r.narrow);
+        CHECK(r.activity_fraction == -1.f);
         CHECK(std::abs(r.t1_s - r.t0_s - 1024 / r.fs_hz) < 1e-9);
         CHECK(r.processing_ms > 0);
+        CHECK(std::abs(r.source_time_s - origin_s - static_cast<double>(r.window+1)*kWindowSamples/kFs) < 1e-9);
     }
     REQUIRE(by[false].size() >= 2);
     for (std::size_t i = 1; i < by[false].size(); ++i) {
@@ -150,10 +156,10 @@ TEST_CASE("stage 2 finds centre and bandwidth of wide and narrow signals", "[cud
         if (!references.count(key)) {
             const auto w = static_cast<unsigned>(std::lround(r.fs_hz * kWindowSamples / kFs));
             auto &gold = references[key]; gold.resize(kWindows * w);
-            ref::resample_signal(kFs, r.fc_hz, extraction_ratio(kWindowSamples,w), decoded, 0, gold);
+            ref::resample_signal(kFs, r.fc_hz, extraction_ratio(kWindowSamples,w), decoded, source_origin, gold);
         }
         const auto &gold = references.at(key);
-        const auto begin = std::llround(r.t0_s * r.fs_hz + 16);
+        const auto begin = std::llround((r.t0_s - origin_s) * r.fs_hz + 16);
         REQUIRE(begin >= 0); REQUIRE(std::size_t(begin) + 1024 <= gold.size());
         double energy = 0;
         for (unsigned j = 0; j < 1024; ++j) {
