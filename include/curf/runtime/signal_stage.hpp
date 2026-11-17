@@ -12,6 +12,7 @@
 
 #include "curf/engine/engine.hpp"
 #include "curf/format.hpp"
+#include "curf/dsss_lock.hpp"
 #include "curf/runtime/classifier.hpp"
 
 #include <cuda_runtime.h>
@@ -52,6 +53,7 @@ namespace curf {
         std::function<void(const SignalResult &, std::span<const float>)> on_input; // optional diagnostic [L][3]
         std::function<void(const SignalBandEstimate &, std::span<const float>)> on_band; // optional existing host PSD bins
         bool current_hop_bandwidth = true; // broad requests: estimate from this hop; extraction keeps FIR history
+        bool dsss_frequency_lock = false; // experimental Barker-11 carrier evidence; does not change model input/probabilities
         bool drop_when_busy = true; // offline replay can back-pressure instead of skipping a window
         engine::EngineConfig engine;           // buckets: the largest is the max windows per stage-2 run
     };
@@ -60,6 +62,9 @@ namespace curf {
         std::uint64_t window = 0;     // stage-1 window it came from (the last one, for narrow signals)
         std::uint32_t stream = 0, track = 0;
         double fc_hz = 0;             // centre, relative to the tuned frequency
+        double extraction_fc_hz = 0;  // actual extraction oscillator, before optional structural frequency correction
+        DsssFrequencyEstimate dsss_frequency;
+        bool dsss_frequency_tested = false;
         double bw_hz = 0;             // 99 % occupied bandwidth estimate (the model's side input)
         double fs_hz = 0;             // rate the signal was extracted at
         std::uint32_t cls = 0;

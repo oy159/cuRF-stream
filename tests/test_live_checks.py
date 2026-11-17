@@ -41,8 +41,9 @@ class LiveChecksTests(unittest.TestCase):
             fake.chmod(0o700)
             case={"name":"cell900","freq":939e6,"gain":40,"threshold":6,"rx":[2]}
             with self.assertRaisesRegex(RuntimeError,"feed limit"):
-                record_case(fake,root,root/"trial",case,300.,Hub(),max_bytes=8)
+                record_case(fake,root,root/"trial",case,300.,Hub(),max_bytes=8,dsss_frequency_lock=True)
             self.assertTrue((root/"trial/command.json").exists())
+            self.assertIn("--stage2-dsss-lock",json.loads((root/"trial/command.json").read_text())["argv"])
             self.assertTrue((root/"trial/display.feed").exists())
             self.assertFalse((root/"trial/result.json").exists())
 

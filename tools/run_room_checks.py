@@ -44,6 +44,7 @@ def main():
     ap.add_argument("--split",choices=("dev","acceptance"),required=True)
     ap.add_argument("--policy",type=Path)
     ap.add_argument("--bandwidth-estimator",choices=("current","history"),default="current")
+    ap.add_argument("--dsss-frequency-lock",action="store_true",help="experimental Barker-11 carrier frequency evidence")
     ap.add_argument("--count",type=int,help="positive scenes; default dev 32, acceptance 96")
     ap.add_argument("--seed-base",type=int,help="new scene seed range for a separately frozen run")
     ap.add_argument("--seconds",type=float,default=.8)
@@ -64,9 +65,11 @@ def main():
     source_files=["tools/signal_policy.py","tools/room_evaluation.py","tools/run_room_checks.py","tools/policy/default.json",
                   "model/make_room_scene.py","model/make_scene.py","model/curf_model/widesig.py","model/curf_model/scoring.py","bench/classify.cpp",
                   "src/runtime/signal_stage.cu","include/curf/runtime/signal_stage.hpp","src/kernels/extraction_bank.cu",
-                  "include/curf/cuda/extraction_bank.hpp"]
+                  "include/curf/cuda/extraction_bank.hpp","include/curf/dsss_lock.hpp","include/curf/cuda/dsss_lock.hpp",
+                  "src/reference/dsss_lock.cpp","src/kernels/dsss_lock.cu"]
     manifest={"version":1,"split":a.split,"seconds":a.seconds,"cases":plan,"policy":config,"policy_sha256":config_hash(config),
               "bandwidth_estimator":a.bandwidth_estimator,
+              "dsss_frequency_lock":a.dsss_frequency_lock,
               "binary_sha256":file_hash(a.bin),"model_sha256":file_hash(a.model/"s2.curf"),"emissions_sha256":file_hash(a.emissions),
               "code_sha256":{p:file_hash(ROOT/p) for p in source_files},"command":sys.argv,
               "software":{"python":platform.python_version(),"numpy":np.__version__,"scipy":scipy.__version__},
@@ -77,8 +80,8 @@ def main():
             ap.error("output already has a frozen manifest; use --resume or a new directory")
         if old["cases"]!=json.loads(json.dumps(plan)) or old["seconds"]!=a.seconds:
             ap.error("case plan differs from frozen manifest")
-        if not a.rescore and any(old.get(k)!=manifest[k] for k in ("policy_sha256","binary_sha256","model_sha256","emissions_sha256","code_sha256","bandwidth_estimator")):
-            ap.error("resume requires identical policy, code, binary, input index and bandwidth estimator")
+        if not a.rescore and any(old.get(k)!=manifest[k] for k in ("policy_sha256","binary_sha256","model_sha256","emissions_sha256","code_sha256","bandwidth_estimator","dsss_frequency_lock")):
+            ap.error("resume requires identical policy, code, binary, input index and frequency estimators")
     else:
         if a.rescore:
             ap.error("dev rescore requires an existing run")
@@ -108,6 +111,8 @@ def main():
                  "--stage2",str(a.model.resolve()),"--freq",str(truth["freq"]),"--seconds","0","--realtime","--drop",
                  "--stage2-bandwidth",a.bandwidth_estimator,
                  "--band-mhz","44","--ui-out",str(out/"raw.feed")]
+            if a.dsss_frequency_lock:
+                cmd += ["--stage2-dsss-lock"]
             (out/"command.json").write_text(json.dumps(cmd,indent=2))
             with (out/"runtime.json").open("w") as f:
                 subprocess.run(cmd,check=True,stdout=f)

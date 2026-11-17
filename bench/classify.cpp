@@ -14,7 +14,9 @@
 //                                                    extracted from the raw samples at 2-3x its bandwidth and
 //                                                    classified by DIR/s2.curf; {"sig":{...}} lines in the feed)
 //                 [--stage2-band-dump PATH]  (finite offline file replay only; first 1024 band estimates + PSD)
+//                 [--stage2-input-dump PATH] (finite offline replay only; first 128 broad model input rows)
 //                 [--stage2-bandwidth history|current]  (bandwidth estimator, extraction FIR is unchanged)
+//                 [--stage2-dsss-lock] (experimental Barker-11 carrier frequency evidence)
 //                 [--adsb [HZ]] [--adsb-stream N] [--adsb-threshold T]  (Mode S / ADS-B demodulator on the raw
 //                                                    samples of stream N, carrier HZ (default 1090e6); decoded
 //                                                    messages go to the display feed as {"adsb":{...}} lines.
@@ -175,7 +177,9 @@ int main(int argc, char **argv) {
     bool stage2_int8 = false;
     std::string stage2_tune_cache;
     std::string stage2_band_dump;
+    std::string stage2_input_dump;
     std::string stage2_bandwidth_mode = "current";
+    bool stage2_dsss_lock = false;
     std::uint32_t stage2_max_signals = 64, stage2_max_tracks = 256;
     std::uint32_t stage2_pending = 3;
     std::size_t stage2_scratch_mib = 32;
@@ -243,7 +247,9 @@ int main(int argc, char **argv) {
         else if (a == "--stage2-int8") stage2_int8 = true;
         else if (a == "--stage2-tune-cache") stage2_tune_cache = next();
         else if (a == "--stage2-band-dump") stage2_band_dump = next();
+        else if (a == "--stage2-input-dump") stage2_input_dump = next();
         else if (a == "--stage2-bandwidth") stage2_bandwidth_mode = next();
+        else if (a == "--stage2-dsss-lock") stage2_dsss_lock = true;
         else if (a == "--stage2-max-signals") stage2_max_signals = static_cast<std::uint32_t>(std::stoul(next()));
         else if (a == "--stage2-max-tracks") stage2_max_tracks = static_cast<std::uint32_t>(std::stoul(next()));
         else if (a == "--stage2-scratch-mib") stage2_scratch_mib = std::stoull(next());
@@ -266,8 +272,8 @@ int main(int argc, char **argv) {
     if (stage2_bandwidth_mode != "history" && stage2_bandwidth_mode != "current") {
         std::fprintf(stderr,"stage-2 bandwidth mode must be history or current\n"); return 2;
     }
-    if (!stage2_band_dump.empty() && (source != "file" || loop || realtime || stage2_dir.empty() || cfg.seconds != 0)) {
-        std::fprintf(stderr,"band diagnostics require --source file --stage2 DIR --seconds 0, without --loop or --realtime\n");
+    if ((!stage2_band_dump.empty() || !stage2_input_dump.empty()) && (source != "file" || loop || realtime || stage2_dir.empty() || cfg.seconds != 0)) {
+        std::fprintf(stderr,"stage-2 diagnostics require --source file --stage2 DIR --seconds 0, without --loop or --realtime\n");
         return 2;
     }
     engine::Model model;
@@ -374,7 +380,7 @@ int main(int argc, char **argv) {
                      static_cast<unsigned long long>(ui_every), source.c_str(), rx.c_str(), stage2_dir.empty() ? "false" : "true",
                      stage2_dir.empty() || stage1_classify ? "true" : "false");
         if (!stage2_dir.empty())
-            std::fprintf(ui, ",\"signal_classes\":[\"noise\",\"ofdm\",\"fsk\",\"4fsk\",\"psk\",\"qam\",\"dsss\",\"chirp\",\"ook\",\"am\",\"fm\",\"pulse\",\"unknown\"],\"bandwidth_estimator\":\"%s\"",stage2_bandwidth_mode.c_str());
+            std::fprintf(ui, ",\"signal_classes\":[\"noise\",\"ofdm\",\"fsk\",\"4fsk\",\"psk\",\"qam\",\"dsss\",\"chirp\",\"ook\",\"am\",\"fm\",\"pulse\",\"unknown\"],\"bandwidth_estimator\":\"%s\",\"dsss_frequency_lock\":%s",stage2_bandwidth_mode.c_str(),stage2_dsss_lock?"true":"false");
         if (source == "omnicore")
             std::fprintf(ui, ",\"receiver\":{\"device\":%s,\"gain\":%.6g,\"agc\":%u,\"bandwidth\":%.6g,\"iq_bits\":%u,\"noise_shape\":%s}",
                          json_quote(receiver_name).c_str(), gain, agc, bandwidth > 0 ? bandwidth : std::min(fmt.sample_rate, 56e6),
@@ -411,11 +417,18 @@ int main(int argc, char **argv) {
     }
     // stage 2
     std::unique_ptr<std::FILE,decltype(&std::fclose)> band_file(nullptr,&std::fclose);
+    std::unique_ptr<std::FILE,decltype(&std::fclose)> input_file(nullptr,&std::fclose);
     std::uint64_t band_seen = 0, band_written = 0;
+    std::uint64_t input_seen = 0, input_written = 0;
     if (!stage2_band_dump.empty()) {
         band_file.reset(std::fopen(stage2_band_dump.c_str(),"wx"));
         if (!band_file) { std::perror(stage2_band_dump.c_str()); return 1; }
         std::fprintf(band_file.get(),"{\"meta\":{\"version\":1,\"limit\":1024,\"freq\":%.17g,\"rate\":%.17g}}\n",freq_given?freq:0.,fmt.sample_rate);
+    }
+    if (!stage2_input_dump.empty()) {
+        input_file.reset(std::fopen(stage2_input_dump.c_str(),"wx"));
+        if (!input_file) { std::perror(stage2_input_dump.c_str()); return 1; }
+        std::fprintf(input_file.get(),"{\"meta\":{\"version\":1,\"limit\":128,\"freq\":%.17g,\"layout\":\"Lx3\",\"type\":\"fp32_before_engine_cast\"}}\n",freq_given?freq:0.);
     }
     std::unique_ptr<engine::Model> s2_model;
     std::unique_ptr<SignalStage> stage2;
@@ -435,6 +448,17 @@ int main(int argc, char **argv) {
         sc.engine.tune_iters = 10;
         sc.engine.tune_cache = stage2_tune_cache;
         sc.current_hop_bandwidth = stage2_bandwidth_mode == "current";
+        sc.dsss_frequency_lock = stage2_dsss_lock;
+        if (input_file) sc.on_input = [&](const SignalResult &r, std::span<const float> input) {
+            if (r.bw_hz<8e6 || r.bw_hz>24e6 || r.narrow) return;
+            ++input_seen;
+            if (input_written == 128) return;
+            ++input_written; auto *f=input_file.get();
+            std::fprintf(f,"{\"w\":%llu,\"s\":%u,\"id\":%u,\"f\":%.9g,\"bw\":%.9g,\"fs\":%.9g,\"t0\":%.9g,\"c\":%u,\"p\":%.8g,\"input\":[",
+                         static_cast<unsigned long long>(r.window),r.stream,r.track,r.extraction_fc_hz,r.bw_hz,r.fs_hz,r.t0_s,r.cls,static_cast<double>(r.prob));
+            for (std::size_t i=0;i<input.size();++i) std::fprintf(f,"%s%.9g",i?",":"",static_cast<double>(input[i]));
+            std::fprintf(f,"]}\n");
+        };
         if (band_file) sc.on_band = [&](const SignalBandEstimate &b, std::span<const float> power) {
             ++band_seen;
             if (band_written == 1024) return;
@@ -459,7 +483,7 @@ int main(int argc, char **argv) {
                 const std::size_t offset = cfg.noise_shape.size() == M ? 0 : std::size_t{r.stream} * M;
                 for (unsigned k = 0; k < M; ++k) {
                     const double f = static_cast<double>(k) * fmt.sample_rate / M;
-                    if (std::abs(std::remainder(f-r.fc_hz, fmt.sample_rate)) <= .375*r.fs_hz) {
+                    if (std::abs(std::remainder(f-r.extraction_fc_hz, fmt.sample_rate)) <= .375*r.fs_hz) {
                         sum += cfg.noise_shape[offset+k]; ++count;
                     }
                 }
@@ -479,7 +503,12 @@ int main(int argc, char **argv) {
                          idx[1], static_cast<double>(r.probs[idx[1]]), idx[2], static_cast<double>(r.probs[idx[2]]),
                          r.source_time_s, static_cast<double>(r.activity_fraction));
             for (std::size_t i = 0; i < r.probs.size(); ++i) std::fprintf(ui, "%s%.7g", i ? "," : "", static_cast<double>(r.probs[i]));
-            std::fprintf(ui, "],\"snr_db\":%.3f}}\n", snr_db);
+            std::fprintf(ui, "],\"snr_db\":%.3f", snr_db);
+            if (r.dsss_frequency_tested)
+                std::fprintf(ui, ",\"extraction_f\":%.0f,\"dsss_frequency\":{\"offset_hz\":%.0f,\"coherence\":%.6f,\"contrast\":%.6f,\"retained_power\":%.6f,\"valid\":%s}",
+                             r.extraction_fc_hz,static_cast<double>(r.dsss_frequency.offset_hz),static_cast<double>(r.dsss_frequency.coherence),
+                             static_cast<double>(r.dsss_frequency.contrast),static_cast<double>(r.dsss_frequency.retained_power),r.dsss_frequency.valid()?"true":"false");
+            std::fprintf(ui, "}}\n");
         });
         cfg.taps.push_back(stage2.get());
         std::fprintf(stderr, "stage 2: %s%s\n", stage2_dir.c_str(), stage2_int8 ? " (INT8)" : "");
@@ -596,6 +625,13 @@ int main(int argc, char **argv) {
                      static_cast<unsigned long long>(band_seen),static_cast<unsigned long long>(band_written),band_seen>band_written?"true":"false");
         if (std::fflush(band_file.get()) || std::ferror(band_file.get())) {
             std::fprintf(stderr,"band diagnostic write failed\n"); return 1;
+        }
+    }
+    if (input_file) {
+        std::fprintf(input_file.get(),"{\"end\":{\"observed\":%llu,\"written\":%llu,\"truncated\":%s}}\n",
+                     static_cast<unsigned long long>(input_seen),static_cast<unsigned long long>(input_written),input_seen>input_written?"true":"false");
+        if (std::fflush(input_file.get()) || std::ferror(input_file.get())) {
+            std::fprintf(stderr,"model input diagnostic write failed\n"); return 1;
         }
     }
     if (ui) {

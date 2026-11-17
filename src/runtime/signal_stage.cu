@@ -2,6 +2,7 @@
 
 #include "curf/cuda/memory.hpp"
 #include "curf/cuda/extraction_bank.hpp"
+#include "curf/cuda/dsss_lock.hpp"
 
 #include <cufft.h>
 
@@ -221,6 +222,7 @@ namespace curf {
         engine::Engine eng;
         cudaStream_t s2 = nullptr;
         std::unique_ptr<cuda::ExtractionBank> bank;
+        std::unique_ptr<cuda::DsssFrequencyLock> dsss_lock;
         std::uint64_t origin = ~std::uint64_t{0};
         using Clock = std::chrono::steady_clock;
         std::vector<double> narrow_latency, wide_latency;
@@ -278,6 +280,13 @@ namespace curf {
             PinnedBuffer<std::uint32_t> h_start;
             DeviceBuffer<float> d_probs, d_power, d_activity;
             PinnedBuffer<float> h_probs, h_power, h_input, h_activity;
+            DeviceBuffer<cuda::DsssLockRequest> d_dsss_jobs;
+            PinnedBuffer<cuda::DsssLockRequest> h_dsss_jobs;
+            DeviceBuffer<cf32> d_dsss_wave;
+            DeviceBuffer<float> d_dsss_scores;
+            DeviceBuffer<DsssFrequencyEstimate> d_dsss_result;
+            PinnedBuffer<DsssFrequencyEstimate> h_dsss_result;
+            std::size_t dsss_count = 0;
             std::unique_ptr<Event> a_done, b_done;
             std::vector<SignalResult> out; // filled in phase B, probabilities after b_done
         };
@@ -299,6 +308,8 @@ namespace curf {
             if (in.channels != 3 || in.length != c.length) throw std::invalid_argument("signal stage: model input must be [L][3]");
             L = c.length;
             classes = model.tensors[model.output].channels;
+            if (c.dsss_frequency_lock && (L != barker11::length || classes != 13))
+                throw std::invalid_argument("Barker frequency correction requires the run4 [1024][3], 13-class model");
             fs = f.sample_rate;
             bin_hz = fs / nf;
             CURF_CUDA_CHECK(cudaStreamCreateWithFlags(&s2, cudaStreamNonBlocking));
@@ -312,6 +323,14 @@ namespace curf {
             tracks.resize(c.max_tracks);
             track_buf = DeviceBuffer<float2>(std::size_t{c.max_tracks} * L * 2);
             bank = std::make_unique<cuda::ExtractionBank>(nf, f.channels, fs);
+            if (c.dsss_frequency_lock) {
+                std::vector<double> rates;
+                for (std::uint32_t w = 1; w <= nf; w *= 2) {
+                    for (auto v : {w, w + w/2})
+                        if (v <= nf && barker11::supports(v*bin_hz)) rates.push_back(v*bin_hz);
+                }
+                if (!rates.empty()) dsss_lock = std::make_unique<cuda::DsssFrequencyLock>(rates);
+            }
             pend.resize(c.pending);
             const std::size_t ms = c.max_signals;
             for (auto &p : pend) {
@@ -335,6 +354,14 @@ namespace curf {
                 p.h_power = PinnedBuffer<float>(ms);
                 p.h_activity = PinnedBuffer<float>(ms);
                 if (cfg.on_input) p.h_input = PinnedBuffer<float>(ms * L * 3);
+                if (dsss_lock) {
+                    p.d_dsss_jobs = DeviceBuffer<cuda::DsssLockRequest>(ms);
+                    p.h_dsss_jobs = PinnedBuffer<cuda::DsssLockRequest>(ms);
+                    p.d_dsss_wave = DeviceBuffer<cf32>(ms*barker11::waveform);
+                    p.d_dsss_scores = DeviceBuffer<float>(ms*barker11::frequencies);
+                    p.d_dsss_result = DeviceBuffer<DsssFrequencyEstimate>(ms);
+                    p.h_dsss_result = PinnedBuffer<DsssFrequencyEstimate>(ms);
+                }
                 p.a_done = std::make_unique<Event>();
                 p.b_done = std::make_unique<Event>();
             }
@@ -670,6 +697,7 @@ namespace curf {
                 SignalResult res;
                 res.window = p.window; res.stream = p.sig[it.sig].band.stream; res.track = p.sig[it.sig].track;
                 res.fc_hz = it.kc * bin_hz / 4; res.bw_hz = it.bw; res.fs_hz = it.w * bin_hz;
+                res.extraction_fc_hz = res.fc_hz;
                 res.narrow = it.w < L; res.observation_ms = 1000.0 * L / res.fs_hz;
                 res.source_time_s = (static_cast<double>(p.first) + nf) / fs;
                 double start = static_cast<double>(p.first);
@@ -698,6 +726,12 @@ namespace curf {
                 res.t1_s = res.t0_s + static_cast<double>(L) / res.fs_hz;
                 p.out.push_back(std::move(res));
             }
+            p.dsss_count = 0;
+            if (dsss_lock) for (std::size_t i = 0; i < p.out.size(); ++i) {
+                const auto &r = p.out[i];
+                if (!r.narrow && r.bw_hz >= 8e6 && r.bw_hz <= 24e6 && barker11::supports(r.fs_hz))
+                    p.h_dsss_jobs[p.dsss_count++] = {static_cast<unsigned>(i), dsss_lock->rate_index(r.fs_hz)};
+            }
             for (std::size_t i = 0; i < append.size(); ++i) p.h_append[i] = append[i];
             for (std::size_t i = 0; i < carry.size(); ++i) p.h_append[append.size() + i] = carry[i];
             if (!append.empty() || !carry.empty())
@@ -717,6 +751,12 @@ namespace curf {
                 }
                 if (cfg.on_input)
                     CURF_CUDA_CHECK(cudaMemcpyAsync(p.h_input.get(), eng.input(), windows.size() * L * 3 * sizeof(float), cudaMemcpyDeviceToHost, s2));
+                if (p.dsss_count) {
+                    CURF_CUDA_CHECK(cudaMemcpyAsync(p.d_dsss_jobs.get(), p.h_dsss_jobs.get(), p.dsss_count*sizeof(cuda::DsssLockRequest), cudaMemcpyHostToDevice, s2));
+                    dsss_lock->run(eng.input(), p.d_dsss_jobs.get(), static_cast<unsigned>(p.dsss_count),
+                                   p.d_dsss_wave.get(), p.d_dsss_scores.get(), p.d_dsss_result.get(), s2);
+                    CURF_CUDA_CHECK(cudaMemcpyAsync(p.h_dsss_result.get(), p.d_dsss_result.get(), p.dsss_count*sizeof(DsssFrequencyEstimate), cudaMemcpyDeviceToHost, s2));
+                }
                 eng.run(static_cast<int>(windows.size()), s2);
                 softmax_kernel<<<(static_cast<unsigned>(windows.size()) + 127) / 128, 128, 0, s2>>>(eng.logits(), static_cast<std::uint32_t>(windows.size()), classes, p.d_probs.get());
                 CURF_CUDA_CHECK(cudaGetLastError());
@@ -730,12 +770,21 @@ namespace curf {
         }
 
         void deliver(Pending &p) {
+            for (std::size_t j = 0; j < p.dsss_count; ++j) {
+                auto &r = p.out[p.h_dsss_jobs[j].row];
+                r.dsss_frequency = p.h_dsss_result[j];
+                r.dsss_frequency_tested = true;
+            }
             for (std::size_t i = 0; i < p.out.size(); ++i) {
                 SignalResult &r = p.out[i];
                 const float *pr = p.h_probs.get() + i * classes;
                 r.probs.assign(pr, pr + classes);
                 r.cls = static_cast<std::uint32_t>(std::max_element(pr, pr + classes) - pr);
                 r.prob = pr[r.cls];
+                // Evidence is tied to this exact IQ window. No channel-grid snapping,
+                // inherited track centre, or changes to the raw classifier probabilities.
+                if (r.cls == 6 && r.prob >= .9f && r.dsss_frequency_tested && r.dsss_frequency.valid())
+                    r.fc_hz = r.extraction_fc_hz + r.dsss_frequency.offset_hz;
                 r.power_db = 10.f * std::log10(std::max(p.h_power[i], 1e-20f));
                 r.activity_fraction = p.h_activity[i];
                 r.t0_s += p.h_start[i] / r.fs_hz;

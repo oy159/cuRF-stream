@@ -430,6 +430,7 @@ TEST_CASE("stage 2 retains model results across bounded in-flight windows", "[cu
     SignalStageConfig cfg;
     SECTION("three pending windows") { cfg.pending = 3; }
     SECTION("eight pending windows") { cfg.pending = 8; }
+    SECTION("eight pending windows with independent Barker evidence") { cfg.pending = 8; cfg.dsss_frequency_lock = true; }
     cfg.scratch_complex = 1u << 20;
     cfg.reclassify_windows = 1; cfg.drop_when_busy = false;
     cfg.engine.buckets = {1,4,16,64}; cfg.engine.autotune = false;
@@ -440,11 +441,22 @@ TEST_CASE("stage 2 retains model results across bounded in-flight windows", "[cu
     for (auto &x : samples) x = {noise(rng),noise(rng)};
     const auto wire = pack(samples);
     std::vector<SignalResult> got;
+    unsigned evidence_checked = 0;
+    if (cfg.dsss_frequency_lock) cfg.on_input = [&](const SignalResult &r, std::span<const float> input) {
+        REQUIRE(r.dsss_frequency_tested);
+        const auto expected = ref::dsss_frequency(input,r.fs_hz);
+        CHECK(r.dsss_frequency.valid() == expected.valid());
+        CHECK(std::abs(r.dsss_frequency.coherence-expected.coherence) < .005f);
+        CHECK(std::abs(r.dsss_frequency.contrast-expected.contrast) < .01f);
+        CHECK_FALSE(r.dsss_frequency.valid());
+        CHECK(r.fc_hz == r.extraction_fc_hz);
+        ++evidence_checked;
+    };
     SignalStage stage(cfg,model,{WireFormat::packed12,1,kFs},kBlock,
                       [&](const SignalResult &r) { got.push_back(r); });
     cuda::DeviceBuffer<std::uint8_t> d(kBlock*3);
     std::vector<WindowResult> det;
-    for (auto k : channels_of(0,1e6)) det.push_back({0,k,0,0,1e-3f});
+    for (auto k : channels_of(0,cfg.dsss_frequency_lock?16e6:1e6)) det.push_back({0,k,0,0,1e-3f});
     for (unsigned w = 0; w < windows; ++w) {
         for (unsigned b = 0; b < 2; ++b) {
             const std::size_t first = (std::size_t{w}*2+b)*kBlock;
@@ -458,6 +470,7 @@ TEST_CASE("stage 2 retains model results across bounded in-flight windows", "[cu
     }
     stage.flush();
     REQUIRE(got.size() == windows);
+    if (cfg.dsss_frequency_lock) CHECK(evidence_checked == windows);
     for (unsigned w = 0; w < windows; ++w) {
         CHECK(got[w].window == w);
         double sum = 0;
