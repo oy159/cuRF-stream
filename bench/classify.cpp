@@ -10,6 +10,9 @@
 //                 [--ui-out PATH] [--ui-every N]   (display feed, see tools/ui_server.py)
 //                 [--noise-shape F] [--calibrate-noise F]  (front-end noise shape: use / measure with no signal)
 //                 [--dc-guard N]  (channels at DC never reported; omnicore default 1)
+//                 [--stage2 DIR] [--stage2-int8] [--stage1-classify]  (signal-level stage 2: adjacent detected channels -> one signal,
+//                                                    extracted from the raw samples at 2-3x its bandwidth and
+//                                                    classified by DIR/s2.curf; {"sig":{...}} lines in the feed)
 //                 [--adsb [HZ]] [--adsb-stream N] [--adsb-threshold T]  (Mode S / ADS-B demodulator on the raw
 //                                                    samples of stream N, carrier HZ (default 1090e6); decoded
 //                                                    messages go to the display feed as {"adsb":{...}} lines.
@@ -28,6 +31,7 @@
 #include "curf/cuda/adsb.hpp"
 #include "curf/engine/model.hpp"
 #include "curf/runtime/classifier.hpp"
+#include "curf/runtime/signal_stage.hpp"
 #include "curf/sources.hpp"
 #ifdef CURF_HAVE_OMNICORE
 #include "curf/omnicore_source.hpp"
@@ -147,6 +151,9 @@ int main(int argc, char **argv) {
     [[maybe_unused]] std::string tx_file;
     [[maybe_unused]] double tx_atten = 89.75;
     bool int8 = false;
+    std::string stage2_dir;      // stage-2 model directory (s2.curf, s2.golden)
+    bool stage2_int8 = false;
+    bool stage1_classify = false;
     double adsb_hz = 0;          // > 0: ADS-B demodulator on the side, carrier frequency
     cuda::AdsbConfig adsb_cfg;
     bool fp32_input = false;     // INT8 engine, calibrated on the model directory's golden windows
@@ -206,6 +213,9 @@ int main(int argc, char **argv) {
         else if (a == "--label") label = next();
         else if (a == "--int8") int8 = true;
         else if (a == "--adsb") adsb_hz = i + 1 < argc && argv[i + 1][0] != '-' ? std::stod(next()) : 1090e6;
+        else if (a == "--stage2") stage2_dir = next();
+        else if (a == "--stage2-int8") stage2_int8 = true;
+        else if (a == "--stage1-classify") stage1_classify = true;
         else if (a == "--adsb-stream") adsb_cfg.stream = static_cast<std::uint32_t>(std::stoul(next()));
         else if (a == "--adsb-threshold") adsb_cfg.threshold = std::stof(next());
         else if (a == "--fp32-input") fp32_input = true;
@@ -214,8 +224,15 @@ int main(int argc, char **argv) {
         else { std::fprintf(stderr, "unknown option %s\n", a.c_str()); return 2; }
     }
 
-    const auto model = engine::Model::load(std::filesystem::path(model_dir) / "amc.curf");
-    if (int8) {
+    engine::Model model;
+    if (stage2_dir.empty() || stage1_classify) {
+        model = engine::Model::load(std::filesystem::path(model_dir) / "amc.curf");
+    } else {
+        // Detection-only stage 1 needs no trained model. Keep its legacy callback shape as a descriptor.
+        model.tensors = {{2,cfg.window,"input"}, {1,1,"detection"}};
+        model.input = 0; model.output = 1;
+    }
+    if (int8 && (stage2_dir.empty() || stage1_classify)) {
         cfg.engine.int8 = true;
         cfg.engine.half_input = !fp32_input;
         cfg.engine.calibration = engine::Golden::load(std::filesystem::path(model_dir) / "amc.golden", model).input;
@@ -225,7 +242,7 @@ int main(int argc, char **argv) {
     OmniCoreSource *och = nullptr;
 #endif
     if (source == "file") {
-        src = std::make_unique<FileSource>(FileConfig{file, fmt, loop});
+        src = std::make_unique<FileSource>(FileConfig{file, fmt, loop, realtime});
     } else if (source == "omnicore") {
 #ifdef CURF_HAVE_OMNICORE
         OmniCoreConfig oc;
@@ -330,11 +347,45 @@ int main(int argc, char **argv) {
             return 2;
         }
         adsb_tap = std::make_unique<AdsbTap>(adsb_cfg, fmt, cfg.block_frames, cfg.depth, ui);
-        cfg.tap = adsb_tap.get();
+        cfg.taps.push_back(adsb_tap.get());
         std::fprintf(stderr, "adsb: stream %u, carrier at %+.3f MHz from the centre\n", adsb_cfg.stream, adsb_cfg.offset_hz / 1e6);
     }
+    // stage 2
+    std::unique_ptr<engine::Model> s2_model;
+    std::unique_ptr<SignalStage> stage2;
+    if (!stage2_dir.empty()) {
+        s2_model = std::make_unique<engine::Model>(engine::Model::load(std::filesystem::path(stage2_dir) / "s2.curf"));
+        SignalStageConfig sc;
+        sc.channels = cfg.channelizer.channels;
+        sc.window_frames = cfg.window;
+        sc.drop_when_busy = cfg.drop_when_full;
+        sc.engine.buckets = {1, 4, 16, 64};
+        sc.engine.tune_iters = 10;
+        if (stage2_int8) {
+            sc.engine.int8 = true;
+            sc.engine.calibration = engine::Golden::load(std::filesystem::path(stage2_dir) / "s2.golden", *s2_model).input;
+        }
+        cfg.classify_channels = stage1_classify;
+        cfg.detect.peak_detection = true;
+        const double rate = fmt.sample_rate;
+        stage2 = std::make_unique<SignalStage>(sc, *s2_model, fmt, cfg.block_frames, [ui, rate](const SignalResult &r) {
+            if (!ui) return;
+            std::vector<std::size_t> idx(r.probs.size());
+            for (std::size_t i = 0; i < idx.size(); ++i) idx[i] = i;
+            std::partial_sort(idx.begin(), idx.begin() + std::min<std::size_t>(3, idx.size()), idx.end(),
+                              [&](std::size_t a, std::size_t b) { return r.probs[a] > r.probs[b]; });
+            std::fprintf(ui, "{\"sig\":{\"w\":%llu,\"s\":%u,\"id\":%u,\"f\":%.0f,\"bw\":%.0f,\"fs\":%.0f,\"t0\":%.9f,\"t1\":%.9f,\"processing_ms\":%.4f,\"observation_ms\":%.4f,\"c\":%u,\"p\":%.3f,\"db\":%.1f,\"top\":[[%zu,%.3f],[%zu,%.3f],[%zu,%.3f]]}}\n",
+                         static_cast<unsigned long long>(r.window), r.stream, r.track, r.fc_hz, r.bw_hz, r.fs_hz, r.t0_s, r.t1_s, r.processing_ms, r.observation_ms, r.cls,
+                         static_cast<double>(r.prob), static_cast<double>(r.power_db), idx[0], static_cast<double>(r.probs[idx[0]]),
+                         idx[1], static_cast<double>(r.probs[idx[1]]), idx[2], static_cast<double>(r.probs[idx[2]]));
+            (void)rate;
+        });
+        cfg.taps.push_back(stage2.get());
+        std::fprintf(stderr, "stage 2: %s%s\n", stage2_dir.c_str(), stage2_int8 ? " (INT8)" : "");
+    }
     std::string line;
-    const auto st = run_classifier(*src, model, cfg, [&](std::uint64_t w, std::uint64_t first, const WindowResult *r, std::size_t n) {
+    const auto st = run_classifier(*src, model, cfg, [&](std::uint64_t w, std::uint64_t first, const WindowResult *r, std::size_t n, auto ready_at) {
+        if (stage2) stage2->on_window(w, first, r, n, ready_at);
         if (ui) { // per channel: vote of this row's windows
             if (w % ui_every == 0) {
                 std::fill(ui_vote.begin(), ui_vote.end(), 0.f);
@@ -435,6 +486,10 @@ int main(int argc, char **argv) {
     }
 #endif
     if (adsb_tap) js.insert(1, adsb_tap->json());
+    if (stage2) {
+        stage2->flush();
+        js.insert(1, "\"stage2\":" + stage2->stats().to_json() + ",");
+    }
     if (ui) {
         std::fprintf(ui, "{\"end\":%s}\n", st.to_json().c_str());
         std::fclose(ui);

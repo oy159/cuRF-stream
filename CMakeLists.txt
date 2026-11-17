@@ -104,7 +104,8 @@ if(CURF_HAVE_CUDA)
         src/kernels/block_int8.cu
         src/engine/engine.cpp
         src/runtime/pipeline.cpp
-        src/runtime/classifier.cu)
+        src/runtime/classifier.cu
+        src/runtime/signal_stage.cu)
     target_include_directories(curf_cuda PUBLIC include)
     target_link_libraries(curf_cuda PUBLIC curf_core CUDA::cudart CUDA::cufft PRIVATE curf_warnings)
     if(TARGET CUDA::nvtx3)

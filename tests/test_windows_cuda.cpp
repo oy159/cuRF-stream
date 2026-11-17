@@ -68,6 +68,28 @@ TEST_CASE("detection finds the loud channels with either compaction", "[cuda][wi
     }
 }
 
+TEST_CASE("peak detection recovers a short burst without changing mean power", "[cuda][windows]") {
+    auto sc = make_scene(27, {});
+    // 16 dB while active for 32/1024 frames: whole-window power is below the 6 dB gate.
+    for (unsigned t = 400; t < 432; ++t) {
+        auto &v = sc.win[std::size_t{t} * M + 100];
+        v.re += .063f;
+    }
+    cuda::DeviceBuffer<cf32> win(sc.win.size());
+    CURF_CUDA_CHECK(cudaMemcpy(win.get(), sc.win.data(), win.bytes(), cudaMemcpyHostToDevice));
+    cuda::WindowStage stage(S, M, W);
+    cuda::DetectConfig c;
+    stage.detect(win.get(), c, nullptr);
+    CHECK(read_active(stage).empty());
+    std::vector<float> before(S * M), after(S * M);
+    CURF_CUDA_CHECK(cudaMemcpy(before.data(), stage.d_power(), before.size()*sizeof(float), cudaMemcpyDeviceToHost));
+    c.peak_detection = true;
+    stage.detect(win.get(), c, nullptr);
+    CHECK(read_active(stage) == std::vector<std::uint32_t>{100});
+    CURF_CUDA_CHECK(cudaMemcpy(after.data(), stage.d_power(), after.size()*sizeof(float), cudaMemcpyDeviceToHost));
+    CHECK(before == after);
+}
+
 TEST_CASE("leakage into neighbouring channels is rejected", "[cuda][windows]") {
     // channel 100 strong (power 1e-2), 99 and 101 at -42 dBc (leakage level), 300 a weak real signal (1e-3)
     std::vector<cf32> win(std::size_t{S} * W * M);

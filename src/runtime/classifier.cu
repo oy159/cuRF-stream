@@ -29,6 +29,11 @@ namespace curf {
             // Speculative launches cover entries past this window's real count; their `active` slots may never
             // have been written (uninitialised memory), so they must not be used as indices.
             if (i >= n || first + i >= *count) return;
+            if (!logits) {
+                const auto id = active[first + i];
+                out[first + i] = {id / M, id % M, 0, 0, power[id]};
+                return;
+            }
             const float *l = logits + static_cast<std::size_t>(i) * classes;
             int best = 0;
             float mx = l[0];
@@ -114,8 +119,9 @@ namespace curf {
         const std::size_t bpw = W / F;
         if (cfg.depth == 0 || cfg.ring_slots < cfg.depth) throw std::invalid_argument("classifier: need 0 < depth <= ring_slots");
 
-        engine::Engine eng(model, cfg.engine);
-        const auto chunk = static_cast<std::uint32_t>(eng.max_batch());
+        std::unique_ptr<engine::Engine> eng;
+        if (cfg.classify_channels) eng = std::make_unique<engine::Engine>(model, cfg.engine);
+        const auto chunk = eng ? static_cast<std::uint32_t>(eng->max_batch()) : S * M;
 
         HostRing ring(cfg.ring_slots, block_bytes);
         CURF_CUDA_CHECK(cudaHostRegister(ring.base(), ring.bytes(), cudaHostRegisterDefault));
@@ -163,11 +169,13 @@ namespace curf {
         auto enqueue_range = [&](WinCtx &w, std::uint32_t from, std::uint32_t to) {
             for (std::uint32_t first = from; first < to; first += chunk) {
                 const std::uint32_t c = std::min(chunk, to - first);
-                if (cfg.engine.half_input) w.stage.gather_half(w.buf.get(), first, c, eng.input_half(), comp_s);
-                else w.stage.gather(w.buf.get(), first, c, eng.input(), comp_s);
-                eng.run(static_cast<int>(c), comp_s);
+                if (eng) {
+                    if (cfg.engine.half_input) w.stage.gather_half(w.buf.get(), first, c, eng->input_half(), comp_s);
+                    else w.stage.gather(w.buf.get(), first, c, eng->input(), comp_s);
+                    eng->run(static_cast<int>(c), comp_s);
+                }
                 postprocess_kernel<<<(c + 127) / 128, 128, 0, comp_s>>>(
-                    eng.logits(), classes, w.stage.d_active(), w.stage.d_count(), w.stage.d_power(), first, c, M, w.d_res.get());
+                    eng ? eng->logits() : nullptr, classes, w.stage.d_active(), w.stage.d_count(), w.stage.d_power(), first, c, M, w.d_res.get());
                 CURF_CUDA_CHECK(cudaGetLastError());
             }
             if (to > from)
@@ -204,7 +212,7 @@ namespace curf {
                     BlockCtx &b = *blk[retired % cfg.depth];
                     HostSlot &slot = ring.oldest_in_flight();
                     chan_ms += elapsed_ms(b.c0, b.c1);
-                    if (cfg.tap) cfg.tap->retire(retired % cfg.depth);
+                    for (auto *t : cfg.taps) t->retire(retired % cfg.depth);
                     if (have_expected && slot.first_sample != expected) st.gap_frames += slot.first_sample - expected;
                     expected = slot.first_sample + slot.frames;
                     have_expected = true;
@@ -232,10 +240,10 @@ namespace curf {
                     WinCtx &w = win(delivered);
                     lat.push_back(std::chrono::duration<double, std::milli>(Clock::now() - w.ready_at).count());
                     wgpu.push_back(elapsed_ms(w.start, w.done));
-                    for (std::uint32_t i = 0; i < w.n; ++i) ++st.class_histogram[w.h_res[i].cls];
+                    if (eng) for (std::uint32_t i = 0; i < w.n; ++i) ++st.class_histogram[w.h_res[i].cls];
                     if (cfg.on_power) cfg.on_power(delivered, w.h_power.get(), w.h_floor.get());
-                    if (on_results) on_results(delivered, w.first_sample, w.h_res.get(), w.n);
-                    st.classified += w.n;
+                    if (on_results) on_results(delivered, w.first_sample, w.h_res.get(), w.n, w.ready_at);
+                    if (eng) st.classified += w.n;
                     st.max_active = std::max(st.max_active, w.n);
                     ++st.windows;
                     ++delivered;
@@ -257,12 +265,12 @@ namespace curf {
                         CURF_CUDA_CHECK(cudaStreamWaitEvent(comp_s, b.h2d_done.e));
                         CURF_CUDA_CHECK(cudaEventRecord(b.c0.e, comp_s));
                         ch.run_wire(b.wire.get(), fmt.wire, w.buf.get() + part * F * M, comp_s, std::size_t{W} * M);
-                        if (cfg.tap) cfg.tap->enqueue(submitted % cfg.depth, b.wire.get(), slot->frames, slot->first_sample, comp_s);
+                        for (auto *t : cfg.taps) t->enqueue(submitted % cfg.depth, b.wire.get(), slot->frames, slot->first_sample, comp_s);
                         CURF_CUDA_CHECK(cudaEventRecord(b.c1.e, comp_s));
                         if (part == bpw - 1) {
                             w.ready_at = slot->filled_at;
                             CURF_CUDA_CHECK(cudaEventRecord(w.start.e, comp_s));
-                            w.stage.detect(w.buf.get(), cfg.detect, comp_s);
+                            w.stage.detect(w.buf.get(), cfg.detect, comp_s, wi == 0 ? 2 * cfg.channelizer.taps_per_phase : 0);
                             CURF_CUDA_CHECK(cudaMemcpyAsync(w.count.get(), w.stage.d_count(), sizeof(std::uint32_t),
                                                             cudaMemcpyDeviceToHost, comp_s));
                             CURF_CUDA_CHECK(cudaEventRecord(w.count_ready.e, comp_s));
@@ -298,6 +306,7 @@ namespace curf {
                     ring.next_submit(std::chrono::milliseconds(2));
                 }
             }
+            for (auto *tap : cfg.taps) tap->flush();
         } catch (...) {
             error = std::current_exception();
         }

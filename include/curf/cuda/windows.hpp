@@ -26,6 +26,7 @@ namespace curf::cuda {
     enum class Compaction : std::uint8_t { ballot, cub };
 
     struct DetectConfig {
+        bool peak_detection = false; // compare the strongest of 16 time slices; keep mean power for RMS/UI
         DetectMode mode = DetectMode::relative;
         float threshold_db = 6.f;    // relative: power > floor * 10^(dB/10) (6 dB: full recall at 5-20 dB SNR)
         float percentile = 0.25f;    // noise floor = this quantile of the stream's channel powers
@@ -54,7 +55,7 @@ namespace curf::cuda {
         WindowStage &operator=(const WindowStage &) = delete;
 
         // Power, floor, active list and count (device), asynchronously.
-        void detect(const cf32 *d_win, const DetectConfig &cfg, cudaStream_t stream);
+        void detect(const cf32 *d_win, const DetectConfig &cfg, cudaStream_t stream, unsigned ignore_frames = 0);
         // Gather active windows [first, first + n) of the list into d_out ([n][W][2] fp32), unit RMS.
         void gather(const cf32 *d_win, std::uint32_t first, std::uint32_t n, float *d_out, cudaStream_t stream);
         // Same, rounded to fp16 ([n][W][2] half): half the bytes, for an engine with an fp16 input.
