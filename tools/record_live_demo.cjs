@@ -69,10 +69,12 @@ async function main() {
     await sleep(seconds*500);
     await page.screenshot({ path: path.join(out, `${name}-demo.png`), fullPage: true });
     await page.locator('#mode').selectOption('engineering');
-    const inspect = page.getByRole('button', { name: '检查', exact: false }).first();
+    const dsss = page.locator('tr').filter({hasText:'WiFi DSSS'}).getByRole('button',{name:'检查',exact:false}).first();
+    const inspect = await dsss.count() ? dsss : page.getByRole('button', { name: '检查', exact: false }).first();
     if (await inspect.count()) await inspect.click();
     await sleep(seconds*500-500);
-    const fresh = page.locator('tr').filter({hasText:'0.0 s'}).getByRole('button',{name:'检查',exact:false}).first();
+    const freshDsss = page.locator('tr').filter({hasText:'WiFi DSSS'}).getByRole('button',{name:'检查',exact:false}).first();
+    const fresh = await freshDsss.count() ? freshDsss : page.locator('tr').filter({hasText:'0.0 s'}).getByRole('button',{name:'检查',exact:false}).first();
     if (await fresh.count()) await fresh.click();
     await sleep(500);
     await page.screenshot({ path: path.join(out, `${name}-engineering.png`), fullPage: true });

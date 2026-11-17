@@ -21,7 +21,9 @@ from signal_policy import SignalPolicy, load_config
 from ui_server import Handler, Hub
 
 ROOT = Path(__file__).resolve().parents[1]
-PROFILES = {"ism24": (2440e6, 10, 24), "wlan5": (5770e6, 40, 18),
+# Site presets, separate from classifier defaults. M5 v2 checks full 2.4 GHz
+# candidates at the ordinary 6 dB detection threshold after component recovery.
+PROFILES = {"ism24": (2440e6, 20, 6), "wlan5": (5770e6, 40, 18),
             "cell900": (939e6, 40, 6), "adsb": (1100e6, 45, 6)}
 
 
