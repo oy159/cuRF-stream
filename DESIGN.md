@@ -104,6 +104,8 @@ preserves focused actions and scroll position. The tooltip is supplementary; tab
 Source-relative times use seconds, RF frequencies MHz, bandwidths kHz/MHz, and powers dBFS. Protocol
 names always carry “推测”; ADS-B is marked “CRC 通过”, never an invented probability. Continuous counters
 are not live announcements. Motion is limited to new measured rows; reduced motion adds no animation.
+The source label distinguishes live SDR reception from recorded SDR playback. Replay adds an explicit
+speed marker while retaining the physical source and the recorded policy decisions.
 
 ## Do's and Don'ts
 

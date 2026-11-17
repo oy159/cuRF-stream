@@ -171,7 +171,9 @@ def run_replay(hub: Hub, path: Path, speed: float, loop: bool):
                     continue
                 row = json.loads(line)
                 if "meta" in row:
-                    meta = row["meta"]
+                    meta = {**row["meta"], "playback": {"mode": "replay", "speed": speed, "loop": loop}}
+                    row = {**row, "meta": meta}
+                    line = json.dumps(row, ensure_ascii=False, allow_nan=False)
                 t = row.get("t")
                 if "sig" in row:
                     sig = row["sig"]

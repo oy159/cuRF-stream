@@ -9,7 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 from apply_signal_policy import apply, DisplayScore
 from build_spur_table import build
 from signal_policy import FAMILIES, SignalPolicy, load_spurs
-from ui_server import Hub, run_live
+from ui_server import Hub, run_live, run_replay
 
 
 def signal(w, **kwargs):
@@ -133,6 +133,18 @@ class DisplayPipelineTests(unittest.TestCase):
         self.assertEqual(sum("adsb" in r for r in rows), 1)
         self.assertEqual(sum("p" in r for r in rows), 250)
         hub.unsubscribe(q)
+
+    def test_hardware_replay_is_explicit_without_changing_measurements(self):
+        with tempfile.TemporaryDirectory() as d:
+            feed=Path(d)/"capture.feed"
+            raw=[{"meta":{**META["meta"],"source":"omnicore"}},signal(0),{"end":{}}]
+            feed.write_text("\n".join(json.dumps(r) for r in raw))
+            hub=Hub()
+            run_replay(hub,feed,2.,False)
+            meta=json.loads(hub.meta)["meta"]
+            self.assertEqual(meta["source"],"omnicore")
+            self.assertEqual(meta["playback"],{"mode":"replay","speed":2.,"loop":False})
+            self.assertEqual(json.loads(next(iter(hub.signals.values()))[0])["sig"],raw[1]["sig"])
 
 
 if __name__ == "__main__":

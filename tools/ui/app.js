@@ -38,7 +38,9 @@ const engineering = () => document.getElementById("mode").value === "engineering
 const title = g => meta.stage2 ? g.title : name(g.cls);
 const reasons = {allowed_mass:"允许类别的原始概率总量不足", raw_confidence:"原始模型置信度不足", low_confidence:"先验内置信度不足",
   small_margin:"前两名差距不足", confirming:"等待连续一致判断", confirmed:"连续判断已确认", hysteresis:"门限滞回保持",
-  missing_probabilities:"缺少完整有效概率，保持未识别", calibrated_spur:"匹配同一接收设置的杂散校准表", decoder_only:"此频段只显示 CRC 通过的 ADS-B 解码", invalid_record:"信号记录无效"};
+  missing_probabilities:"缺少完整有效概率，保持未识别", calibrated_spur:"匹配同一接收设置的杂散校准表", decoder_only:"此频段只显示 CRC 通过的 ADS-B 解码", invalid_record:"信号记录无效",
+  low_snr:"提取窗信噪比不足", missing_snr:"缺少提取窗信噪比证据", bandwidth_prior:"带宽不符合当前频段先验",
+  off_channel_grid:"中心频率偏离 WiFi 信道栅格", near_wideband_component:"靠近宽候选，可能是同一信号的碎片"};
 const col = (k, M) => (k + M / 2) % M;                       // channel -> display column (left edge = -fs/2)
 const colHz = x => (x - meta.channels / 2) * meta.rate / meta.channels; // display column -> offset Hz
 const fmtMHz = x => ((meta.freq + colHz(x)) / 1e6).toFixed(2);
@@ -556,7 +558,8 @@ function connect() {
       document.querySelector('#mode option[value="demo"]').disabled = !meta.stage2;
       if (!meta.stage2) document.getElementById("mode").value = "engineering";
       document.getElementById("mode").onchange();
-      document.getElementById("src").textContent = meta.source;
+      const sourceName = {omnicore:"SDR 实采", file:"文件输入", synthetic:"仿真输入"}[meta.source] || meta.source;
+      document.getElementById("src").textContent = meta.playback?.mode === "replay" ? `${sourceName}回放 · ${meta.playback.speed}×` : sourceName;
       document.getElementById("rate").textContent = (meta.rate / 1e6).toFixed(2) + " MSPS × " + meta.streams;
       document.getElementById("fc").textContent = meta.freq ? (meta.freq / 1e6).toFixed(3) + " MHz" : "基带（相对频率）";
       document.getElementById("end").style.display = "none";
