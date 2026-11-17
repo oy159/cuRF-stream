@@ -16,10 +16,10 @@ def signal(w, **kwargs):
     p = [0.]*13
     p[0], p[1] = .02, .98
     return {"sig": {"s": 0, "id": 2, "w": w, "f": 1e6, "bw": 18e6, "t": w*.03,
-                    "t0": w*.03, "t1": w*.03+.001, "c": 1, "p": .98, "probs": p, **kwargs}}
+                    "t0": w*.03, "t1": w*.03+.001, "c": 1, "p": .98, "probs": p, "snr_db": 25, **kwargs}}
 
 
-META = {"meta": {"source": "file", "stage2": True, "freq": 2440e6, "rate": 61.44e6,
+META = {"meta": {"source": "file", "stage2": True, "freq": 2441e6, "rate": 61.44e6,
                  "streams": 1, "channels": 512, "window": 1024, "every": 8, "signal_classes": FAMILIES}}
 
 

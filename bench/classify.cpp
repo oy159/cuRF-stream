@@ -28,6 +28,7 @@
 // pipeline statistics; --print N also lists the results of the first N windows.
 
 #include "curf/adsb.hpp"
+#include "curf/channelizer.hpp"
 #include "curf/cuda/adsb.hpp"
 #include "curf/engine/model.hpp"
 #include "curf/runtime/classifier.hpp"
@@ -331,6 +332,8 @@ int main(int argc, char **argv) {
     // of the time on the cable loopback, a vote over 8 windows (34 ms) ~96 %. Channel order as produced.
     std::FILE *ui = ui_path.empty() ? nullptr : std::fopen(ui_path.c_str(), "w");
     const std::uint32_t S = fmt.channels, M = cfg.channelizer.channels;
+    double channel_noise_gain = 0;
+    for (float h : design_prototype(cfg.channelizer)) channel_noise_gain += static_cast<double>(h) * h;
     std::vector<float> ui_max(std::size_t{S} * M, 0.f), ui_floor(S, 0.f);
     const auto ncls = static_cast<std::size_t>(model.tensors[model.output].channels);
     std::vector<float> ui_vote(std::size_t{S} * M * ncls, 0.f); // [S][M][classes] summed probabilities
@@ -349,7 +352,7 @@ int main(int argc, char **argv) {
                          json_quote(receiver_name).c_str(), gain, agc, bandwidth > 0 ? bandwidth : std::min(fmt.sample_rate, 56e6),
                          iq_bits, json_quote(shape_path).c_str());
         if (adsb_hz > 0) std::fprintf(ui, ",\"adsb\":{\"stream\":%u,\"freq\":%.0f}", adsb_cfg.stream, adsb_hz);
-        std::fprintf(ui, "}}\n");
+        std::fprintf(ui, ",\"channel_noise_gain\":%.12g}}\n", channel_noise_gain);
     }
     // Noise-shape calibration: per channel, the median power over (up to the first 4096) windows, divided by
     // the median over the stream's in-band channels. Run with no signal at the input.
@@ -395,8 +398,24 @@ int main(int argc, char **argv) {
         }
         cfg.classify_channels = stage1_classify;
         cfg.detect.peak_detection = true;
-        stage2 = std::make_unique<SignalStage>(sc, *s2_model, fmt, cfg.block_frames, [ui](const SignalResult &r) {
+        stage2 = std::make_unique<SignalStage>(sc, *s2_model, fmt, cfg.block_frames, [ui, &ui_floor, &cfg, fmt, M, channel_noise_gain](const SignalResult &r) {
             if (!ui) return;
+            double shape = 1;
+            if (!cfg.noise_shape.empty()) {
+                double sum = 0; unsigned count = 0;
+                const std::size_t offset = cfg.noise_shape.size() == M ? 0 : std::size_t{r.stream} * M;
+                for (unsigned k = 0; k < M; ++k) {
+                    const double f = static_cast<double>(k) * fmt.sample_rate / M;
+                    if (std::abs(std::remainder(f-r.fc_hz, fmt.sample_rate)) <= .375*r.fs_hz) {
+                        sum += cfg.noise_shape[offset+k]; ++count;
+                    }
+                }
+                if (count) shape = sum/static_cast<double>(count);
+            }
+            // Unit-gain PFB noise variance = raw variance * sum(h^2). The finite extraction FIR has
+            // ENBW slightly below 0.75 * output_rate; using that upper bound is conservative.
+            const double window_noise = ui_floor[r.stream] * shape / channel_noise_gain * (.75*r.fs_hz/fmt.sample_rate);
+            const double snr_db = 10*std::log10(std::max(std::pow(10., r.power_db/10.)/std::max(window_noise,1e-30)-1.,1e-9));
             std::vector<std::size_t> idx(r.probs.size());
             for (std::size_t i = 0; i < idx.size(); ++i) idx[i] = i;
             std::partial_sort(idx.begin(), idx.begin() + std::min<std::size_t>(3, idx.size()), idx.end(),
@@ -407,7 +426,7 @@ int main(int argc, char **argv) {
                          idx[1], static_cast<double>(r.probs[idx[1]]), idx[2], static_cast<double>(r.probs[idx[2]]),
                          r.source_time_s, static_cast<double>(r.activity_fraction));
             for (std::size_t i = 0; i < r.probs.size(); ++i) std::fprintf(ui, "%s%.7g", i ? "," : "", static_cast<double>(r.probs[i]));
-            std::fprintf(ui, "]}}\n");
+            std::fprintf(ui, "],\"snr_db\":%.3f}}\n", snr_db);
         });
         cfg.taps.push_back(stage2.get());
         std::fprintf(stderr, "stage 2: %s%s\n", stage2_dir.c_str(), stage2_int8 ? " (INT8)" : "");

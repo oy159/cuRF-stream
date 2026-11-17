@@ -1,30 +1,206 @@
 {
   "version": 1,
-  "confidence": 0.85,
-  "raw_confidence": 0.80,
+  "confidence": 0.9,
+  "raw_confidence": 0.9,
   "allowed_mass": 0.85,
-  "margin": 0.20,
-  "other_confidence": 0.94,
-  "hold_confidence": 0.70,
+  "margin": 0.2,
+  "other_confidence": 0.97,
+  "hold_confidence": 0.85,
   "confirmations": 3,
   "release_observations": 2,
   "vote_seconds": 3.0,
-  "hold_seconds": 0.30,
+  "hold_seconds": 0.3,
   "max_carriers": 512,
   "spur_action": "mark",
   "bands": [
-    {"name": "ADS-B 1090", "lo_mhz": 1088, "hi_mhz": 1092, "allow": [], "protocol": "adsb", "decoder_only": true},
-    {"name": "2.4 GHz ISM", "lo_mhz": 2400, "hi_mhz": 2483.5, "allow": ["ofdm", "dsss", "fsk"], "protocol": "ism24"},
-    {"name": "5 GHz WLAN", "lo_mhz": 5150, "hi_mhz": 5850, "allow": ["ofdm"], "protocol": "wlan5"},
-    {"name": "FM broadcast", "lo_mhz": 87.5, "hi_mhz": 108, "allow": ["fm"], "protocol": "fm"},
-    {"name": "B1 DL", "lo_mhz": 2110, "hi_mhz": 2170, "allow": ["ofdm", "fsk"], "protocol": "cellular"},
-    {"name": "B3 DL", "lo_mhz": 1805, "hi_mhz": 1880, "allow": ["ofdm", "fsk"], "protocol": "cellular", "gsm": true},
-    {"name": "B8 DL", "lo_mhz": 925, "hi_mhz": 960, "allow": ["ofdm", "fsk"], "protocol": "cellular", "gsm": true},
-    {"name": "B34 TDD", "lo_mhz": 2010, "hi_mhz": 2025, "allow": ["ofdm", "fsk"], "protocol": "cellular"},
-    {"name": "B39 TDD", "lo_mhz": 1880, "hi_mhz": 1920, "allow": ["ofdm", "fsk"], "protocol": "cellular"},
-    {"name": "B40 TDD", "lo_mhz": 2300, "hi_mhz": 2400, "allow": ["ofdm", "fsk"], "protocol": "cellular"},
-    {"name": "B41 / n41", "lo_mhz": 2496, "hi_mhz": 2690, "allow": ["ofdm", "fsk"], "protocol": "lte_nr"},
-    {"name": "n78", "lo_mhz": 3300, "hi_mhz": 3800, "allow": ["ofdm"], "protocol": "nr"},
-    {"name": "n79", "lo_mhz": 4400, "hi_mhz": 5000, "allow": ["ofdm"], "protocol": "nr"}
-  ]
+    {
+      "name": "ADS-B 1090",
+      "lo_mhz": 1088,
+      "hi_mhz": 1092,
+      "allow": [],
+      "protocol": "adsb",
+      "decoder_only": true
+    },
+    {
+      "name": "2.4 GHz ISM",
+      "lo_mhz": 2400,
+      "hi_mhz": 2483.5,
+      "allow": [
+        "ofdm",
+        "dsss",
+        "fsk"
+      ],
+      "protocol": "ism24"
+    },
+    {
+      "name": "5 GHz WLAN",
+      "lo_mhz": 5150,
+      "hi_mhz": 5850,
+      "allow": [
+        "ofdm"
+      ],
+      "protocol": "wlan5"
+    },
+    {
+      "name": "FM broadcast",
+      "lo_mhz": 87.5,
+      "hi_mhz": 108,
+      "allow": [
+        "fm"
+      ],
+      "protocol": "fm"
+    },
+    {
+      "name": "B1 DL",
+      "lo_mhz": 2110,
+      "hi_mhz": 2170,
+      "allow": [
+        "ofdm",
+        "fsk"
+      ],
+      "protocol": "cellular"
+    },
+    {
+      "name": "B3 DL",
+      "lo_mhz": 1805,
+      "hi_mhz": 1880,
+      "allow": [
+        "ofdm",
+        "fsk"
+      ],
+      "protocol": "cellular",
+      "gsm": true
+    },
+    {
+      "name": "B8 DL",
+      "lo_mhz": 925,
+      "hi_mhz": 960,
+      "allow": [
+        "ofdm",
+        "fsk"
+      ],
+      "protocol": "cellular",
+      "gsm": true
+    },
+    {
+      "name": "B34 TDD",
+      "lo_mhz": 2010,
+      "hi_mhz": 2025,
+      "allow": [
+        "ofdm",
+        "fsk"
+      ],
+      "protocol": "cellular"
+    },
+    {
+      "name": "B39 TDD",
+      "lo_mhz": 1880,
+      "hi_mhz": 1920,
+      "allow": [
+        "ofdm",
+        "fsk"
+      ],
+      "protocol": "cellular"
+    },
+    {
+      "name": "B40 TDD",
+      "lo_mhz": 2300,
+      "hi_mhz": 2400,
+      "allow": [
+        "ofdm",
+        "fsk"
+      ],
+      "protocol": "cellular"
+    },
+    {
+      "name": "B41 / n41",
+      "lo_mhz": 2496,
+      "hi_mhz": 2690,
+      "allow": [
+        "ofdm",
+        "fsk"
+      ],
+      "protocol": "lte_nr"
+    },
+    {
+      "name": "n78",
+      "lo_mhz": 3300,
+      "hi_mhz": 3800,
+      "allow": [
+        "ofdm"
+      ],
+      "protocol": "nr"
+    },
+    {
+      "name": "n79",
+      "lo_mhz": 4400,
+      "hi_mhz": 5000,
+      "allow": [
+        "ofdm"
+      ],
+      "protocol": "nr"
+    }
+  ],
+  "minimum_snr_db": 10.0,
+  "bandwidth_limits": {
+    "ism24": {
+      "ofdm": [
+        12000000.0,
+        45000000.0
+      ],
+      "fsk": [
+        300000.0,
+        3000000.0
+      ],
+      "dsss": [
+        600000.0,
+        24000000.0
+      ]
+    },
+    "wlan5": {
+      "ofdm": [
+        12000000.0,
+        50000000.0
+      ]
+    },
+    "cellular": {
+      "ofdm": [
+        750000.0,
+        30000000.0
+      ],
+      "fsk": [
+        80000.0,
+        400000.0
+      ]
+    },
+    "lte_nr": {
+      "ofdm": [
+        750000.0,
+        30000000.0
+      ],
+      "fsk": [
+        80000.0,
+        400000.0
+      ]
+    },
+    "nr": {
+      "ofdm": [
+        750000.0,
+        40000000.0
+      ]
+    },
+    "fm": {
+      "fm": [
+        40000.0,
+        400000.0
+      ]
+    }
+  },
+  "wifi_grid_tolerance_hz": 500000,
+  "wideband_guard": {
+    "minimum_bw_hz": 8000000,
+    "maximum_width_ratio": 0.75,
+    "seconds": 0.08,
+    "gap_fraction": 0.1
+  }
 }

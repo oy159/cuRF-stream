@@ -62,6 +62,14 @@ def main():
         run([sys.executable, root/"model/make_scene.py", "make", "--src", a.src, "--emissions", a.emissions,
              "--out", out, "--scenes", 1, "--secs", a.seconds, "--sources", len(modes.split(',')),
              "--modes", modes, "--one-of-each", "--snr", 20, 30], out/"generate.log")
+        # This older fixture chooses arbitrary baseband centres. Give its WiFi
+        # carrier a physical channel centre for the current RF-grid prior.
+        truth = json.loads((out/"truth.json").read_text())["truth"]
+        wifi = [e for e in truth if e["mode"].startswith("wifi")]
+        if wifi:
+            centre = (min(e["fc"]-e["bw"]/2 for e in wifi) + max(e["fc"]+e["bw"]/2 for e in wifi))/2
+            origin = 2412e6 if name == "ism24" else 5000e6
+            freq = origin + round((freq+centre-origin)/5e6)*5e6 - centre
         run([a.bin.resolve(), "--source", "file", "--file", out/"scene_0.p12", "--streams", 1,
              "--stage2", a.model.resolve(), "--freq", freq, "--realtime", "--drop", "--seconds", 0,
              "--band-mhz", 44, "--ui-out", out/"scene_0.feed"], out/"runtime.json")
@@ -77,7 +85,7 @@ def main():
         assert score["named"] > 0, "no model labels passed policy"
         assert stats["dropped_frames"] == stats["gap_frames"] == 0, "sample loss"
         assert all(stats["stage2"][k] == 0 for k in ("skipped_busy", "skipped_ring", "skipped_capacity")), "stage-2 skips"
-        results[name] = {"score": score, "stage2": stats["stage2"], "passed": True}
+        results[name] = {"score": score, "stage2": stats["stage2"], "rf_center_hz": freq, "passed": True}
     out = a.out/"adsb"
     out.mkdir(exist_ok=True)
     make_adsb(out/"adsb.p12")

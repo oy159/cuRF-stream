@@ -18,10 +18,10 @@ def record(w=0, family="ofdm", **kwargs):
     p = probabilities(family)
     return {"s": 0, "id": 0, "w": w, "f": 1e6, "bw": 18e6, "t": w*.03,
             "t0": w*.03-.001, "t1": w*.03, "c": FAMILIES.index(family), "p": max(p), "probs": p,
-            "activity_fraction": .25, **kwargs}
+            "activity_fraction": .25, "snr_db": 25, **kwargs}
 
 
-def policy(freq=2440e6, **kwargs):
+def policy(freq=2441e6, **kwargs):
     p = SignalPolicy(**kwargs)
     p.process({"meta": {"freq": freq, "rate": 61.44e6, "streams": 2, "channels": 512, "window": 1024,
                          "signal_classes": FAMILIES, "source": "file"}})
@@ -57,7 +57,7 @@ class SignalPolicyTests(unittest.TestCase):
         ds = [p.process({"sig": record(w)})["display"] for w in range(3)]
         self.assertEqual([d["status"] for d in ds], ["unknown", "unknown", "stable"])
         self.assertEqual(ds[-1]["protocol"], "WiFi（推测）")
-        d = p.process({"sig": record(3, probs=probabilities("ofdm", .75))})["display"]
+        d = p.process({"sig": record(3, probs=probabilities("ofdm", .87))})["display"]
         self.assertEqual(d["status"], "held")
         d = p.process({"sig": record(4, "fm")})["display"]
         self.assertEqual(d["family"], "unknown")
@@ -175,6 +175,52 @@ class SignalPolicyTests(unittest.TestCase):
             p.process({"sig": record(w)})
         self.assertAlmostEqual(p.stats()["unknown_fraction"], 2/3)
         self.assertEqual(p.process({"end": {}})["end"]["policy"]["named"], 1)
+
+    def test_signal_quality_gates_cannot_be_bypassed_by_confidence_or_hysteresis(self):
+        p=policy()
+        for w in range(3):
+            p.process({"sig":record(w)})
+        d=p.process({"sig":record(3,snr_db=3)})["display"]
+        self.assertEqual((d["family"],d["reason"]),("unknown","low_snr"))
+        d=p.process({"sig":record(4,snr_db=None)})["display"]
+        self.assertEqual(d["reason"],"missing_snr")
+        for w in range(5,10):
+            d=p.process({"sig":record(w,"fsk",bw=12e3,snr_db=30)})["display"]
+        self.assertEqual((d["family"],d["reason"]),("unknown","bandwidth_prior"))
+        for w in range(10,13):
+            d=p.process({"sig":record(w,"fsk",bw=1e6,snr_db=25)})["display"]
+        self.assertEqual(d["family"],"fsk")
+
+    def test_wide_wifi_family_off_channel_grid_does_not_keep_a_stable_label(self):
+        p=policy()
+        for w in range(3):
+            d=p.process({"sig":record(w)})["display"]
+        self.assertEqual(d["family"],"ofdm")
+        d=p.process({"sig":record(3,f=1.8e6)})["display"]
+        self.assertEqual((d["family"],d["reason"]),("unknown","off_channel_grid"))
+
+    def test_nearby_wide_component_prevents_naming_a_narrow_piece_in_either_order(self):
+        for narrow_first in (False,True):
+            p=policy()
+            for w in range(3):
+                narrow={"sig":record(w,"dsss",f=11.5e6,bw=2e6)}
+                wide={"sig":record(w)}
+                if narrow_first:
+                    d=p.process(narrow)["display"]
+                    p.process(wide)
+                else:
+                    p.process(wide)
+                    d=p.process(narrow)["display"]
+            self.assertEqual((d["family"],d["reason"]),("unknown","near_wideband_component"))
+
+    def test_wide_component_guard_is_local_to_receiver_and_expires(self):
+        for different_rx in (False,True):
+            p=policy()
+            p.process({"sig":record(0)})
+            start=1 if different_rx else 10
+            for w in range(start,start+3):
+                d=p.process({"sig":record(w,"dsss",s=int(different_rx),f=11.5e6,bw=2e6)})["display"]
+            self.assertEqual(d["family"],"dsss")
 
 
 if __name__ == "__main__":

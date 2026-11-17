@@ -42,6 +42,18 @@ def load_config(path=None):
             raise ValueError(f"invalid {key}")
     if config["hold_confidence"] > config["confidence"] or config["other_confidence"] < config["confidence"]:
         raise ValueError("invalid confidence hysteresis")
+    if not finite(config["minimum_snr_db"]) or not -10 <= config["minimum_snr_db"] <= 40:
+        raise ValueError("invalid minimum SNR")
+    if not finite(config["wifi_grid_tolerance_hz"]) or not 0<config["wifi_grid_tolerance_hz"]<=2e6:
+        raise ValueError("invalid WiFi centre tolerance")
+    for limits in config["bandwidth_limits"].values():
+        for family, bounds in limits.items():
+            if family not in NAMED or len(bounds)!=2 or not all(finite(x) for x in bounds) or not 0<bounds[0]<bounds[1]:
+                raise ValueError("invalid bandwidth prior")
+    guard=config["wideband_guard"]
+    for key,lo,hi in (("minimum_bw_hz",1e6,40e6),("maximum_width_ratio",.1,.9),("seconds",.001,.5),("gap_fraction",0,.25)):
+        if not finite(guard[key]) or not lo<=guard[key]<=hi:
+            raise ValueError("invalid wideband guard")
     if config["spur_action"] not in ("hide", "mark"):
         raise ValueError("spur_action must be hide or mark")
     for b in config["bands"]:
@@ -238,7 +250,7 @@ class SignalPolicy:
         base = {"uid": c.uid, "s": r["s"], "id": r.get("id"), "w": r.get("w"), "f": r["f"], "freq": freq,
                 "bw": r["bw"], "db": r.get("db"), "t": now, "t0": r["t0"], "t1": r["t1"], "age_s": now-c.first,
                 "processing_ms": r.get("processing_ms"), "observation_ms": r.get("observation_ms"),
-                "band": band["name"] if band else "其他 / 无射频先验", "activity_fraction": c.duty,
+                "band": band["name"] if band else "其他 / 无射频先验", "activity_fraction": c.duty, "snr_db": r.get("snr_db"),
                 "family": "unknown", "status": "unknown", "label": "未识别信号", "protocol": None, "visible": True,
                 "ttl_s": cfg["vote_seconds"]}
         if band and band.get("decoder_only"):
@@ -252,7 +264,7 @@ class SignalPolicy:
                  and abs(sum(probs) - 1) < .02 and len(set(self.classes)) == len(self.classes))
         allowed = set(band["allow"]) if band else NAMED
         base["allowed"] = sorted(allowed)
-        family, reason, admissible = None, "missing_probabilities", False
+        family, reason, admissible, quality_ok = None, "missing_probabilities", False, True
         if valid:
             raw = dict(zip(self.classes, probs))
             mass = sum(raw.get(k, 0) for k in allowed)
@@ -266,6 +278,39 @@ class SignalPolicy:
             base.update(raw=raw, adjusted=adjusted, allowed_mass=mass, confidence=raw_p, posterior=posterior, margin=posterior-second, candidate=family)
             reason = ("allowed_mass" if mass < cfg["allowed_mass"] else "raw_confidence" if raw_p < (cfg["raw_confidence"] if band else threshold)
                       else "low_confidence" if posterior < threshold else "small_margin" if posterior-second < cfg["margin"] else "confirming")
+            min_snr=cfg.get("minimum_snr_db")
+            if min_snr is not None and (not finite(r.get("snr_db")) or r["snr_db"]<min_snr):
+                reason="missing_snr" if not finite(r.get("snr_db")) else "low_snr"
+                quality_ok=False
+            bounds=cfg.get("bandwidth_limits",{}).get(band.get("protocol") if band else None,{}).get(family)
+            if bounds:
+                base["bandwidth_range_hz"]=bounds
+                if not bounds[0]<=r["bw"]<=bounds[1]:
+                    reason="bandwidth_prior"
+                    quality_ok=False
+            grid=cfg.get("wifi_grid_tolerance_hz")
+            wlan = band and ((band.get("protocol")=="ism24" and (family=="ofdm" or family=="dsss" and r["bw"]>=8e6)) or
+                             (band.get("protocol")=="wlan5" and family=="ofdm"))
+            if grid and wlan:
+                origin=2412e6 if band["protocol"]=="ism24" else 5000e6
+                delta=abs(math.remainder(freq-origin,5e6))
+                base["channel_grid_offset_hz"]=delta
+                if delta>grid:
+                    quality_ok=False
+                    if reason=="confirming":
+                        reason="off_channel_grid"
+            guard=cfg.get("wideband_guard")
+            if guard and band and band["protocol"]=="ism24" and family in ("fsk","dsss"):
+                # A narrow piece next to a recent broad component can be one
+                # transmitter split by detection. Keep it unnamed until isolated.
+                for other in self.carriers.values():
+                    if (other.uid!=c.uid and other.stream==c.stream and other.bw>=guard["minimum_bw_hz"] and
+                        r["bw"]<=guard["maximum_width_ratio"]*other.bw and 0<=now-other.last<=guard["seconds"]):
+                        gap=abs(r["f"]-other.fc)-.5*(r["bw"]+other.bw)
+                        if gap<=guard["gap_fraction"]*other.bw:
+                            quality_ok=False
+                            reason="near_wideband_component"
+                            break
             admissible = reason == "confirming"
         while c.votes and now - c.votes[0][0] > cfg["vote_seconds"]:
             c.votes.popleft()
@@ -286,7 +331,7 @@ class SignalPolicy:
         if admissible and len(c.votes) >= cfg["confirmations"]:
             c.stable, c.bad, c.accepted_at = family, 0, now
             base.update(family=family, status="stable", label=family.upper(), reason="confirmed")
-        elif (valid and family == c.stable and now - c.accepted_at <= cfg["hold_seconds"] and
+        elif (valid and quality_ok and family == c.stable and now - c.accepted_at <= cfg["hold_seconds"] and
               base["allowed_mass"] >= cfg["hold_confidence"] and base["confidence"] >= cfg["hold_confidence"] and
               base["posterior"] >= cfg["hold_confidence"] and base["margin"] >= cfg["margin"] / 2):
             base.update(family=c.stable, status="held", label=c.stable.upper(), reason="hysteresis")
