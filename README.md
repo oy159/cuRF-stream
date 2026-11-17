@@ -259,7 +259,7 @@ python3 tools/ui_server.py --port 8080 -- build/cuda-release/bench/curf_classify
 | `curf_bench_engine` | 引擎优化阶梯、逐层耗时（`--ops`）、ncu 采集（`--profile`）、库基线 |
 | `curf_classify` | 端到端：吞吐、延迟分位、丢样、准确率 |
 
-辅助脚本：`tools/ncu_summary.py`（ncu 报告逐 kernel 汇总）、`tools/nsys_overlap.py`（拷贝与计算的重叠率）、`tools/cpu_baseline.py`、`tools/loopback.py`、`tools/live_survey.py`。
+辅助脚本：`tools/ncu_summary.py`（ncu 报告逐 kernel 汇总）、`tools/nsys_overlap.py`（拷贝与计算的重叠率）、`tools/cpu_baseline.py`、`tools/loopback.py`。
 
 ---
 
