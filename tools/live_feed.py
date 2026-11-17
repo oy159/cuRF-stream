@@ -5,14 +5,23 @@ import shutil
 import subprocess
 import time
 
+from signal_policy import SignalPolicy
+
 
 class DisplayReducer:
-    def __init__(self, interval, max_pending=8192):
+    """Evaluate every observation, then coalesce repeated unknown updates.
+
+    Retain every named decision and the latest unknown per carrier in a bucket.
+    A brief confirmed burst must survive a later unknown observation;
+    neither probabilities nor the policy's full-feed counters are rewritten.
+    """
+    def __init__(self, interval, max_pending=8192, policy=None):
         if interval <= 0 or max_pending < 1:
             raise ValueError("positive display interval and capacity required")
         self.interval, self.max_pending = interval, max_pending
         self.bucket, self.pending, self.sequence = None, {}, 0
         self.input_signals = self.output_signals = self.peak_pending = 0
+        self.policy = policy or SignalPolicy()
 
     def flush(self):
         rows = [r for _, _, r in sorted(self.pending.values(), key=lambda x: x[:2])]
@@ -21,15 +30,20 @@ class DisplayReducer:
         return rows
 
     def push(self, row):
+        row = self.policy.process(row)
         if "meta" in row:
             output = self.flush()
-            row["meta"]["display_sampling"] = {"mode": "latest_per_track", "interval_s": self.interval,
-                                                "raw_file": "raw.feed"}
+            row["meta"]["display_sampling"] = {"mode": "policy_then_coalesce_unknown", "interval_s": self.interval,
+                                                "raw_file": "raw.feed", "policy_denominator": "complete_raw_feed"}
             self.bucket = None
             return output + [row]
         if "sig" in row:
             s = row["sig"]
-            key, stamp = ("sig", s["s"], s["id"]), s["t"]
+            d = row["display"]
+            key = ("sig", s["s"], d.get("uid", s.get("id", -1)), d["family"], d.get("protocol"), d["visible"])
+            if d["status"] in ("stable", "held"):
+                key += (self.sequence,)
+            stamp = d.get("t", s.get("t", 0))
             self.input_signals += 1
         elif "p" in row and "t" in row:
             # Power rows are already only ~30 Hz. Keep the measured waterfall
@@ -56,7 +70,8 @@ class DisplayReducer:
         return output
 
     def stats(self):
-        return {"interval_s": self.interval, "input_signals": self.input_signals,
+        return {"mode": "policy_then_coalesce_unknown", "policy": self.policy.stats(),
+                "interval_s": self.interval, "input_signals": self.input_signals,
                 "output_signals": self.output_signals,
                 "coalesced_signals": self.input_signals-self.output_signals,
                 "peak_pending": self.peak_pending, "capacity": self.max_pending}
@@ -75,7 +90,9 @@ def capture_file_feed(cmd, out, hub, max_bytes, interval, max_pending):
     raw.touch(exist_ok=False)
     raw_limit = max_bytes // 2
     display_limit = max_bytes - raw_limit
-    reducer = DisplayReducer(interval, max_pending)
+    # The hub sees policy metadata and passes the already-decided envelopes
+    # through. Only fan-out/serialization is reduced; voting sees the full feed.
+    reducer = DisplayReducer(interval, max_pending, hub.policy)
     written = unread_peak = lines = 0
     proc = None
     try:

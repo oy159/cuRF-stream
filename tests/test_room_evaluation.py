@@ -6,7 +6,7 @@ import unittest
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/"tools"))
 from room_evaluation import evaluate_case, strict_match, summarize
-from signal_policy import FAMILIES, load_config
+from signal_policy import FAMILIES, SignalPolicy, load_config
 
 
 class RoomEvaluationTests(unittest.TestCase):
@@ -24,7 +24,7 @@ class RoomEvaluationTests(unittest.TestCase):
         hopped={**e,"fc":1.8e6,"carrier_fc":1e6,"carrier_bw":4e6}
         self.assertGreater(strict_match({**r,"bw":3e6},hopped),0)
 
-    def score(self,stream=0,protocol="wifi",family="ofdm",complete=True):
+    def score(self,stream=0,protocol="wifi",family="ofdm",complete=True,processed=False,mismatch=False):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory)
             truth={"version":2,"seed":1,"profile":"ism24","kind":"positive","nominal_snr_db":[20,30],"freq":2441e6,
@@ -38,13 +38,18 @@ class RoomEvaluationTests(unittest.TestCase):
                   {"sig":{"w":1,"s":0,"f":1e6,"bw":18e6,"t":.1,"t0":.09,"t1":.1,"c":1,"probs":probs,"activity_fraction":.2,"snr_db":25}}]
             if complete:
                 rows.append({"end":{}})
+            config=load_config()
+            config["confirmations"]=1
+            if processed:
+                p=SignalPolicy(config)
+                rows=[p.process(row) for row in rows]
+                if mismatch:
+                    rows[0]["meta"]["policy"]["config"]={**config,"confirmations":2}
             (root/"truth.json").write_text(json.dumps(truth))
             (root/"raw.feed").write_text("\n".join(json.dumps(r) for r in rows))
             (root/"runtime.json").write_text(json.dumps({"wall_s":.8,"dropped_frames":0,"gap_frames":0,
                 "stage2":{"skipped_busy":0,"skipped_ring":0,"skipped_capacity":0}}))
-            config=load_config()
-            config["confirmations"]=1
-            return evaluate_case(root,config)
+            return evaluate_case(root,config,processed=processed)
 
     def test_correct_family_with_wrong_protocol_is_a_label_error(self):
         r=self.score(protocol="lte")
@@ -67,6 +72,11 @@ class RoomEvaluationTests(unittest.TestCase):
         self.assertEqual(r["high_snr_named"],1)
         with self.assertRaisesRegex(ValueError,"incomplete"):
             self.score(complete=False)
+
+    def test_processed_decisions_are_scored_with_the_same_frozen_policy(self):
+        self.assertEqual(self.score(), self.score(processed=True))
+        with self.assertRaisesRegex(ValueError,"policy does not match"):
+            self.score(processed=True,mismatch=True)
 
     def test_rejecting_everything_cannot_pass_acceptance(self):
         runs=[{"counts":{"unknown":100},"profile":p,"checks":{"complete":True},"kind":"positive", "high_snr_named":0,"high_snr_carriers":1}

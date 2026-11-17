@@ -28,7 +28,7 @@ def strict_match(r,e):
     return match(r,e,time_fraction=.05)
 
 
-def evaluate_case(directory, config, write_feed=True):
+def evaluate_case(directory, config, write_feed=True, processed=False):
     directory=Path(directory)
     truth=json.loads((directory/"truth.json").read_text())
     if truth.get("version") != 2 or any("stream" not in e or "protocol" not in e for e in truth["truth"]):
@@ -55,11 +55,17 @@ def evaluate_case(directory, config, write_feed=True):
                     meta=True
                     if row["meta"]["freq"] != truth["freq"] or row["meta"]["streams"] != truth["streams"]:
                         raise ValueError("RF centre or receiver mapping does not match truth")
+                    if processed and row["meta"].get("policy", {}).get("config") != config:
+                        raise ValueError("processed feed policy does not match scoring configuration")
                 elif not meta:
                     raise ValueError("missing feed metadata")
                 if ended:
                     raise ValueError("records after end")
-                row=p.process(row)
+                if processed:
+                    if "sig" in row and "display" not in row:
+                        raise ValueError("processed signal lacks a display decision")
+                else:
+                    row=p.process(row)
                 ended="end" in row
                 if output:
                     output.write(json.dumps(row,ensure_ascii=False,allow_nan=False,separators=(",",":"))+"\n")
