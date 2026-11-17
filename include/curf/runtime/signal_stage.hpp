@@ -16,6 +16,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <cstddef>
 #include <chrono>
 #include <functional>
 #include <memory>
@@ -34,6 +35,7 @@ namespace curf {
         std::uint32_t ring_blocks = 48;        // ~102 ms at the default block size (per RX)
         std::uint32_t max_signals = 64;        // per window
         std::uint32_t max_tracks = 256;
+        std::size_t scratch_complex = std::size_t{1} << 22; // total IFFT storage per pending window
         std::uint32_t pending = 3;             // windows in flight on the stage-2 stream
         std::uint32_t reclassify_windows = 6;  // a track is classified at most once per this many windows (W >= L)
         std::uint32_t track_timeout_windows = 48; // a track not detected for this long is dropped (~200 ms)
@@ -64,6 +66,7 @@ namespace curf {
     struct SignalStageStats {
         std::uint64_t windows = 0, signals = 0, classified = 0, skipped_busy = 0, skipped_ring = 0, tracks = 0;
         std::uint64_t skipped_capacity = 0, narrow = 0, wide = 0;
+        std::uint64_t skipped_signals = 0, skipped_tracks = 0, skipped_workspace = 0;
         cuda::Percentiles narrow_latency_ms, wide_latency_ms;
         std::string to_json() const;
     };

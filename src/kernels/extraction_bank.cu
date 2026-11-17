@@ -102,7 +102,7 @@ namespace curf::cuda {
                     CURF_CUDA_CHECK(cudaMemcpy(r.response.get(), tmp.get() + nh - r.radius, r.radius * sizeof(cf32), cudaMemcpyDeviceToDevice));
                     CURF_CUDA_CHECK(cudaMemcpy(r.response.get() + r.radius, tmp.get(), (r.radius + 1) * sizeof(cf32), cudaMemcpyDeviceToDevice));
                     cufftDestroy(hp);
-                    for (unsigned b = 1; b <= 64 && std::size_t{b} * 4 * w <= (1u << 22); b *= 2)
+                    for (unsigned b = 1; b <= ExtractionBank::max_batch(w); b *= 2)
                         plan(r.inverse[b], 4 * w, b);
                 }
             }
@@ -122,6 +122,12 @@ namespace curf::cuda {
     unsigned ExtractionBank::batch_size(std::size_t n) {
         if (!n || n > 64) throw std::invalid_argument("extraction batch outside [1,64]");
         unsigned b = 1; while (b < n) b *= 2; return b;
+    }
+    unsigned ExtractionBank::max_batch(unsigned w) {
+        if (!w || w > (1u << 20)) throw std::invalid_argument("extraction rate outside plan budget");
+        unsigned b = 64;
+        while (std::size_t{b} * 4 * w > (1u << 22)) b /= 2;
+        return b;
     }
     void ExtractionBank::forward(cf32 *context, cudaStream_t stream) {
         ck(cufftSetStream(impl_->fwd, stream));

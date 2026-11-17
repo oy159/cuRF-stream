@@ -24,7 +24,6 @@ namespace curf {
 
         constexpr int kSub = 512;          // sub-bands per coarse band (bandwidth estimate)
         constexpr int kCand = 64;          // candidate segments when picking the strongest 1024 samples
-        constexpr std::size_t kScratch = std::size_t{1} << 22; // complex samples of IFFT scratch per window
 
         struct Event {
             cudaEvent_t e = nullptr;
@@ -202,6 +201,8 @@ namespace curf {
         o << "{\"windows\":" << windows << ",\"signals\":" << signals << ",\"classified\":" << classified
           << ",\"skipped_busy\":" << skipped_busy << ",\"skipped_ring\":" << skipped_ring
           << ",\"skipped_capacity\":" << skipped_capacity << ",\"tracks\":" << tracks
+          << ",\"skipped_signals\":" << skipped_signals << ",\"skipped_tracks\":" << skipped_tracks
+          << ",\"skipped_workspace\":" << skipped_workspace
           << ",\"wide\":" << wide << ",\"narrow\":" << narrow << ",\"wide_latency_ms\":";
         percentiles(wide_latency_ms); o << ",\"narrow_latency_ms\":"; percentiles(narrow_latency_ms);
         o << "}"; return o.str();
@@ -282,7 +283,8 @@ namespace curf {
 
         Impl(const SignalStageConfig &c, const engine::Model &model, StreamFormat f, std::size_t block_frames, Callback cb_)
             : cfg(c), fmt(f), block(block_frames), cb(std::move(cb_)), eng(model, c.engine) {
-            if (!block || !c.pending || !c.max_signals || c.max_signals > 64 || !c.max_tracks || c.channels < 2)
+            if (!block || !c.pending || !c.max_signals || c.max_signals > 256 || !c.max_tracks || c.channels < 2 ||
+                !c.scratch_complex || c.scratch_complex > (std::size_t{1} << 26))
                 throw std::invalid_argument("signal stage: invalid capacities");
             nf = c.window_frames * (c.channels / 2);
             if (nf % block) throw std::invalid_argument("signal stage: window must be whole raw blocks");
@@ -310,7 +312,7 @@ namespace curf {
             const std::size_t ms = c.max_signals;
             for (auto &p : pend) {
                 p.spec = DeviceBuffer<float2>(std::size_t{f.channels} * 4 * nf);
-                p.scratch = DeviceBuffer<float2>(kScratch);
+                p.scratch = DeviceBuffer<float2>(c.scratch_complex);
                 p.d_band = DeviceBuffer<BandReq>(ms);
                 p.h_band = PinnedBuffer<BandReq>(ms);
                 p.d_sub = DeviceBuffer<float>(ms * kSub);
@@ -395,7 +397,7 @@ namespace curf {
                     tr.lo = lo; tr.hi = hi; tr.last_seen = w;
                     const bool narrow = tr.w && tr.w < L;
                     if (!narrow && tr.classified_once && w - tr.last_class < cfg.reclassify_windows) return;
-                    if (sig.size() >= cfg.max_signals) { ++st.skipped_capacity; return; }
+                    if (sig.size() >= cfg.max_signals) { ++st.skipped_capacity; ++st.skipped_signals; return; }
                     const int bpc = static_cast<int>(4 * nf / cfg.channels);
                     int k0 = std::max((lo - 1) * bpc - bpc / 2, -static_cast<int>(2 * nf));
                     int k1 = std::min((hi + 1) * bpc + bpc / 2, static_cast<int>(2 * nf) - 1);
@@ -429,7 +431,8 @@ namespace curf {
                     std::sort(matches.begin(), matches.end(), [](const Prior &x, const Prior &y) { return x.lo < y.lo; });
                     if (matches.empty()) {
                         const int id = match_track(stream,lo,hi,w);
-                        if (id >= 0) submit(static_cast<unsigned>(id),lo,hi); else ++st.skipped_capacity;
+                        if (id >= 0) submit(static_cast<unsigned>(id),lo,hi);
+                        else { ++st.skipped_capacity; ++st.skipped_tracks; }
                     } else {
                         int begin = lo;
                         for (std::size_t i = 0; i < matches.size(); ++i) {
@@ -554,18 +557,29 @@ namespace curf {
                 std::size_t end = begin + 1;
                 while (end < items.size() && items[end].w == items[begin].w) ++end;
                 const auto w = items[begin].w;
-                const auto batch = cuda::ExtractionBank::batch_size(end - begin);
-                const std::size_t need = std::size_t{batch} * 4 * w;
-                if (off + need > kScratch) { st.skipped_capacity += end - begin; begin = end; continue; }
-                std::vector<cuda::ExtractionRequest> req;
-                for (std::size_t i = begin; i < end; ++i) {
-                    req.push_back({p.sig[items[i].sig].band.stream, items[i].kc, p.first});
-                    items[i].offset = off + (i - begin) * 4 * w;
-                    accepted.push_back(items[i]);
+                // Keep the bank's bounded plans. A large model batch can use
+                // several IFFTs at the same rate without allocating huge plans.
+                while (begin < end) {
+                    std::size_t capacity = cuda::ExtractionBank::max_batch(w);
+                    while (capacity && capacity * 4 * w > cfg.scratch_complex - off) capacity /= 2;
+                    if (!capacity) {
+                        st.skipped_capacity += end - begin;
+                        st.skipped_workspace += end - begin;
+                        break;
+                    }
+                    const auto count = std::min(capacity, end - begin);
+                    const auto batch = cuda::ExtractionBank::batch_size(count);
+                    std::vector<cuda::ExtractionRequest> req;
+                    for (std::size_t i = begin; i < begin + count; ++i) {
+                        req.push_back({p.sig[items[i].sig].band.stream, items[i].kc, p.first});
+                        items[i].offset = off + (i - begin) * 4 * w;
+                        accepted.push_back(items[i]);
+                    }
+                    bank->extract(reinterpret_cast<cf32 *>(p.spec.get()), w, req,
+                                  reinterpret_cast<cf32 *>(p.scratch.get() + off), s2);
+                    off += std::size_t{batch} * 4 * w;
+                    begin += count;
                 }
-                bank->extract(reinterpret_cast<cf32 *>(p.spec.get()), w, req,
-                              reinterpret_cast<cf32 *>(p.scratch.get() + off), s2);
-                off += need;
                 begin = end;
             }
             std::vector<AppendReq> append, carry;

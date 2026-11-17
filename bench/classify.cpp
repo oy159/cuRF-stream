@@ -171,6 +171,9 @@ int main(int argc, char **argv) {
     bool int8 = false;
     std::string stage2_dir;      // stage-2 model directory (s2.curf, s2.golden)
     bool stage2_int8 = false;
+    std::string stage2_tune_cache;
+    std::uint32_t stage2_max_signals = 64, stage2_max_tracks = 256;
+    std::size_t stage2_scratch_mib = 32;
     bool stage1_classify = false;
     double adsb_hz = 0;          // > 0: ADS-B demodulator on the side, carrier frequency
     cuda::AdsbConfig adsb_cfg;
@@ -233,6 +236,10 @@ int main(int argc, char **argv) {
         else if (a == "--adsb") adsb_hz = i + 1 < argc && argv[i + 1][0] != '-' ? std::stod(next()) : 1090e6;
         else if (a == "--stage2") stage2_dir = next();
         else if (a == "--stage2-int8") stage2_int8 = true;
+        else if (a == "--stage2-tune-cache") stage2_tune_cache = next();
+        else if (a == "--stage2-max-signals") stage2_max_signals = static_cast<std::uint32_t>(std::stoul(next()));
+        else if (a == "--stage2-max-tracks") stage2_max_tracks = static_cast<std::uint32_t>(std::stoul(next()));
+        else if (a == "--stage2-scratch-mib") stage2_scratch_mib = std::stoull(next());
         else if (a == "--stage1-classify") stage1_classify = true;
         else if (a == "--adsb-stream") adsb_cfg.stream = static_cast<std::uint32_t>(std::stoul(next()));
         else if (a == "--adsb-threshold") adsb_cfg.threshold = std::stof(next());
@@ -240,6 +247,12 @@ int main(int argc, char **argv) {
         else if (a == "--calib-percentile") cfg.engine.calib_percentile = std::stod(next());
         else if (a == "--tune-cache") cfg.engine.tune_cache = next();
         else { std::fprintf(stderr, "unknown option %s\n", a.c_str()); return 2; }
+    }
+
+    if (!stage2_max_signals || stage2_max_signals > 256 || stage2_max_tracks < stage2_max_signals ||
+        stage2_max_tracks > 4096 || stage2_scratch_mib < 8 || stage2_scratch_mib > 512) {
+        std::fprintf(stderr, "invalid stage-2 capacities: signals 1..256, tracks signals..4096, scratch 8..512 MiB\n");
+        return 2;
     }
 
     engine::Model model;
@@ -389,9 +402,15 @@ int main(int argc, char **argv) {
         SignalStageConfig sc;
         sc.channels = cfg.channelizer.channels;
         sc.window_frames = cfg.window;
+        sc.max_signals = stage2_max_signals;
+        sc.max_tracks = stage2_max_tracks;
+        sc.scratch_complex = stage2_scratch_mib * (std::size_t{1} << 20) / sizeof(cf32);
         sc.drop_when_busy = cfg.drop_when_full;
         sc.engine.buckets = {1, 4, 16, 64};
+        for (unsigned b = 128; sc.engine.buckets.back() < static_cast<int>(sc.max_signals); b *= 2)
+            sc.engine.buckets.push_back(static_cast<int>(b));
         sc.engine.tune_iters = 10;
+        sc.engine.tune_cache = stage2_tune_cache;
         if (stage2_int8) {
             sc.engine.int8 = true;
             sc.engine.calibration = engine::Golden::load(std::filesystem::path(stage2_dir) / "s2.golden", *s2_model).input;

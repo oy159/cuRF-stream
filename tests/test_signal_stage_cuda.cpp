@@ -179,6 +179,61 @@ TEST_CASE("stage 2 finds centre and bandwidth of wide and narrow signals", "[cud
     CHECK(s.skipped_busy == 0);
 }
 
+TEST_CASE("stage 2 chunks more than 64 requests without losing model windows", "[cuda][stage2][capacity]") {
+    const std::filesystem::path dir = CURF_S2_MODEL_DIR;
+    if (!std::filesystem::exists(dir / "s2.curf")) SKIP("no stage-2 model");
+    const auto model = engine::Model::load(dir / "s2.curf");
+    SignalStageConfig cfg;
+    cfg.max_signals = 256; cfg.max_tracks = 512;
+    int limit = 0;
+    SECTION("large model batch uses several bounded IFFTs") {}
+    SECTION("signal limit reports rejected requests") { limit = 1; cfg.max_signals = 16; }
+    SECTION("workspace limit reports rejected requests") { limit = 2; cfg.scratch_complex = 32; }
+    SECTION("track limit reports rejected requests") { limit = 3; cfg.max_tracks = 8; }
+    cfg.engine.buckets = {1, 4, 16, 64, 256}; cfg.engine.autotune = false;
+    std::vector<SignalResult> got;
+    SignalStage stage(cfg, model, {WireFormat::packed12, 1, kFs}, kBlock,
+                      [&](const SignalResult &r) { got.push_back(r); });
+    std::mt19937 rng(71);
+    std::normal_distribution<double> noise(0, .01);
+    std::vector<std::complex<double>> samples(4 * kWindowSamples);
+    for (auto &x : samples) x = {noise(rng), noise(rng)};
+    const auto wire = pack(samples);
+    cuda::DeviceBuffer<std::uint8_t> d(kBlock * 3);
+    std::vector<WindowResult> detections;
+    // Independent coarse components stress scheduling, not classification truth.
+    for (int k = -249; k <= 249; k += 3)
+        detections.push_back({0, static_cast<unsigned>(k < 0 ? k + 512 : k), 0, 0, 1e-3f});
+    REQUIRE(detections.size() > 128);
+    for (unsigned w = 0; w < 4; ++w) {
+        for (unsigned b = 0; b < 2; ++b) {
+            const std::size_t first = (std::size_t{w} * 2 + b) * kBlock;
+            CURF_CUDA_CHECK(cudaMemcpy(d.get(), wire.data() + first * 3, d.bytes(), cudaMemcpyHostToDevice));
+            stage.enqueue(0, d.get(), kBlock, first, nullptr);
+            CURF_CUDA_CHECK(cudaDeviceSynchronize());
+        }
+        stage.on_window(w, std::uint64_t{w} * kWindowSamples, detections.data(), detections.size());
+        stage.flush();
+    }
+    if (limit == 0) REQUIRE(got.size() >= detections.size());
+    else if (limit == 2) CHECK(got.empty());
+    else REQUIRE(!got.empty());
+    for (const auto &r : got) {
+        REQUIRE(r.probs.size() == 13);
+        double sum = 0;
+        for (float p : r.probs) { CHECK(std::isfinite(p)); sum += p; }
+        CHECK(std::abs(sum - 1) < 1e-5);
+    }
+    const auto stats = stage.stats();
+    if (limit == 0) CHECK(stats.skipped_capacity == 0);
+    else CHECK(stats.skipped_capacity > 0);
+    CHECK(stats.skipped_capacity == stats.skipped_signals + stats.skipped_tracks + stats.skipped_workspace);
+    if (limit == 1) CHECK(stats.skipped_signals > 0); else CHECK(stats.skipped_signals == 0);
+    if (limit == 2) CHECK(stats.skipped_workspace > 0); else CHECK(stats.skipped_workspace == 0);
+    if (limit == 3) CHECK(stats.skipped_tracks > 0); else CHECK(stats.skipped_tracks == 0);
+    CHECK(stats.skipped_ring == 0); CHECK(stats.skipped_busy == 0);
+}
+
 TEST_CASE("detection-only pipeline drives stage 2 without a stage-1 engine", "[cuda][stage2][classifier]") {
     const std::filesystem::path dir = CURF_S2_MODEL_DIR;
     if (!std::filesystem::exists(dir / "s2.curf")) SKIP("no stage-2 model");

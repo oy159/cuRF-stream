@@ -25,6 +25,7 @@ namespace curf::cuda {
         void extract(const cf32 *spectrum, std::uint32_t w, std::span<const ExtractionRequest> requests,
                      cf32 *output, cudaStream_t stream);
         static std::uint32_t batch_size(std::size_t count);
+        static std::uint32_t max_batch(std::uint32_t w); // rate-specific preplanned IFFT budget
     private:
         struct Impl;
         std::unique_ptr<Impl> impl_;
