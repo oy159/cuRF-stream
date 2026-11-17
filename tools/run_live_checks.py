@@ -19,6 +19,7 @@ import threading
 
 from signal_policy import SignalPolicy, load_config
 from ui_server import Handler, Hub
+from live_feed import capture_file_feed
 
 ROOT = Path(__file__).resolve().parents[1]
 # Site presets, separate from classifier defaults. M5 v2 checks full 2.4 GHz
@@ -84,7 +85,7 @@ def summarize_feed(path):
                        for k, n in labels.most_common(30)]}
 
 
-def record_case(binary, model, out, case, seconds, hub, max_bytes=2**30, capacities=(64, 256, 32), tune_cache=None):
+def record_case(binary, model, out, case, seconds, hub, max_bytes=2**30, capacities=(64, 256, 32), tune_cache=None, display_interval=0):
     out.mkdir()
     cmd = [str(binary.resolve()), "--source", "omnicore", "--rx", ",".join(map(str, case["rx"])),
            "--freq", str(case["freq"]), "--gain", str(case["gain"]), "--threshold-db", str(case["threshold"]),
@@ -96,8 +97,15 @@ def record_case(binary, model, out, case, seconds, hub, max_bytes=2**30, capacit
         cmd += ["--adsb", "1090e6", "--adsb-stream", "0", "--adsb-threshold", "1.6"]
     if tune_cache:
         cmd += ["--stage2-tune-cache", str(tune_cache.resolve())]
-    write_json(out/"command.json", {"argv": cmd, "feed": "display.feed", "transport": "inherited pipe fd"})
+    write_json(out/"command.json", {"argv": cmd, "feed": "display.feed",
+                                  "transport": "bounded file tail" if display_interval else "inherited pipe fd"})
     started = utc()
+    if display_interval:
+        sampling = capture_file_feed(cmd, out, hub, max_bytes, display_interval, capacities[1]*2+1)
+        result = finish_case(out, case, seconds, started)
+        result.update(raw_feed_sha256=digest(out/"raw.feed"), display_sampling=sampling)
+        write_json(out/"result.json", result)
+        return result
     r, w = os.pipe()
     proc = None
     try:
@@ -127,6 +135,10 @@ def record_case(binary, model, out, case, seconds, hub, max_bytes=2**30, capacit
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait()
+    return finish_case(out, case, seconds, started)
+
+
+def finish_case(out, case, seconds, started):
     summary = summarize_feed(out/"display.feed")
     runtime = json.loads((out/"runtime.json").read_text())
     checks = runtime_checks(runtime, summary["meta"], case, seconds, summary["ended"])
@@ -166,6 +178,7 @@ def main():
     ap.add_argument("--scratch-mib", type=int, default=32)
     ap.add_argument("--tune-cache", type=Path, help="stage-2 kernel tuning cache; preserves the engine's cache validation")
     ap.add_argument("--max-feed-mib", type=int, default=1024, help="hard per-case capture limit; exceeding it stops reception")
+    ap.add_argument("--display-interval-ms", type=int, default=0, help="0: complete pipe feed; otherwise file-backed display coalescing, full model records retained")
     a = ap.parse_args()
     names = a.bands.split(",")
     if not 5 <= a.seconds <= 3600 or not names or len(set(names)) != len(names) or any(n not in PROFILES for n in names):
@@ -174,6 +187,8 @@ def main():
         ap.error("output already contains a run; choose a new directory")
     if not 64 <= a.max_feed_mib <= 4096:
         ap.error("feed limit must be in 64..4096 MiB")
+    if a.display_interval_ms and not 50 <= a.display_interval_ms <= 1000:
+        ap.error("display interval must be 0 or 50..1000 ms")
     if not 0 <= a.neighbor_db <= 30:
         ap.error("neighbour rejection must be in 0..30 dB")
     if not 1 <= a.max_signals <= 256 or not a.max_signals <= a.max_tracks <= 4096 or not 8 <= a.scratch_mib <= 512:
@@ -188,12 +203,14 @@ def main():
         ap.error("need the planned maximum feed sizes plus 3 GiB of free space")
     config = load_config()
     files = ["tools/run_live_checks.py", "tools/signal_policy.py", "tools/ui_server.py", "tools/policy/default.json",
+             "tools/live_feed.py",
              "tools/ui/app.js", "tools/ui/index.html", "bench/classify.cpp", "src/source/omnicore_source.cpp",
              "src/runtime/signal_stage.cu", "src/kernels/extraction_bank.cu", "include/curf/runtime/signal_stage.hpp",
              "include/curf/cuda/extraction_bank.hpp"]
     manifest = {"version": 1, "created_utc": utc(), "revision": a.revision, "seconds": a.seconds, "cases": plan,
                 "policy": config, "max_feed_bytes": a.max_feed_mib*2**20,
                 "capacities": [a.max_signals, a.max_tracks, a.scratch_mib],
+                "display_interval_ms": a.display_interval_ms,
                 "tune_cache": str(a.tune_cache) if a.tune_cache else None,
                 "initial_tune_cache_sha256": digest(a.tune_cache) if a.tune_cache and a.tune_cache.exists() else None,
                 "binary_sha256": digest(a.bin), "model_sha256": digest(a.model/"s2.curf"),
@@ -224,7 +241,7 @@ def main():
         for case in plan:
             print(f"starting {case['name']} RX{case['rx']} for {a.seconds:g}s", flush=True)
             result = record_case(a.bin, a.model, a.out/case["name"], case, a.seconds, hub, a.max_feed_mib*2**20,
-                                 (a.max_signals, a.max_tracks, a.scratch_mib), a.tune_cache)
+                                 (a.max_signals, a.max_tracks, a.scratch_mib), a.tune_cache, a.display_interval_ms/1000)
             results.append(result)
             write_json(a.out/"progress.json", results)
             print(json.dumps({"case": case["name"], "runtime_passed": result["runtime_passed"],

@@ -14,6 +14,7 @@ const url = option('--url', 'http://127.0.0.1:8770/');
 const out = path.resolve(option('--out', 'docs/results/m5/video'));
 const seconds = Number(option('--seconds', '20'));
 const maxWait = Number(option('--max-wait', '360')) * 1000;
+const focusKnown = argv.includes('--focus-known');
 if (!(seconds >= 10 && seconds <= 120 && maxWait >= 1000)) throw new Error('invalid recording duration');
 const manifest = option('--manifest', null);
 const cases = manifest ? JSON.parse(fs.readFileSync(manifest, 'utf8')).cases.map(c =>
@@ -24,7 +25,7 @@ const cases = manifest ? JSON.parse(fs.readFileSync(manifest, 'utf8')).cases.map
 ];
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const errors = [];
-const report = { url, started: new Date().toISOString(), cases: [], errors };
+const report = { url, started: new Date().toISOString(), focusKnown, cases: [], errors };
 let browser;
 
 async function state(page) {
@@ -66,9 +67,16 @@ async function main() {
       parseFloat(document.querySelector('#t')?.textContent) >= 1, {freq, rate});
     const began = await state(page);
     console.log(`recording ${name}`);
-    await sleep(seconds*500);
+    if (focusKnown) {
+      // Show the complete view first, then use the existing visible class filter.
+      // Cumulative named/unknown counters remain visible in both views.
+      await sleep(5000);
+      await page.getByRole('button', {name:/^未识别/}).click();
+      await sleep(seconds*500-5000);
+    } else await sleep(seconds*500);
     await page.screenshot({ path: path.join(out, `${name}-demo.png`), fullPage: true });
     await page.locator('#mode').selectOption('engineering');
+    if (focusKnown) await page.getByRole('button', {name:/^未识别/}).click();
     const dsss = page.locator('tr').filter({hasText:'WiFi DSSS'}).getByRole('button',{name:'检查',exact:false}).first();
     const inspect = await dsss.count() ? dsss : page.getByRole('button', { name: '检查', exact: false }).first();
     if (await inspect.count()) await inspect.click();

@@ -232,7 +232,7 @@ function updatePolicy(stats) {
   const p = meta?.policy;
   const spur = {not_loaded:"杂散表未加载", active:"已使用匹配接收设置的杂散表", context_mismatch:"杂散表与接收设置不符，未使用"}[p?.spur_status] || "杂散表未加载";
   document.getElementById("policy-note").textContent = meta?.stage2
-    ? `识别结合频段规划 · 协议名称为推测 · ${spur}` : "逐信道工程数据；演示视图需要 --stage2 信号级 feed。";
+    ? `识别结合频段规划 · 协议名称为推测 · ${spur}${meta.display_sampling ? ` · 信号记录每 ${Math.round(meta.display_sampling.interval_s*1000)} ms 按轨迹合并，完整模型记录另存` : ""}` : "逐信道工程数据；演示视图需要 --stage2 信号级 feed。";
   if (policyStats) document.getElementById("policy-counts").innerHTML = `累计记录：已命名 <b>${policyStats.named}</b> · 未识别 <b>${policyStats.unknown}</b>（${policyStats.unknown_fraction === null ? "—" : (100*policyStats.unknown_fraction).toFixed(1)+"%"}）`;
   document.getElementById("policy-detail").textContent = JSON.stringify({policy:p || null, counts:policyStats}, null, 2);
 }

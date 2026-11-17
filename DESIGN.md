@@ -106,6 +106,8 @@ names always carry “推测”; ADS-B is marked “CRC 通过”, never an inve
 are not live announcements. Motion is limited to new measured rows; reduced motion adds no animation.
 The source label distinguishes live SDR reception from recorded SDR playback. Replay adds an explicit
 speed marker while retaining the physical source and the recorded policy decisions.
+When display updates are coalesced, the policy note states the interval and that complete model records
+are stored separately. On-screen counters describe the displayed observations, not every model result.
 
 ## Do's and Don'ts
 
