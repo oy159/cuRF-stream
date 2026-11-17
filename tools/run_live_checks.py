@@ -85,7 +85,7 @@ def summarize_feed(path):
                        for k, n in labels.most_common(30)]}
 
 
-def record_case(binary, model, out, case, seconds, hub, max_bytes=2**30, capacities=(64, 256, 32), tune_cache=None, display_interval=0, pending=3):
+def record_case(binary, model, out, case, seconds, hub, max_bytes=2**30, capacities=(64, 256, 32), tune_cache=None, display_interval=0, pending=3, bandwidth_estimator="current"):
     out.mkdir()
     cmd = [str(binary.resolve()), "--source", "omnicore", "--rx", ",".join(map(str, case["rx"])),
            "--freq", str(case["freq"]), "--gain", str(case["gain"]), "--threshold-db", str(case["threshold"]),
@@ -93,6 +93,7 @@ def record_case(binary, model, out, case, seconds, hub, max_bytes=2**30, capacit
            "--stage2-max-signals", str(capacities[0]), "--stage2-max-tracks", str(capacities[1]),
            "--stage2-scratch-mib", str(capacities[2]),
            "--stage2-pending", str(pending),
+           "--stage2-bandwidth", bandwidth_estimator,
            "--bandwidth", "56e6", "--band-mhz", "44", "--stage2", str(model.resolve()), "--seconds", str(seconds)]
     if case["name"] == "adsb":
         cmd += ["--adsb", "1090e6", "--adsb-stream", "0", "--adsb-threshold", "1.6"]
@@ -180,6 +181,7 @@ def main():
     ap.add_argument("--max-tracks", type=int, default=256)
     ap.add_argument("--scratch-mib", type=int, default=32)
     ap.add_argument("--pending", type=int, default=3, help="bounded stage-2 windows in flight (1..8)")
+    ap.add_argument("--bandwidth-estimator", choices=("current","history"), default="current")
     ap.add_argument("--tune-cache", type=Path, help="stage-2 kernel tuning cache; preserves the engine's cache validation")
     ap.add_argument("--max-feed-mib", type=int, default=1024, help="hard per-case capture limit; exceeding it stops reception")
     ap.add_argument("--display-interval-ms", type=int, default=0, help="0: complete pipe feed; otherwise file-backed display coalescing, full model records retained")
@@ -222,6 +224,7 @@ def main():
                 "policy": config, "max_feed_bytes": a.max_feed_mib*2**20,
                 "capacities": [a.max_signals, a.max_tracks, a.scratch_mib],
                 "pending": a.pending,
+                "bandwidth_estimator": a.bandwidth_estimator,
                 "display_interval_ms": a.display_interval_ms,
                 "tune_cache": str(a.tune_cache) if a.tune_cache else None,
                 "initial_tune_cache_sha256": digest(a.tune_cache) if a.tune_cache and a.tune_cache.exists() else None,
@@ -253,7 +256,7 @@ def main():
         for case in plan:
             print(f"starting {case['name']} RX{case['rx']} for {a.seconds:g}s", flush=True)
             result = record_case(a.bin, a.model, a.out/case["name"], case, a.seconds, hub, a.max_feed_mib*2**20,
-                                 (a.max_signals, a.max_tracks, a.scratch_mib), a.tune_cache, a.display_interval_ms/1000, a.pending)
+                                 (a.max_signals, a.max_tracks, a.scratch_mib), a.tune_cache, a.display_interval_ms/1000, a.pending, a.bandwidth_estimator)
             results.append(result)
             write_json(a.out/"progress.json", results)
             print(json.dumps({"case": case["name"], "runtime_passed": result["runtime_passed"],
