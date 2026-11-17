@@ -251,9 +251,9 @@ int main(int argc, char **argv) {
         else { std::fprintf(stderr, "unknown option %s\n", a.c_str()); return 2; }
     }
 
-    if (!stage2_max_signals || stage2_max_signals > 256 || stage2_max_tracks < stage2_max_signals ||
+    if (!stage2_max_signals || stage2_max_signals > 512 || stage2_max_tracks < stage2_max_signals ||
         stage2_max_tracks > 4096 || stage2_scratch_mib < 8 || stage2_scratch_mib > 512 || !stage2_pending || stage2_pending > 8) {
-        std::fprintf(stderr, "invalid stage-2 capacities: signals 1..256, tracks signals..4096, scratch 8..512 MiB, pending 1..8\n");
+        std::fprintf(stderr, "invalid stage-2 capacities: signals 1..512, tracks signals..4096, scratch 8..512 MiB, pending 1..8\n");
         return 2;
     }
 

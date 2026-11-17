@@ -285,7 +285,7 @@ namespace curf {
 
         Impl(const SignalStageConfig &c, const engine::Model &model, StreamFormat f, std::size_t block_frames, Callback cb_)
             : cfg(c), fmt(f), block(block_frames), cb(std::move(cb_)), eng(model, c.engine) {
-            if (!block || !c.pending || !c.max_signals || c.max_signals > 256 || !c.max_tracks || c.channels < 2 ||
+            if (!block || !c.pending || !c.max_signals || c.max_signals > 512 || !c.max_tracks || c.channels < 2 ||
                 !c.scratch_complex || c.scratch_complex > (std::size_t{1} << 26))
                 throw std::invalid_argument("signal stage: invalid capacities");
             nf = c.window_frames * (c.channels / 2);

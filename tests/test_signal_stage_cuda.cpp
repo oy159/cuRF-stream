@@ -179,36 +179,78 @@ TEST_CASE("stage 2 finds centre and bandwidth of wide and narrow signals", "[cud
     CHECK(s.skipped_busy == 0);
 }
 
+TEST_CASE("stage 2 batch 512 agrees with reordered fp32 reference windows", "[cuda][stage2][batch512]") {
+    const std::filesystem::path dir = CURF_S2_MODEL_DIR;
+    if (!std::filesystem::exists(dir / "s2.curf")) SKIP("no stage-2 model");
+    const auto model = engine::Model::load(dir / "s2.curf");
+    const auto golden = engine::Golden::load(dir / "s2.golden",model);
+    REQUIRE(golden.n_full > 0);
+    engine::EngineConfig cfg;
+    cfg.buckets = {512}; cfg.tune_iters = 2;
+    engine::Engine eng(model,cfg);
+    const auto per = model.tensors[model.input].elems_per_window();
+    std::vector<float> input(512*per);
+    std::vector<std::size_t> refs;
+    for (unsigned i = 0; i < 512; ++i) {
+        const auto ref = i < 256 ? i % golden.n_full : golden.n_full-1-(i-256)%golden.n_full;
+        refs.push_back(ref);
+        std::copy_n(golden.input.data()+ref*per,per,input.data()+i*per);
+    }
+    CURF_CUDA_CHECK(cudaMemcpyAsync(eng.input(),input.data(),input.size()*sizeof(float),cudaMemcpyHostToDevice,nullptr));
+    eng.run(512,nullptr);
+    CURF_CUDA_CHECK(cudaDeviceSynchronize());
+    const auto got = eng.read_tensor(model.output,512);
+    int agree = 0;
+    double err = 0,scale = 0;
+    const auto classes = golden.classes;
+    for (unsigned i = 0; i < 512; ++i) {
+        const auto *want = golden.logits.data()+refs[i]*classes;
+        const auto *value = got.data()+i*classes;
+        agree += std::max_element(want,want+classes)-want == std::max_element(value,value+classes)-value;
+        for (unsigned j = 0; j < classes; ++j) {
+            CHECK(std::isfinite(value[j]));
+            err = std::max(err,double(std::abs(value[j]-want[j])));
+            scale = std::max(scale,double(std::abs(want[j])));
+        }
+    }
+    INFO("512-window top1 agreement " << agree << "/512, relative logit error " << err/scale);
+    CHECK(agree >= 507);
+    CHECK(err/std::max(scale,1e-12) < .03);
+}
+
 TEST_CASE("stage 2 chunks more than 64 requests without losing model windows", "[cuda][stage2][capacity]") {
     const std::filesystem::path dir = CURF_S2_MODEL_DIR;
     if (!std::filesystem::exists(dir / "s2.curf")) SKIP("no stage-2 model");
     const auto model = engine::Model::load(dir / "s2.curf");
     SignalStageConfig cfg;
     cfg.max_signals = 256; cfg.max_tracks = 512;
+    std::uint32_t streams = 1;
     int limit = 0;
     SECTION("large model batch uses several bounded IFFTs") {}
+    SECTION("two receivers exceed 256 requests") { streams = 2; cfg.max_signals = 512; cfg.max_tracks = 1024; }
     SECTION("signal limit reports rejected requests") { limit = 1; cfg.max_signals = 16; }
     SECTION("workspace limit reports rejected requests") { limit = 2; cfg.scratch_complex = 32; }
     SECTION("track limit reports rejected requests") { limit = 3; cfg.max_tracks = 8; }
-    cfg.engine.buckets = {1, 4, 16, 64, 256}; cfg.engine.autotune = false;
+    cfg.engine.buckets = {1, 4, 16, 64, 256, 512}; cfg.engine.autotune = false;
     std::vector<SignalResult> got;
-    SignalStage stage(cfg, model, {WireFormat::packed12, 1, kFs}, kBlock,
+    SignalStage stage(cfg, model, {WireFormat::packed12, streams, kFs}, kBlock,
                       [&](const SignalResult &r) { got.push_back(r); });
     std::mt19937 rng(71);
     std::normal_distribution<double> noise(0, .01);
-    std::vector<std::complex<double>> samples(4 * kWindowSamples);
+    std::vector<std::complex<double>> samples(4 * kWindowSamples * streams);
     for (auto &x : samples) x = {noise(rng), noise(rng)};
     const auto wire = pack(samples);
-    cuda::DeviceBuffer<std::uint8_t> d(kBlock * 3);
+    cuda::DeviceBuffer<std::uint8_t> d(kBlock * 3 * streams);
     std::vector<WindowResult> detections;
     // Independent coarse components stress scheduling, not classification truth.
-    for (int k = -249; k <= 249; k += 3)
-        detections.push_back({0, static_cast<unsigned>(k < 0 ? k + 512 : k), 0, 0, 1e-3f});
+    for (std::uint32_t s = 0; s < streams; ++s)
+        for (int k = -249; k <= 249; k += 3)
+            detections.push_back({s, static_cast<unsigned>(k < 0 ? k + 512 : k), 0, 0, 1e-3f});
     REQUIRE(detections.size() > 128);
     for (unsigned w = 0; w < 4; ++w) {
         for (unsigned b = 0; b < 2; ++b) {
             const std::size_t first = (std::size_t{w} * 2 + b) * kBlock;
-            CURF_CUDA_CHECK(cudaMemcpy(d.get(), wire.data() + first * 3, d.bytes(), cudaMemcpyHostToDevice));
+            CURF_CUDA_CHECK(cudaMemcpy(d.get(), wire.data() + first * 3 * streams, d.bytes(), cudaMemcpyHostToDevice));
             stage.enqueue(0, d.get(), kBlock, first, nullptr);
             CURF_CUDA_CHECK(cudaDeviceSynchronize());
         }

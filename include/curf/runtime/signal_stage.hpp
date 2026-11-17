@@ -33,7 +33,7 @@ namespace curf {
         std::uint32_t window_frames = 1024;    // stage-1 window, channel frames (x M/2 raw samples)
         std::uint32_t length = 1024;           // stage-2 model window
         std::uint32_t ring_blocks = 48;        // ~102 ms at the default block size (per RX)
-        std::uint32_t max_signals = 64;        // per window
+        std::uint32_t max_signals = 64;        // per window, up to 512
         std::uint32_t max_tracks = 256;
         std::size_t scratch_complex = std::size_t{1} << 22; // total IFFT storage per pending window
         std::uint32_t pending = 3;             // windows in flight on the stage-2 stream

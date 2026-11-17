@@ -194,7 +194,7 @@ def main():
         ap.error("display interval must be 0 or 50..1000 ms")
     if not 0 <= a.neighbor_db <= 30:
         ap.error("neighbour rejection must be in 0..30 dB")
-    if not 1 <= a.max_signals <= 256 or not a.max_signals <= a.max_tracks <= 4096 or not 8 <= a.scratch_mib <= 512:
+    if not 1 <= a.max_signals <= 512 or not a.max_signals <= a.max_tracks <= 4096 or not 8 <= a.scratch_mib <= 512:
         ap.error("invalid stage-2 capacity")
     if not 1 <= a.pending <= 8 or a.dual and a.dual_only:
         ap.error("require pending 1..8 and at most one dual mode")
