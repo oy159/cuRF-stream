@@ -2,6 +2,7 @@
 // Signal-level stage 2: coarse channels -> persistent carriers -> rational FFT-bank extraction -> engine.
 // A ~100 ms packed-wire ring retains the current hop plus three hops of FIR history. One shared 4*hop FFT
 // per RX feeds noise-subtracted fine bandwidth estimates, then batched IFFTs grouped by output rate.
+// Broad-band geometry uses a separate current-hop spectrum; extraction retains all FIR history.
 // The {2^m, 1.5*2^m} rates preserve the run4 training grid (normally 2B..3B). Finite Blackman FIRs and valid
 // output intervals remove independent-block seams; the explicit causal delay is 16 output samples.
 // Narrow streams keep their centre/rate while collecting consecutive samples; carry is retained across
@@ -27,6 +28,14 @@
 namespace curf {
 
     struct SignalResult;
+    struct SignalBandEstimate {
+        std::uint64_t window;
+        std::uint32_t stream, track;
+        double lo_hz, hi_hz; // request edges, including the coarse guards
+        double measured_fc_hz, measured_bw_hz;
+        double applied_fc_hz, applied_bw_hz;
+        bool current_hop;
+    };
 
     struct SignalStageConfig {
         std::uint32_t channels = 512;          // stage-1 channel grid (M)
@@ -41,6 +50,8 @@ namespace curf {
         std::uint32_t track_timeout_windows = 48; // a track not detected for this long is dropped (~200 ms)
         std::uint32_t edge_guard = 4;          // channels at each band edge never used (analogue filter edge)
         std::function<void(const SignalResult &, std::span<const float>)> on_input; // optional diagnostic [L][3]
+        std::function<void(const SignalBandEstimate &, std::span<const float>)> on_band; // optional existing host PSD bins
+        bool current_hop_bandwidth = true; // broad requests: estimate from this hop; extraction keeps FIR history
         bool drop_when_busy = true; // offline replay can back-pressure instead of skipping a window
         engine::EngineConfig engine;           // buckets: the largest is the max windows per stage-2 run
     };

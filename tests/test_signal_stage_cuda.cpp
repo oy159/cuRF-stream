@@ -7,6 +7,7 @@
 #include "curf/reference.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -339,6 +340,87 @@ TEST_CASE("stage 2 rechecks a connected wide burst after narrow fragment tracks"
             return r.window >= 12 && std::abs(r.fc_hz - 182*120e3) < 240e3 && r.bw_hz < 1e6;
         }));
     }
+}
+
+TEST_CASE("wide PSD isolates the current hop on both receivers", "[cuda][stage2][bandwidth]") {
+    const std::filesystem::path dir = CURF_S2_MODEL_DIR;
+    if (!std::filesystem::exists(dir / "s2.curf")) SKIP("no stage-2 model");
+    const auto model = engine::Model::load(dir / "s2.curf");
+    const bool current = GENERATE(false,true);
+    constexpr unsigned windows = 4;
+    std::vector<std::complex<double>> samples(std::size_t{windows}*kWindowSamples*2);
+    for (unsigned w = 0; w < windows; ++w) for (unsigned j = 0; j < kWindowSamples; ++j) {
+        const auto n = std::size_t{w}*kWindowSamples+j;
+        for (unsigned s = 0; s < 2; ++s) {
+            const unsigned channel = ((w < 3) != bool(s)) ? 48 : 120;
+            const double amplitude = w < 3 ? .5 : .05;
+            samples[n*2+s] = std::polar(amplitude,2*std::numbers::pi*channel*120e3*n/kFs);
+        }
+    }
+    const auto wire = pack(samples);
+    SignalStageConfig cfg; cfg.drop_when_busy = false; cfg.current_hop_bandwidth = current;
+    cfg.engine.buckets = {1,4,16,64}; cfg.engine.autotune = false;
+    std::vector<std::pair<unsigned,double>> peaks;
+    cfg.on_band = [&](const SignalBandEstimate &b, std::span<const float> p) {
+        CHECK(b.current_hop == current);
+        CHECK(std::all_of(p.begin(),p.end(),[](float x) { return std::isfinite(x) && x >= 0; }));
+        const auto index = std::max_element(p.begin(),p.end())-p.begin();
+        peaks.emplace_back(b.stream,b.lo_hz+(index+.5)*(b.hi_hz-b.lo_hz)/p.size());
+    };
+    SignalStage stage(cfg,model,{WireFormat::packed12,2,kFs},kBlock,[](const auto &) {});
+    cuda::DeviceBuffer<std::uint8_t> d(kBlock*6);
+    for (unsigned w = 0; w < windows; ++w) {
+        for (unsigned b = 0; b < 2; ++b) {
+            const std::size_t first = (std::size_t{w}*2+b)*kBlock;
+            CURF_CUDA_CHECK(cudaMemcpy(d.get(),wire.data()+first*6,d.bytes(),cudaMemcpyHostToDevice));
+            stage.enqueue(0,d.get(),kBlock,first,nullptr);
+            CURF_CUDA_CHECK(cudaDeviceSynchronize());
+        }
+        std::vector<WindowResult> det;
+        if (w == 3) for (unsigned s = 0; s < 2; ++s) for (unsigned k = 24; k <= 160; ++k) det.push_back({s,k,0,0,1e-3f});
+        stage.on_window(w,std::uint64_t{w}*kWindowSamples,det.data(),det.size()); stage.flush();
+    }
+    REQUIRE(peaks.size() == 2);
+    for (const auto &[s,fc] : peaks) {
+        const unsigned channel = (current != bool(s)) ? 120 : 48;
+        CHECK(std::abs(fc-channel*120e3) < 50e3);
+    }
+    CHECK(stage.stats().skipped_busy == 0); CHECK(stage.stats().skipped_ring == 0); CHECK(stage.stats().skipped_capacity == 0);
+}
+
+TEST_CASE("broad central energy can refine centre without collapsing the bandwidth", "[cuda][stage2][bandwidth]") {
+    const std::filesystem::path dir = CURF_S2_MODEL_DIR;
+    if (!std::filesystem::exists(dir / "s2.curf")) SKIP("no stage-2 model");
+    const auto model = engine::Model::load(dir / "s2.curf");
+    const bool current = GENERATE(false,true);
+    unsigned centre = 84, tones = 16;
+    SECTION("broad central core") {}
+    SECTION("a single tone must not steer a broad candidate") { tones = 1; }
+    SECTION("an asymmetric component must not steer the centre") { centre = 96; }
+    std::vector<std::complex<double>> samples(kWindowSamples);
+    for (unsigned j = 0; j < kWindowSamples; ++j) for (unsigned t = 0; t < tones; ++t) {
+        const double frequency = (centre+(double(t)-.5*(tones-1))*7)*120e3;
+        samples[j] += std::polar(.3/tones,2*std::numbers::pi*frequency*j/kFs+.7*t);
+    }
+    const auto wire = pack(samples);
+    SignalStageConfig cfg; cfg.drop_when_busy = false; cfg.current_hop_bandwidth = current;
+    cfg.engine.buckets = {1,4,16,64}; cfg.engine.autotune = false;
+    std::vector<SignalBandEstimate> estimates;
+    cfg.on_band = [&](const auto &b, auto) { estimates.push_back(b); };
+    SignalStage stage(cfg,model,{WireFormat::packed12,1,kFs},kBlock,[](const auto &) {});
+    cuda::DeviceBuffer<std::uint8_t> d(kBlock*3);
+    for (unsigned b = 0; b < 2; ++b) {
+        const std::size_t first = std::size_t{b}*kBlock;
+        CURF_CUDA_CHECK(cudaMemcpy(d.get(),wire.data()+first*3,d.bytes(),cudaMemcpyHostToDevice));
+        stage.enqueue(0,d.get(),kBlock,first,nullptr); CURF_CUDA_CHECK(cudaDeviceSynchronize());
+    }
+    std::vector<WindowResult> det;
+    for (int k = -12; k <= 172; ++k) det.push_back({0,static_cast<unsigned>((k+512)%512),0,0,1e-3f});
+    stage.on_window(0,0,det.data(),det.size()); stage.flush();
+    REQUIRE(estimates.size() == 1);
+    const double expected = current && tones > 1 && centre == 84 ? 84*120e3 : 80*120e3;
+    CHECK(std::abs(estimates[0].measured_fc_hz-expected) < 80e3);
+    CHECK(std::abs(estimates[0].measured_bw_hz-185*120e3) < 80e3);
 }
 
 TEST_CASE("stage 2 retains model results across bounded in-flight windows", "[cuda][stage2][pending]") {

@@ -24,6 +24,7 @@ namespace curf {
 
         constexpr int kSub = 512;          // sub-bands per coarse band (bandwidth estimate)
         constexpr int kCand = 64;          // candidate segments when picking the strongest 1024 samples
+        constexpr unsigned kWideChannels = 64;
 
         struct Event {
             cudaEvent_t e = nullptr;
@@ -79,12 +80,13 @@ namespace curf {
         };
 
         // power of each request's coarse band in kSub sub-bands
-        __global__ void band_power_kernel(const float2 *__restrict__ spec, const BandReq *__restrict__ req, std::uint32_t nf,
+        __global__ void band_power_kernel(const float2 *__restrict__ spec, const float2 *__restrict__ current,
+                                          const BandReq *__restrict__ req, std::uint32_t nf, std::uint32_t wide_bins,
                                           float *__restrict__ sub) {
             const BandReq r = req[blockIdx.x];
             const std::uint32_t j = threadIdx.x; // sub-band
             const std::uint64_t a = std::uint64_t{r.nb} * j / kSub, b = std::uint64_t{r.nb} * (j + 1) / kSub;
-            const float2 *x = spec + std::size_t{r.stream} * nf;
+            const float2 *x = (current && r.nb >= wide_bins ? current : spec) + std::size_t{r.stream} * nf;
             float acc = 0.f;
             for (std::uint64_t i = a; i < b; ++i) {
                 const int kb = r.k0 + static_cast<int>(i);
@@ -263,7 +265,7 @@ namespace curf {
             std::uint64_t window = 0, first = 0;
             Clock::time_point ready_at;
             std::vector<Signal> sig;
-            DeviceBuffer<float2> spec, scratch;
+            DeviceBuffer<float2> spec, current_spec, scratch;
             DeviceBuffer<BandReq> d_band;
             PinnedBuffer<BandReq> h_band;
             DeviceBuffer<float> d_sub;
@@ -314,6 +316,7 @@ namespace curf {
             const std::size_t ms = c.max_signals;
             for (auto &p : pend) {
                 p.spec = DeviceBuffer<float2>(std::size_t{f.channels} * 4 * nf);
+                if (c.current_hop_bandwidth) p.current_spec = DeviceBuffer<float2>(p.spec.size());
                 p.scratch = DeviceBuffer<float2>(c.scratch_complex);
                 p.d_band = DeviceBuffer<BandReq>(ms);
                 p.h_band = PinnedBuffer<BandReq>(ms);
@@ -469,7 +472,7 @@ namespace curf {
                             const int extent = std::max(hi,tr.hi) - std::min(lo,tr.lo) + 1;
                             if (overlap >= .85 * extent) { continuing_probe = true; break; }
                         }
-                        if (hi - lo + 1 >= 64 && (continuing_probe ||
+                        if (hi - lo + 1 >= static_cast<int>(kWideChannels) && (continuing_probe ||
                             (hi - lo + 1 >= 3 * largest))) {
                             const int id = match_track(stream, lo, hi, w, true);
                             if (id >= 0) {
@@ -534,10 +537,24 @@ namespace curf {
                 CURF_CUDA_CHECK(cudaEventRecord(slots[u].read->e, s2));
                 slots[u].read_pending = true;
             }
+            const unsigned wide_bins = (kWideChannels+2)*4*nf/cfg.channels;
+            const bool current = cfg.current_hop_bandwidth && std::any_of(p.sig.begin(),p.sig.end(),
+                [&](const auto &s) { return s.band.nb >= wide_bins; });
+            if (current) {
+                // Estimating a burst from four hops mixes in older neighbouring bursts.
+                // Keep the original FFT for continuous FIR extraction; use a zero-padded
+                // current hop for broad-band geometry at exactly the same frequency grid.
+                CURF_CUDA_CHECK(cudaMemsetAsync(p.current_spec.get(),0,p.current_spec.bytes(),s2));
+                const std::size_t pitch = std::size_t{4}*nf*sizeof(float2);
+                CURF_CUDA_CHECK(cudaMemcpy2DAsync(p.current_spec.get()+3*nf,pitch,p.spec.get()+3*nf,pitch,
+                                                std::size_t{nf}*sizeof(float2),fmt.channels,cudaMemcpyDeviceToDevice,s2));
+            }
             bank->forward(reinterpret_cast<cf32 *>(p.spec.get()), s2);
+            if (current) bank->forward(reinterpret_cast<cf32 *>(p.current_spec.get()), s2);
             for (std::size_t i = 0; i < p.sig.size(); ++i) p.h_band[i] = p.sig[i].band;
             CURF_CUDA_CHECK(cudaMemcpyAsync(p.d_band.get(), p.h_band.get(), p.sig.size() * sizeof(BandReq), cudaMemcpyHostToDevice, s2));
-            band_power_kernel<<<static_cast<unsigned>(p.sig.size()), kSub, 0, s2>>>(p.spec.get(), p.d_band.get(), 4 * nf, p.d_sub.get());
+            band_power_kernel<<<static_cast<unsigned>(p.sig.size()), kSub, 0, s2>>>(p.spec.get(),
+                current ? p.current_spec.get() : nullptr,p.d_band.get(),4*nf,wide_bins,p.d_sub.get());
             CURF_CUDA_CHECK(cudaGetLastError());
             CURF_CUDA_CHECK(cudaMemcpyAsync(p.h_sub.get(), p.d_sub.get(), p.sig.size() * kSub * sizeof(float), cudaMemcpyDeviceToHost, s2));
             CURF_CUDA_CHECK(cudaEventRecord(p.a_done->e, s2));
@@ -569,8 +586,16 @@ namespace curf {
             }
             hi = std::min(hi, kSub - 1);
             const double a = b.k0 + lo * per, e = b.k0 + (hi + 1) * per;
-            if (coarse >= 32.0 * nf / cfg.channels && e - a < .6 * coarse)
-                return {b.k0 + b.nb / 2.0, coarse};
+            if (coarse >= 32.0 * nf / cfg.channels && e - a < .6 * coarse) {
+                const double centre = b.k0 + b.nb/2.0;
+                // A broad central core still gives a useful centre when the
+                // coarse skirts require retaining a wider bandwidth envelope.
+                // Isolated tones and strongly asymmetric pieces cannot steer it.
+                if (cfg.current_hop_bandwidth && coarse >= kWideChannels*4.0*nf/cfg.channels &&
+                    e-a >= .5*coarse && std::abs((a+e)/2-centre) <= .05*coarse)
+                    return {(a+e)/2,coarse};
+                return {centre,coarse};
+            }
             return {(a + e) / 2, std::max(e - a, per)};
         }
 
@@ -594,6 +619,13 @@ namespace curf {
                 if (tr.w && tr.w < L && tr.fill_window + 1 == p.window &&
                     2 * bw <= tr.w * bin_hz && std::abs(kc - tr.kc) <= static_cast<int>(tr.w / 2)) {
                     w = tr.w; kc = tr.kc;
+                }
+                if (cfg.on_band) {
+                    const auto &b = p.sig[i].band;
+                    cfg.on_band({p.window,b.stream,p.sig[i].track,b.k0*bin_hz/4,(static_cast<double>(b.k0)+b.nb)*bin_hz/4,
+                                 cbin*bin_hz/4,bwbin*bin_hz/4,kc*bin_hz/4,bw,
+                                 cfg.current_hop_bandwidth && b.nb >= (kWideChannels+2)*4*nf/cfg.channels},
+                                {p.h_sub.get()+i*kSub,kSub});
                 }
                 items.push_back({i, w, kc, bw});
             }
