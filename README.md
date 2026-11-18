@@ -77,31 +77,6 @@ cuRF-Stream 只通过 OmniCore 的 C ABI 依赖它（`-DCURF_OMNICORE=ON`）。�
   <img src="docs/img/architecture.svg" alt="系统架构：CPU 侧 USB 收包与环形缓冲，GPU 侧信道化、检测、gather、INT8 推理" width="100%">
 </p>
 
-<details>
-<summary>文本版架构图</summary>
-
-```
-CPU（C++）                                GPU（CUDA）
-──────────────────────                   ─────────────────────────────────────
-OmniCore USB 异步收包
-  │ och_recv 直接写入
-HostRing：SPSC 无锁环形缓冲
-  （2 MB 透明大页 + cudaHostRegister）
-  │ H2D（copy stream）
-  └────────────────────────────────────▶ ① 多相信道化：12 bit 解包融进 FIR fold + 批量 cuFFT
-                                         ② 逐信道功率、噪声底（25% 分位）、噪声形状白化
-                                         ③ 检测 + 邻道泄漏抑制 + warp ballot 压缩活跃信道
-                                         ④ gather：转置 + 归一化，直接写 fp16
-                                         ⑤ 推理：自研 INT8 引擎（6 个 kernel，CUDA Graph）
-                                         ⑥ softmax / argmax
-  ┌──────────────────────────────────── D2H：活跃数、识别结果、显示用功率
-调度：GPU 决定 batch 大小（主机只读回一个计数），推测提交
-背压 / 丢样计量，样点时间戳查缺口
-浏览器界面（SSE）：瀑布图 + 信号跟踪 + 识别标注
-```
-
-</details>
-
 数据源通过 `ISource` 接口可插拔：合成源（可超过 USB 速率，用来压测 GPU）、文件回放源（可复现）、OmniCore 实采源。
 
 ---
@@ -330,9 +305,6 @@ bench/                基准程序与 curf_classify
 tests/                Catch2 测试（GPU 对 CPU 参考 / golden）
 tools/                界面、场景生成、回环、FIR 设计、噪声形状、profile 汇总
 ```
-
-
-README 配图由 [`docs/img/make_figures.py`](docs/img/make_figures.py) 生成，数字更新后重新运行即可。
 
 ---
 
