@@ -21,6 +21,19 @@ cmake --build --preset cuda-release
 ctest --preset cuda-release
 ```
 
+## run1 演示回放
+
+单路 packed12 录音可通过 `--freq` 指定采集中心频率，界面按绝对频率显示。
+
+```sh
+build/cuda-release/bench/curf_classify --source file --file capture.p12 \
+  --streams 1 --freq 5.77e9 --seconds 0 --int8 --ui-out capture.feed
+python3 tools/ui_server.py --bind 127.0.0.1 --replay capture.feed --loop
+```
+
+2.4 GHz 演示汇总相邻信道的 OFDM 票。5 GHz 演示依据与占用频带匹配的循环前缀，支持 40–65 MS/s 的输入。
+证据不足的宽带显示为「占用」。用「原始分类」查看逐信道模型的结果。
+
 ## 目录
 
 ```

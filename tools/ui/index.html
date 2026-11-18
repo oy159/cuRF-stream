@@ -49,7 +49,10 @@
   .rows th { text-align: right; color: var(--dim); font-weight: 500; position: sticky; top: 0; background: var(--panel); padding: 0 4px; }
   .rows td { text-align: right; padding: 0 4px; white-space: nowrap; }
   .rows th:nth-child(3), .rows td:nth-child(3) { text-align: left; }
-  .rows tr:hover td { background: var(--hi); cursor: pointer; }
+  .rows tr:hover td, .rows tr:focus-within td { background: var(--hi); }
+  .rows button { border: 0; background: none; color: inherit; font: inherit; cursor: pointer; padding: 0; }
+  :is(button, select, input):focus-visible { outline: 2px solid #7aa7ff; outline-offset: 2px; }
+  .chip { background: none; font-family: inherit; }
   .rows i { width: 9px; height: 9px; border-radius: 2px; display: inline-block; margin-right: 5px; }
   #end { margin: 0 16px 16px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px; font-family: var(--mono); font-size: 12px; color: var(--dim); white-space: pre-wrap; display: none; }
 </style>
@@ -66,10 +69,13 @@
 </header>
 <div class="bar">
   <div class="legend" id="legend"></div>
+  <label class="ctl">视图
+    <select id="view-mode" disabled><option value="demo">频段演示</option><option value="raw">原始分类</option></select>
+  </label>
   <div class="ctl">平滑
     <select id="tau"><option value="0.15">0.15 s</option><option value="0.5" selected>0.5 s</option><option value="2">2 s</option></select>
   </div>
-  <label class="ctl"><input type="checkbox" id="steady" checked>只看持续信号</label>
+  <label class="ctl"><input type="checkbox" id="steady">只看持续信号</label>
   <div class="ctl"><button id="reset">全带宽</button><span>在瀑布图上拖动可放大频段，双击复原</span></div>
 </div>
 <main id="streams"></main>
@@ -83,10 +89,22 @@ const ROWS = 250, CROWS = 80;     // waterfall / class-waterfall history in rows
 const SPAN_DB = 50;
 // Track hysteresis on the presence EMA (fraction of recent rows with a detection)
 const ON = 0.35, OFF = 0.12;
+const OCCUPIED = -1;
+const DEMO_BANDS = [
+  { low: 2400e6, high: 2483.5e6, narrow: "gfsk" },
+  { low: 5150e6, high: 5850e6, cyclicPrefix: true },
+];
+const OFDM_MIN_WIDTH_HZ = 8e6, OFDM_MAX_GAP_HZ = 480e3;
+const OFDM_ENTER_SHARE = 0.50, OFDM_HOLD_SHARE = 0.40, OFDM_HOLD_SECONDS = 0.45;
+const CP_MATCH_SECONDS = 0.15, CP_HOLD_SECONDS = 0.75;
 
 let classes = [], meta = null, panels = [], counts = [], hidden = new Set();
+let demoBand = null, demoBins = [], ofdm = -1, narrowClass = -1, requestedMode = "demo";
 let rowDt = 0.034, rateT0 = performance.now(), rateRows = 0, lastList = 0;
 let view = [0, 512];               // displayed column range (fft-shifted columns)
+const mode = document.getElementById("view-mode");
+const isDemo = () => demoBand !== null && mode.value === "demo";
+const groupsFor = p => isDemo() ? p.demoGroups : p.groups;
 
 const LUT = (() => {
   const stops = [[0, 6, 8, 14], [0.25, 20, 40, 110], [0.5, 30, 140, 150], [0.75, 235, 200, 70], [1, 255, 255, 240]];
@@ -100,8 +118,8 @@ const LUT = (() => {
   return lut;
 })();
 const RGB = PALETTE.map(c => [1, 3, 5].map(i => parseInt(c.slice(i, i + 2), 16)));
-const color = c => PALETTE[c % PALETTE.length];
-const name = c => classes[c] || "c" + c;
+const color = c => c === OCCUPIED ? "#7d8896" : PALETTE[c % PALETTE.length];
+const name = c => c === OCCUPIED ? "占用" : classes[c] || "c" + c;
 const col = (k, M) => (k + M / 2) % M;                       // channel -> display column (left edge = -fs/2)
 const colHz = x => (x - meta.channels / 2) * meta.rate / meta.channels; // display column -> offset Hz
 const fmtMHz = x => ((meta.freq + colHz(x)) / 1e6).toFixed(2);
@@ -119,6 +137,14 @@ function build() {
   const M = meta.channels;
   view = [0, M];
   rowDt = meta.every * meta.window * M / (2 * meta.rate); // 2x-oversampled bank: channel rate 2 fs / M
+  demoBand = ofdm > 0 ? DEMO_BANDS.find(b => b.low <= meta.freq && meta.freq < b.high) ?? null : null;
+  narrowClass = classes.indexOf(demoBand?.narrow);
+  if (demoBand) {
+    const bin = hz => Math.ceil((hz - meta.freq) * M / meta.rate + M / 2);
+    demoBins = [Math.max(0, bin(demoBand.low)), Math.min(M, bin(demoBand.high))];
+  }
+  mode.disabled = !demoBand;
+  mode.value = demoBand ? requestedMode : "raw";
   for (let s = 0; s < meta.streams; s++) {
     const el = document.createElement("section");
     el.className = "stream";
@@ -130,12 +156,15 @@ function build() {
     const [axis, labels, wf, cls] = el.querySelectorAll("canvas");
     const off = document.createElement("canvas"); off.width = M; off.height = ROWS;
     const coff = document.createElement("canvas"); coff.width = M; coff.height = CROWS;
+    const demoOff = document.createElement("canvas"); demoOff.width = M; demoOff.height = CROWS;
     const p = { s, axis, labels, wf, cls, off, coff, info: el.querySelector(".info"), rows: el.querySelector(".rows"),
                 n: el.querySelector(".n"), sel: el.querySelector(".sel"), plots: el.querySelector(".plots"),
                 octx: off.getContext("2d"), cctx: coff.getContext("2d"), row: new ImageData(M, 1), crow: new ImageData(M, 1),
-                trk: newTrack(M, Math.max(classes.length, 16)), floor: null, last: null, groups: [] };
+                demoOff, demoCtx: demoOff.getContext("2d"), demoRow: new ImageData(M, 1),
+                trk: newTrack(M, Math.max(classes.length, 16)), floor: null, now: null, groups: [], demoGroups: [], cp: null };
     p.octx.fillStyle = "#06080e"; p.octx.fillRect(0, 0, M, ROWS);
     p.cctx.fillStyle = "#0b0e13"; p.cctx.fillRect(0, 0, M, CROWS);
+    p.demoCtx.fillStyle = p.cctx.fillStyle; p.demoCtx.fillRect(0, 0, M, CROWS);
     for (const c of [wf, cls]) hookMouse(p, c);
     panels.push(p);
   }
@@ -166,7 +195,7 @@ function drawAxis(p) {
 }
 
 function blit(p) {
-  for (const [cv, src, rows] of [[p.wf, p.off, ROWS], [p.cls, p.coff, CROWS]]) {
+  for (const [cv, src, rows] of [[p.wf, p.off, ROWS], [p.cls, isDemo() ? p.demoOff : p.coff, CROWS]]) {
     const [ctx, w, h] = fit(cv);
     ctx.imageSmoothingEnabled = false;
     ctx.drawImage(src, view[0], 0, view[1] - view[0], rows, 0, 0, w, h);
@@ -183,8 +212,13 @@ function onRow(row) {
   const det = panels.map(() => ({ cls: new Int16Array(M).fill(-1), prob: new Uint8Array(M) }));
   for (const [s, k, c, pr] of row.r) { const x = col(k, M); det[s].cls[x] = c; det[s].prob[x] = pr; }
   const now = row.t;
-  counts = new Array(C).fill(0);
   for (const p of panels) {
+    if (p.now !== null && (now <= p.now || now - p.now > Math.max(0.25, 3 * rowDt))) {
+      p.trk = newTrack(M, C);
+      p.demoGroups = [];
+      p.floor = null;
+      p.cp = null;
+    }
     const s = p.s, T = p.trk, D = det[s];
     const f = row.f[s];
     p.floor = p.floor === null ? f : p.floor + 0.05 * (f - p.floor);
@@ -217,22 +251,31 @@ function onRow(row) {
     p.cctx.drawImage(p.coff, 0, 0, M, CROWS - 1, 0, 1, M, CROWS - 1); p.cctx.putImageData(p.crow, 0, 0);
     p.now = now;
     p.groups = group(p, now);
-    for (const g of p.groups) if (!(document.getElementById("steady").checked && g.bursty)) counts[g.cls]++;
-    blit(p); drawLabels(p);
-    p.info.textContent = `本底 ${f.toFixed(1)} dBFS · 跟踪 ${p.groups.length} 个信号${p.hint || ""}`;
+    if (demoBand) {
+      const cpOffset = row.ofdm_cp?.[s];
+      if (demoBand.cyclicPrefix && Number.isFinite(cpOffset)) {
+        p.cp = { time: now, column: cpOffset * M / meta.rate + M / 2 };
+      }
+      p.demoGroups = groupDemo(p, now, C);
+      drawDemoRow(p, D.cls);
+    }
+    blit(p); drawLabels(p); updatePanelInfo(p);
   }
   document.getElementById("t").textContent = row.t.toFixed(2) + " s";
   rateRows++;
   const t = performance.now();
   if (t - rateT0 > 1000) { document.getElementById("rps").textContent = (rateRows * 1000 / (t - rateT0)).toFixed(1); rateT0 = t; rateRows = 0; }
-  if (t - lastList > 250) { lastList = t; for (const p of panels) drawList(p); drawLegend(); } // lists at 4 Hz
+  if (t - lastList > 250) { lastList = t; refreshLists(); } // lists at 4 Hz
+  if (!document.getElementById("state").classList.contains("live")) {
+    setState("live", meta.replay ? "回放中" : "运行中");
+  }
 }
 
-// Adjacent tracked columns with the same class form one signal (a wideband signal spans several channels).
-function group(p, now) {
+// Adjacent tracked columns of the same modulation form one raw signal.
+function group(p, now, onlyClass = null) {
   const T = p.trk, M = meta.channels, out = [];
   for (let x = 0; x < M;) {
-    if (!T.on[x] || T.cls[x] <= 0) { x++; continue; }
+    if (!T.on[x] || T.cls[x] <= 0 || (onlyClass !== null && T.cls[x] !== onlyClass)) { x++; continue; }
     const c = T.cls[x];
     let e = x, pmax = -200, conf = 0, since = now, wsum = 0, xw = 0, act = 0;
     while (e < M && T.on[e] && T.cls[e] === c) {
@@ -247,6 +290,77 @@ function group(p, now) {
   return out;
 }
 
+function groupDemo(p, now, classCount) {
+  const T = p.trk, step = meta.rate / meta.channels;
+  const maxGap = Math.floor(OFDM_MAX_GAP_HZ / step);
+  const [lo, hi] = demoBins;
+  const wide = [];
+  for (let x = lo; x < hi;) {
+    if (!T.on[x]) { ++x; continue; }
+    const left = x;
+    let right = left;
+    for (let k = left + 1; k < hi; ++k) {
+      if (T.on[k]) right = k;
+      else if (k - right > maxGap) break;
+    }
+    x = right + 1;
+    if ((x - left) * step < OFDM_MIN_WIDTH_HZ) continue;
+
+    let occupied = 0, vote = 0, peak = -200, oldest = now, act = 0;
+    for (let k = left; k < x; ++k) {
+      if (!T.on[k]) continue;
+      const offset = k * classCount;
+      let allVotes = 0;
+      for (let c = 0; c < classCount; ++c) allVotes += T.score[offset + c];
+      // Keep disallowed classes in the denominator so filtering cannot inflate OFDM evidence.
+      if (allVotes > 0) vote += T.score[offset + ofdm] / allVotes;
+      ++occupied;
+      peak = Math.max(peak, T.pw[k]);
+      oldest = Math.min(oldest, T.since[k]);
+      act += T.act[k];
+    }
+    const dense = occupied >= (x - left) * 0.75;
+    const share = vote / occupied;
+    const previous = p.demoGroups.find(g => g.cls === ofdm &&
+      Math.min(x, g.x1) - Math.max(left, g.x0) >= 0.65 * Math.max(x - left, g.x1 - g.x0));
+    const confirmed = !demoBand.cyclicPrefix && dense && share >= OFDM_ENTER_SHARE;
+    const held = !demoBand.cyclicPrefix && dense && share >= OFDM_HOLD_SHARE &&
+      previous && now - previous.confirmedAt <= OFDM_HOLD_SECONDS;
+    const margin = (x - left) * 0.10;
+    const freshCp = dense && p.cp && now - p.cp.time <= CP_MATCH_SECONDS &&
+      p.cp.column >= left + margin && p.cp.column < x - margin;
+    const cpAt = freshCp ? p.cp.time :
+      dense && previous && now - previous.cpAt <= CP_HOLD_SECONDS ? previous.cpAt : undefined;
+    wide.push({
+      x0: left, x1: x, xc: (left + right) / 2,
+      cls: confirmed || held || cpAt !== undefined ? ofdm : OCCUPIED,
+      conf: share, snr: peak - p.floor, age: now - oldest, bursty: act / occupied < 0.8,
+      confirmedAt: confirmed ? now : previous?.confirmedAt, cpAt,
+      recent: cpAt !== undefined && !confirmed && now - cpAt > 0.20,
+    });
+  }
+  const narrow = group(p, now, narrowClass).filter(g =>
+    g.x0 >= lo && g.x1 <= hi && (g.x1 - g.x0) * step <= 3e6 &&
+    !wide.some(b => b.x0 < g.x1 && g.x0 < b.x1));
+  return wide.concat(narrow).sort((a, b) => a.x0 - b.x0);
+}
+
+function drawDemoRow(p, detected) {
+  const pixels = p.demoRow.data, hit = [40, 44, 54, 255], empty = [11, 14, 19, 255];
+  for (let x = 0; x < meta.channels; ++x) {
+    pixels.set(detected[x] >= 0 ? hit : empty, 4 * x);
+  }
+  for (const g of p.demoGroups) {
+    if (hidden.has(g.cls)) continue;
+    const rgb = g.cls === OCCUPIED ? [54, 61, 72] : RGB[g.cls % RGB.length];
+    const strength = g.recent ? 0.60 : g.cls === OCCUPIED || g.cpAt !== undefined ? 1 : 0.35 + 0.65 * g.conf;
+    const rgba = [...rgb.map(value => value * strength), 255];
+    for (let x = g.x0; x < g.x1; ++x) pixels.set(rgba, 4 * x);
+  }
+  p.demoCtx.drawImage(p.demoOff, 0, 0, meta.channels, CROWS - 1, 0, 1, meta.channels, CROWS - 1);
+  p.demoCtx.putImageData(p.demoRow, 0, 0);
+}
+
 // Label strip: every signal gets a colour bar (class colour; bursty signals half transparent). The class name
 // is written where the gap to the neighbouring signals holds it - at full band ~100 signals share ~800 px,
 // so names appear once you zoom in. No greedy "first label that fits" choice: that made a different signal win the
@@ -259,14 +373,12 @@ function drawLabels(p) {
   const gs = visible(p), cx = gs.map(g => (xOf(g.x0, w) + xOf(g.x1, w)) / 2), lineEnd = [-Infinity, -Infinity];
   gs.forEach((g, i) => {
     const x0 = xOf(g.x0, w), x1 = xOf(g.x1, w);
-    ctx.globalAlpha = g.bursty ? 0.45 : 1;
+    ctx.globalAlpha = g.bursty || g.recent ? 0.45 : 1;
     ctx.fillStyle = color(g.cls);
     ctx.fillRect(x0 + 0.5, h - 10, Math.max(2, x1 - x0 - 1), 10);
     ctx.globalAlpha = 1;
     shown++;
-    // Names go on the first of two text lines where they do not overlap the previous name on that line.
-    // With the steady signals only (the default), the set of signals - and so the layout - does not change
-    // while the tracks are steady.
+    // Names go on the first of two text lines with room for the complete label.
     ctx.font = "600 11px system-ui, sans-serif";
     const t1 = name(g.cls), tw = ctx.measureText(t1).width + 4, a = cx[i] - tw / 2, b = cx[i] + tw / 2;
     if (a >= 0 && b <= w)
@@ -279,28 +391,74 @@ function drawLabels(p) {
 // Signals shown: not hidden by the legend, inside the view, and (optionally) not bursty.
 function visible(p) {
   const steady = document.getElementById("steady").checked;
-  return p.groups.filter(g => !hidden.has(g.cls) && g.x1 > view[0] && g.x0 < view[1] && !(steady && g.bursty));
+  return groupsFor(p).filter(g => !hidden.has(g.cls) && g.x1 > view[0] && g.x0 < view[1] && !(steady && g.bursty));
 }
 
 function drawList(p) {
+  if (p.rows.contains(document.activeElement)) return;
   const gs = visible(p);
   p.n.textContent = `${gs.length} 个`;
   const bw = meta.rate / meta.channels;
-  p.rows.innerHTML = `<table><tr><th>频率 MHz</th><th>带宽 kHz</th><th>类别</th><th>置信</th><th>SNR</th><th>持续</th></tr>` +
-    gs.map(g => `<tr data-x="${g.xc}"><td>${fmtMHz(g.xc)}</td><td>${Math.round((g.x1 - g.x0 + 1) * bw / 1e3)}</td>` +
-      `<td><i style="background:${color(g.cls)};opacity:${g.bursty ? 0.45 : 1}"></i>${name(g.cls)}${g.bursty ? " <span style=\"color:#7d8896\">突发</span>" : ""}</td><td>${Math.round(g.conf * 100)}%</td>` +
+  p.rows.innerHTML = `<table><thead><tr><th scope="col">频率 MHz</th><th scope="col">带宽 kHz</th><th scope="col">类别</th><th scope="col">依据</th><th scope="col">SNR</th><th scope="col">持续</th></tr></thead><tbody>` +
+    gs.map(g => `<tr><td><button type="button" data-x="${g.xc}" aria-label="放大 ${fmtMHz(g.xc)} MHz">${fmtMHz(g.xc)}</button></td><td>${Math.round((g.x1 - g.x0) * bw / 1e3)}</td>` +
+      `<td><i style="background:${color(g.cls)};opacity:${g.bursty || g.recent ? 0.45 : 1}"></i>${name(g.cls)}${g.bursty ? " 突发" : ""}${g.recent ? " 近期" : ""}</td><td>${evidenceLabel(g)}</td>` +
       `<td>${g.snr.toFixed(0)} dB</td><td>${g.age < 60 ? g.age.toFixed(1) + " s" : (g.age / 60).toFixed(1) + " min"}</td></tr>`).join("") +
-    `</table>`;
-  for (const tr of p.rows.querySelectorAll("tr[data-x]"))
-    tr.onclick = () => { const x = parseFloat(tr.dataset.x), half = 24; setView(x - half, x + half); };
+    (gs.length ? "" : '<tr><td colspan="6">当前范围没有可显示的信号</td></tr>') + "</tbody></table>";
+  for (const button of p.rows.querySelectorAll("button[data-x]"))
+    button.onclick = () => { const x = Number(button.dataset.x); setView(x - 24, x + 24); };
 }
 
 function drawLegend() {
   const el = document.getElementById("legend");
-  el.innerHTML = classes.map((n, c) => c === 0 ? "" :
-    `<span class="chip${hidden.has(c) ? " off" : ""}" data-c="${c}"><i style="background:${color(c)}"></i>${n} <b>${counts[c] || 0}</b></span>`).join("");
-  for (const ch of el.querySelectorAll(".chip"))
-    ch.onclick = () => { const c = +ch.dataset.c; hidden.has(c) ? hidden.delete(c) : hidden.add(c); drawLegend(); for (const p of panels) { drawList(p); drawLabels(p); } };
+  const options = isDemo() ? [ofdm, narrowClass].filter(c => c > 0) : classes.map((_, c) => c).slice(1);
+  if (el.dataset.classes !== options.join(",")) {
+    el.dataset.classes = options.join(",");
+    el.replaceChildren(...options.map(c => {
+      const button = document.createElement("button");
+      button.type = "button"; button.className = "chip"; button.dataset.c = c;
+      const swatch = document.createElement("i");
+      swatch.style.background = color(c);
+      button.append(swatch, name(c), document.createElement("b"));
+      button.onclick = () => {
+        if (hidden.has(c)) hidden.delete(c);
+        else hidden.add(c);
+        refreshLists(); redrawAll();
+      };
+      return button;
+    }));
+  }
+  for (const chip of el.children) {
+    const c = Number(chip.dataset.c), shown = !hidden.has(c);
+    chip.classList.toggle("off", !shown);
+    chip.setAttribute("aria-pressed", shown);
+    chip.lastElementChild.textContent = counts[c] || 0;
+  }
+}
+
+function refreshLists() {
+  counts = new Array(classes.length).fill(0);
+  for (const p of panels) {
+    for (const g of groupsFor(p)) {
+      if (g.cls > 0 && !(document.getElementById("steady").checked && g.bursty)) ++counts[g.cls];
+    }
+    drawList(p);
+    updatePanelInfo(p);
+  }
+  drawLegend();
+}
+
+function updatePanelInfo(p) {
+  if (p.floor === null) return;
+  const groups = groupsFor(p);
+  const occupied = groups.filter(g => g.cls === OCCUPIED).length;
+  p.info.textContent = `本底 ${p.floor.toFixed(1)} dBFS · 跟踪 ${groups.length - occupied} 个信号` +
+    (occupied ? ` · ${occupied} 段占用` : "") + (p.hint || "");
+}
+
+function evidenceLabel(g) {
+  if (g.cls === OCCUPIED) return "—";
+  if (g.cpAt !== undefined) return "循环前缀";
+  return Math.round(g.conf * 100) + "% 票";
 }
 
 function setView(a, b) {
@@ -327,8 +485,11 @@ function hookMouse(p, cv) {
     const k = (x + M / 2) % M;
     tip.style.display = "block";
     tip.style.left = (e.clientX + 14) + "px"; tip.style.top = (e.clientY + 12) + "px";
+    const g = groupsFor(p).find(signal => signal.x0 <= x && x < signal.x1 && !hidden.has(signal.cls));
+    const label = g ? `${name(g.cls)}${g.recent ? "（近期）" : ""}  ${evidenceLabel(g)}` :
+      T.on[x] ? "检测到占用" : "未跟踪";
     tip.textContent = `${fmtMHz(x)} MHz  (信道 ${k})\n功率 ${T.pw[x].toFixed(0)} dBFS · 高于本底 ${(T.pw[x] - p.floor).toFixed(0)} dB\n` +
-      (T.on[x] && T.cls[x] > 0 ? `${name(T.cls[x])}  置信 ${Math.round(T.conf[x] * 100)}%  已持续 ${(p.now - T.since[x]).toFixed(1)} s` : "未跟踪");
+      label;
   });
   cv.addEventListener("mouseleave", () => { tip.style.display = "none"; });
   addEventListener("mouseup", e => {
@@ -347,7 +508,7 @@ function setState(cls, text) {
 }
 
 function onEnd(st) {
-  setState("ended", "已结束");
+  setState("ended", meta?.loop ? "回放间隔" : "已结束");
   const el = document.getElementById("end");
   el.style.display = "block";
   const keys = ["wall_s", "x_realtime", "windows", "classified", "dropped_frames", "gap_frames", "latency_ms"];
@@ -356,20 +517,27 @@ function onEnd(st) {
 
 async function start() {
   try { classes = await (await fetch("/classes")).json(); } catch { classes = []; }
+  if (!Array.isArray(classes)) classes = [];
+  ofdm = classes.indexOf("ofdm");
   drawLegend();
   document.getElementById("reset").onclick = () => meta && setView(0, meta.channels);
-  document.getElementById("steady").onchange = () => { for (const p of panels) { drawList(p); drawLabels(p); } };
+  document.getElementById("steady").onchange = () => { redrawAll(); refreshLists(); };
+  mode.onchange = () => {
+    requestedMode = mode.value;
+    redrawAll(); refreshLists();
+  };
   const es = new EventSource("/feed");
   es.onmessage = ev => {
     const m = JSON.parse(ev.data);
     if (m.meta) {
       meta = m.meta;
-      document.getElementById("src").textContent = meta.source;
+      document.getElementById("src").textContent = meta.replay ? `回放 · ${meta.source}` : meta.source;
       document.getElementById("rate").textContent = (meta.rate / 1e6).toFixed(2) + " MSPS × " + meta.streams;
       document.getElementById("fc").textContent = meta.freq ? (meta.freq / 1e6).toFixed(3) + " MHz" : "基带（相对频率）";
       document.getElementById("end").style.display = "none";
       build();
-      setState("live", "运行中");
+      refreshLists();
+      setState("live", meta.replay ? "回放中" : "运行中");
     } else if (m.end) onEnd(m.end);
     else if (meta) onRow(m);
   };

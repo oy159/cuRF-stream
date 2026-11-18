@@ -12,7 +12,7 @@ Replay of a recorded feed (curf_classify --ui-out FEED.jsonl), at the recorded p
 
 Then open http://<host>:8080/. Standard library only. Rows are JSON lines (see bench/classify.cpp):
 {"meta": {...}} once, then {"w", "t", "p": [S*M dBFS], "f": [S floor dB], "r": [[stream, channel, cls, prob%]]},
-and {"end": {stats}} at the end.
+with optional "ofdm_cp": [estimated offset in Hz or null per receiver], and {"end": {stats}} at the end.
 """
 
 import argparse
@@ -89,7 +89,11 @@ def run_replay(hub: Hub, path: Path, speed: float, loop: bool):
                 line = line.strip()
                 if not line:
                     continue
-                if line.startswith('{"w"'):
+                if line.startswith('{"meta"'):
+                    record = json.loads(line)
+                    record["meta"].update(replay=True, loop=loop)
+                    line = json.dumps(record, separators=(",", ":"))
+                elif line.startswith('{"w"'):
                     # pace by the sample time of the row: a file source's feed is not produced in real time
                     head = line[: line.index(',"p"')] + "}"
                     t = json.loads(head)["t"]

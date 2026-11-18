@@ -15,6 +15,7 @@
 //   omnicore:     [--rx 1|2|1,2] [--serial S] [--freq HZ] [--gain DB] [--agc 0..3] [--iq-bits 12|8] [--bandwidth HZ]
 //                 [--tx-file SC16 --tx-atten DB]  (loopback: send the file on TX1 in a loop; DB >= 40)
 //                 (--streams / --rate as for the other sources; drop mode is implied: hardware cannot wait)
+//   file:         [--freq HZ]  (recording centre frequency for display; defaults to baseband)
 //
 // Synthetic source: noise plus, per stream, N tones at the centres of N channels spread over the band
 // (random phases), so exactly N channels per stream carry energy - the load knob. Prints one JSON line of
@@ -23,6 +24,7 @@
 #include "curf/engine/model.hpp"
 #include "curf/runtime/classifier.hpp"
 #include "curf/sources.hpp"
+#include "ofdm_probe.hpp"
 #ifdef CURF_HAVE_OMNICORE
 #include "curf/omnicore_source.hpp"
 #endif
@@ -31,6 +33,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <memory>
 #include <numbers>
 #include <random>
 #include <sstream>
@@ -52,6 +55,7 @@ int main(int argc, char **argv) {
     // OmniCore source options (unused when built without it)
     [[maybe_unused]] std::string serial;
     [[maybe_unused]] double freq = 2.4e9, gain = 30, bandwidth = 0;
+    bool freq_given = false;
     [[maybe_unused]] std::uint32_t agc = 0, iq_bits = 12;
     double band_mhz = -1; // usable band for detection; default: all (omnicore: 52 MHz, see below)
     int dc_guard = -1;    // channels at DC never reported; default 0 (omnicore: 1, the LO leakage channel)
@@ -102,7 +106,7 @@ int main(int argc, char **argv) {
         else if (a == "--ui-out") ui_path = next();
         else if (a == "--ui-every") ui_every = std::max<std::uint64_t>(1, std::stoull(next()));
         else if (a == "--serial") serial = next();
-        else if (a == "--freq") freq = std::stod(next());
+        else if (a == "--freq") { freq = std::stod(next()); freq_given = true; }
         else if (a == "--gain") gain = std::stod(next());
         else if (a == "--bandwidth") bandwidth = std::stod(next());
         else if (a == "--agc") agc = static_cast<std::uint32_t>(std::stoul(next()));
@@ -122,6 +126,10 @@ int main(int argc, char **argv) {
         else { std::fprintf(stderr, "unknown option %s\n", a.c_str()); return 2; }
     }
 
+    if (freq_given && (!std::isfinite(freq) || freq < 0)) {
+        std::fprintf(stderr, "--freq requires a finite, nonnegative frequency in Hz\n");
+        return 2;
+    }
     const auto model = engine::Model::load(std::filesystem::path(model_dir) / "amc.curf");
     if (int8) {
         cfg.engine.int8 = true;
@@ -203,6 +211,23 @@ int main(int argc, char **argv) {
     // of the time on the cable loopback, a vote over 8 windows (34 ms) ~96 %. Channel order as produced.
     std::FILE *ui = ui_path.empty() ? nullptr : std::fopen(ui_path.c_str(), "w");
     const std::uint32_t S = fmt.channels, M = cfg.channelizer.channels;
+    const double ui_frequency = source == "omnicore" || (source == "file" && freq_given) ? freq : 0.0;
+    // The 5 GHz demo can confirm OFDM independently of the narrow-channel model.
+    const bool probe_ofdm = ui && 5150e6 <= ui_frequency && ui_frequency < 5850e6 &&
+                            40e6 <= fmt.sample_rate && fmt.sample_rate <= 65e6;
+    std::unique_ptr<OfdmProbe> ofdm_probe;
+    std::vector<OfdmEvidence> probe_windows(2 * S), ui_ofdm(S);
+    std::vector<unsigned> probe_counts(S);
+    std::vector<std::optional<double>> probe_centres(S);
+    if (probe_ofdm) {
+        ofdm_probe = std::make_unique<OfdmProbe>(fmt.sample_rate);
+        cfg.on_first_block = [&](std::uint64_t window, std::span<const std::uint8_t> wire) {
+            for (std::uint32_t s = 0; s < S; ++s) {
+                probe_windows[(window % 2) * S + s] = probe_centres[s]
+                    ? ofdm_probe->observe(wire, fmt, s, *probe_centres[s]) : OfdmEvidence{};
+            }
+        };
+    }
     std::vector<float> ui_max(std::size_t{S} * M, 0.f), ui_floor(S, 0.f);
     const auto ncls = static_cast<std::size_t>(model.tensors[model.output].channels);
     std::vector<float> ui_vote(std::size_t{S} * M * ncls, 0.f); // [S][M][classes] summed probabilities
@@ -211,7 +236,7 @@ int main(int argc, char **argv) {
         // physical receiver of each stream, for the panel titles (omnicore --rx 2: the only stream is RX2)
         const std::string rx = rx_mask == 2 ? "[2]" : S == 2 ? "[1,2]" : "[1]";
         std::fprintf(ui, "{\"meta\":{\"streams\":%u,\"channels\":%u,\"rate\":%.17g,\"freq\":%.17g,\"window\":%u,\"every\":%llu,\"source\":\"%s\",\"rx\":%s}}\n",
-                     S, M, fmt.sample_rate, source == "omnicore" ? freq : 0.0, cfg.window,
+                     S, M, fmt.sample_rate, ui_frequency, cfg.window,
                      static_cast<unsigned long long>(ui_every), source.c_str(), rx.c_str());
     }
     // Noise-shape calibration: per channel, the median power over (up to the first 4096) windows, divided by
@@ -233,6 +258,22 @@ int main(int argc, char **argv) {
             if (w % ui_every == 0) {
                 std::fill(ui_vote.begin(), ui_vote.end(), 0.f);
                 std::fill(ui_hits.begin(), ui_hits.end(), std::uint8_t{0});
+                std::fill(ui_ofdm.begin(), ui_ofdm.end(), OfdmEvidence{});
+                std::fill(probe_counts.begin(), probe_counts.end(), 0u);
+            }
+            if (probe_ofdm) {
+                for (std::uint32_t s = 0; s < S; ++s) {
+                    const auto &result = probe_windows[(w % 2) * S + s];
+                    if (result.contrast == 0) continue;
+                    auto &best = ui_ofdm[s];
+                    if (best.contrast > 0 && std::abs(result.offset_hz - best.offset_hz) <= 3e6) {
+                        ++probe_counts[s];
+                        if (result.contrast > best.contrast) best = result;
+                    } else if (result.contrast > best.contrast && probe_counts[s] < 2) {
+                        best = result;
+                        probe_counts[s] = 1;
+                    }
+                }
             }
             for (std::size_t i = 0; i < n; ++i) {
                 const std::size_t e = std::size_t{r[i].stream} * M + r[i].channel;
@@ -269,7 +310,23 @@ int main(int argc, char **argv) {
                 line += b;
                 comma = true;
             }
-            line += "]}\n";
+            line += "]";
+            if (probe_ofdm) {
+                line += ",\"ofdm_cp\":[";
+                for (std::uint32_t s = 0; s < S; ++s) {
+                    const auto offset = std::size_t{s} * M;
+                    probe_centres[s] = ofdm_probe_centre(std::span{ui_hits}.subspan(offset, M),
+                                                        std::span{ui_max}.subspan(offset, M), fmt.sample_rate);
+                    if (s) line += ',';
+                    if (probe_counts[s] < (ui_every > 1 ? 2u : 1u)) line += "null";
+                    else {
+                        std::snprintf(b, sizeof b, "%.0f", ui_ofdm[s].offset_hz);
+                        line += b;
+                    }
+                }
+                line += "]";
+            }
+            line += "}\n";
             std::fputs(line.c_str(), ui);
             std::fflush(ui);
         }

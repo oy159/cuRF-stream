@@ -22,6 +22,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -43,6 +44,8 @@ namespace curf {
         // channel [streams][channels] (linear, full scale = 1; channel k at k * fs / channels, k >= channels / 2
         // negative) and the per-stream noise floor. Setting it adds a 4 KB D2H per window (for displays).
         std::function<void(std::uint64_t window, const float *power, const float *floor)> on_power;
+        // Optional first wire block of each window on the consumer thread. The span is valid during the call.
+        std::function<void(std::uint64_t window, std::span<const std::uint8_t>)> on_first_block;
     };
 
     struct WindowResult {
