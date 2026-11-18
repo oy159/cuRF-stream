@@ -1,37 +1,56 @@
-# cuRF-Stream
+<p align="center">
+  <img src="docs/img/banner.svg" alt="cuRF-Stream：USB3 SDR + 笔记本 GPU 上的实时宽带信号识别" width="100%">
+</p>
 
-**一块自研 USB3 SDR + 一台游戏本，实时识别 2 × 61.44 MHz 带宽内全部 1024 个信道的调制方式。**
+<p align="center">
+  <b>一块自研 USB3 SDR + 一台游戏本，实时识别 2 × 61.44 MHz 带宽内全部 1024 个信道的调制方式。</b>
+</p>
+
+<p align="center">
+  <img alt="CUDA 12.8" src="https://img.shields.io/badge/CUDA-12.8-76B900?logo=nvidia&logoColor=white">
+  <img alt="sm_86" src="https://img.shields.io/badge/GPU-RTX%203050%20Laptop%20%C2%B7%20sm__86-76B900">
+  <img alt="C++" src="https://img.shields.io/badge/C%2B%2B-20-00599C?logo=cplusplus&logoColor=white">
+  <img alt="CMake" src="https://img.shields.io/badge/build-CMake%20presets-064F8C?logo=cmake&logoColor=white">
+  <img alt="tests" src="https://img.shields.io/badge/tests-41%20(CUDA%2025%20%C2%B7%20CPU%2016)-2ea44f">
+  <img alt="M5" src="https://img.shields.io/badge/M5%20%E8%AF%86%E5%88%AB%E8%B4%A8%E9%87%8F-%E6%9C%AA%E9%80%9A%E8%BF%87-d73a49">
+</p>
+
+<p align="center">
+  <a href="#硬件omnicore-sdr">硬件</a> ·
+  <a href="#系统架构">架构</a> ·
+  <a href="#自研推理引擎">推理引擎</a> ·
+  <a href="#端到端结果">结果</a> ·
+  <a href="#实采与回环">实采</a> ·
+  <a href="#工程中的几个发现">发现</a> ·
+  <a href="#快速开始">快速开始</a> ·
+  <a href="#局限">局限</a>
+</p>
 
 数据来自自研 USB3 SDR 及其传输层 OmniCore-SDR-Host。GPU 侧依次做解包、多相信道化、能量检测，再用**自研推理引擎**（手写 Tensor Core / INT8 kernel，不依赖 TensorRT）完成识别。整条链路跑在一块 60 W 的 RTX 3050 笔记本 GPU 上。
 
-**当前 M5 识别质量未通过**：实采仍有大量未识别候选和已知载波的长时间标签空窗。下列吞吐与零丢样结果属于运行指标，
-识别修复进展及失败对照见 [M5 识别质量复查](docs/m5-recognition.md)。
+> [!WARNING]
+> **当前 M5 识别质量未通过**：实采仍有大量未识别候选和已知载波的长时间标签空窗。下列吞吐与零丢样结果属于运行指标，识别修复进展及失败对照见 [M5 识别质量复查](docs/m5-recognition.md)。
+
+<p align="center">
+  <img src="docs/img/stats.svg" alt="关键指标：1024 信道、300 秒实采零丢样、p99 2.47 ms、INT8 34.3 万窗口/秒、领先 TensorRT 1.32×" width="100%">
+</p>
+
+<p align="center">
+  <img src="docs/img/live-900mhz.png" alt="实采界面：939 MHz，RX2 瀑布图与信号列表" width="100%"><br>
+  <sub>实采界面（RX2，中心 939 MHz）：上方瀑布图 + 识别标注，下方逐信道判决，右侧信号列表。图中大量“未识别信号”即上面提到的 M5 未通过项。</sub>
+</p>
 
 <!-- TODO: 实时界面录屏 docs/img/demo.gif（瀑布图 + 识别标注 + 角落常驻 MS/s、丢样数、p99 延迟） -->
 
 | | |
 |---|---|
-| 输入 | 2 路 × 61.44 MSPS，12 bit，USB3（368.6 MB/s） |
-| 信道化 | 512 信道 × 120 kHz / 路，2 倍过采样 |
-| 识别 | 9 类调制 + 噪声，每信道每 4.27 ms 一次 |
-| 实采长测 | **300 秒零丢样**，端到端延迟 p50 1.74 ms / p99 2.47 ms |
-| 推理引擎 | INT8 **34.3 万窗口/秒**；FP16 版对 TensorRT 11.4 领先 **1.3–1.4×** |
-| 全负载（1024 信道全部识别） | 吞吐模式 1.31×；合成源 300 秒实时持平（受笔记本约 38 W 散热上限约束） |
-| 硬件 | RTX 3050 Laptop（4 GB，sm_86，60 W）、i5-11400H |
-
----
-
-## 目录
-
-- [硬件：OmniCore SDR](#硬件omnicore-sdr)
-- [系统架构](#系统架构)
-- [自研推理引擎](#自研推理引擎)
-- [端到端结果](#端到端结果)
-- [实采与回环](#实采与回环)
-- [工程中的几个发现](#工程中的几个发现)
-- [快速开始](#快速开始)
-- [代码结构](#代码结构)
-- [局限](#局限)
+| 📡 输入 | 2 路 × 61.44 MSPS，12 bit，USB3（368.6 MB/s） |
+| 🔀 信道化 | 512 信道 × 120 kHz / 路，2 倍过采样 |
+| 🧠 识别 | 9 类调制 + 噪声，每信道每 4.27 ms 一次 |
+| ⏱️ 实采长测 | **300 秒零丢样**，端到端延迟 p50 1.74 ms / p99 2.47 ms |
+| ⚡ 推理引擎 | INT8 **34.3 万窗口/秒**；FP16 版对 TensorRT 11.4 领先 **1.3–1.4×** |
+| 🔥 全负载（1024 信道全部识别） | 吞吐模式 1.31×；合成源 300 秒实时持平（受笔记本约 38 W 散热上限约束） |
+| 💻 硬件 | RTX 3050 Laptop（4 GB，sm_86，60 W）、i5-11400H |
 
 ---
 
@@ -39,8 +58,6 @@
 
 本项目是 OmniCore SDR 的演示应用：插上板子，任何一台带 USB3 和 NVIDIA 显卡的电脑都能做全带宽的实时信号识别，不需要专用的 GPU 嵌入式平台或 RDMA 网卡。
 
-| | |
-|---|---|
 | 射频 | AD9361，2T2R，70 MHz – 6 GHz，模拟带宽最高 56 MHz |
 | 接口 | USB3（5 Gb/s），C ABI 驱动（OmniCore-SDR-Host） |
 | 采样 | 2 路 61.44 MSPS（12 bit packed 或 8 bit）；12 bit 2R1T 时最高 58.5 MSPS |
@@ -55,6 +72,13 @@ cuRF-Stream 只通过 OmniCore 的 C ABI 依赖它（`-DCURF_OMNICORE=ON`）。�
 ---
 
 ## 系统架构
+
+<p align="center">
+  <img src="docs/img/architecture.svg" alt="系统架构：CPU 侧 USB 收包与环形缓冲，GPU 侧信道化、检测、gather、INT8 推理" width="100%">
+</p>
+
+<details>
+<summary>文本版架构图</summary>
 
 ```
 CPU（C++）                                GPU（CUDA）
@@ -76,6 +100,8 @@ HostRing：SPSC 无锁环形缓冲
 浏览器界面（SSE）：瀑布图 + 信号跟踪 + 识别标注
 ```
 
+</details>
+
 数据源通过 `ISource` 接口可插拔：合成源（可超过 USB 速率，用来压测 GPU）、文件回放源（可复现）、OmniCore 实采源。
 
 ---
@@ -93,6 +119,13 @@ HostRing：SPSC 无锁环形缓冲
 
 batch 512，CUDA Graph，冷机。每一级都有 Nsight Compute 数据支撑。
 
+<p align="center">
+  <img src="docs/img/ladder.svg" alt="推理引擎优化阶梯：从 naive 1,277 到 INT8 343,000 窗口/秒" width="100%">
+</p>
+
+<details>
+<summary>完整数据表</summary>
+
 | 步骤 | 窗口/秒 | 有效 TFLOPS | 关键改动 |
 |---|---|---|---|
 | 1. naive | 1,277 | 0.07 | 每线程一个输出 |
@@ -104,12 +137,17 @@ batch 512，CUDA Graph，冷机。每一级都有 Nsight Compute 数据支撑。
 | 8'. + swizzle、fragment 双缓冲 | **230,200** | **11.7** | 每层都追平或超过 CUTLASS |
 | 9. INT8 + 融合块 | 300,000–315,000 | — | 对称量化，99.99% 分位校准 |
 | 10. + stem / shortcut / head 融合 | **343,000** | — | 每次推理 6 个 kernel |
+</details>
 
 从 naive 到 FP16 最终版约 **180×**；INT8 再快 1.5×。batch 1 延迟 30.1 µs。
 
 ### 和库的对比
 
 同一 ONNX、同一轮背靠背测量（GPU 已温热，绝对值偏低）。cuDNN 和 CUTLASS 作为 kernel 变体接进同一个引擎，直接在引擎的 buffer 上运行，没有额外拷贝或重排。
+
+<p align="center">
+  <img src="docs/img/vs-libs.svg" alt="与 CUTLASS、TensorRT、cuDNN 的 FP16 吞吐对比" width="100%">
+</p>
 
 | 后端（FP16） | batch 512 窗口/秒 | 自研领先 | batch 1 | batch 8 |
 |---|---|---|---|---|
@@ -171,6 +209,7 @@ batch 512，CUDA Graph，冷机。每一级都有 Nsight Compute 数据支撑。
 - **空中实测**：900 MHz 的 LTE/NR 下行、2.4 GHz 的 WiFi 突发、FM 电台都能被检测并识别。
 - **前端噪声形状校准**：AD9361 的通带边缘有 5–9 dB 的噪声抬升，大小由增益决定。先在无信号时校准一次噪声形状，检测时按形状白化后用全局本底判断，误报减少一半到三分之二。
 - **实时界面**：信道跟踪（指数衰减投票）、信号出现 / 消失的迟滞判断、相邻同类信道合并、区分突发和持续信号、拖动放大、信号列表。
+
 
 ---
 
@@ -291,6 +330,9 @@ bench/                基准程序与 curf_classify
 tests/                Catch2 测试（GPU 对 CPU 参考 / golden）
 tools/                界面、场景生成、回环、FIR 设计、噪声形状、profile 汇总
 ```
+
+
+README 配图由 [`docs/img/make_figures.py`](docs/img/make_figures.py) 生成，数字更新后重新运行即可。
 
 ---
 
