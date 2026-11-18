@@ -274,8 +274,8 @@ namespace curf {
                             enqueue_range(w, 0, w.spec);
                             ++detected;
                         }
-                        if (part == 0 && cfg.on_first_block)
-                            cfg.on_first_block(wi, {slot->data, slot->frames * fb});
+                        if (cfg.on_input_block)
+                            cfg.on_input_block(wi, part == 0, {slot->data, slot->frames * fb});
                         ring.mark_submitted();
                         ++submitted;
                         progressed = true;

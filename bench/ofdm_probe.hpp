@@ -17,15 +17,14 @@ namespace curf {
         float contrast = 0;
     };
 
-    // Focus the probe on the strongest wide span in the previous display row.
-    inline std::optional<double> ofdm_probe_centre(std::span<const std::uint8_t> hits,
-                                                  std::span<const float> power, double rate) {
+    // Visit wide spans from the previous display row, in increasing frequency.
+    template<class Callback>
+    void for_each_probe_band(std::span<const std::uint8_t> hits, std::span<const float> power, double rate,
+                             Callback callback) {
         const auto channels = hits.size();
         const double step = rate / static_cast<double>(channels);
         const auto max_gap = static_cast<std::size_t>(480e3 / step);
         const auto bin = [channels](std::size_t i) { return (i + channels / 2) % channels; };
-        double best_power = 0;
-        std::optional<double> centre;
         for (std::size_t x = 0; x < channels;) {
             if (!hits[bin(x)]) { ++x; continue; }
             const auto left = x;
@@ -37,11 +36,22 @@ namespace curf {
                     energy += power[bin(x)];
                 }
             }
-            if (static_cast<double>(right - left + 1) * step >= 8e6 && energy > best_power) {
-                best_power = energy;
-                centre = (static_cast<double>(left + right) / 2 - static_cast<double>(channels / 2)) * step;
-            }
+            if (static_cast<double>(right - left + 1) * step >= 8e6)
+                callback((static_cast<double>(left) - channels / 2) * step,
+                         (static_cast<double>(right) - channels / 2) * step, energy);
         }
+    }
+
+    inline std::optional<double> ofdm_probe_centre(std::span<const std::uint8_t> hits,
+                                                  std::span<const float> power, double rate) {
+        double best_power = 0;
+        std::optional<double> centre;
+        for_each_probe_band(hits, power, rate, [&](double left, double right, double energy) {
+            if (energy > best_power) {
+                best_power = energy;
+                centre = (left + right) / 2;
+            }
+        });
         return centre;
     }
 

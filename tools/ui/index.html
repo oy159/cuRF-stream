@@ -89,16 +89,18 @@ const ROWS = 250, CROWS = 80;     // waterfall / class-waterfall history in rows
 const SPAN_DB = 50;
 // Track hysteresis on the presence EMA (fraction of recent rows with a detection)
 const ON = 0.35, OFF = 0.12;
-const OCCUPIED = -1;
+const OCCUPIED = -1, DSSS = -2;
+const DSSS_RGB = [118, 199, 192], DSSS_COLOR = `rgb(${DSSS_RGB.join(",")})`;
 const DEMO_BANDS = [
-  { low: 2400e6, high: 2483.5e6, narrow: "gfsk" },
+  { low: 2400e6, high: 2483.5e6, narrow: "gfsk", barker: true },
   { low: 5150e6, high: 5850e6, cyclicPrefix: true },
 ];
 const OFDM_MIN_WIDTH_HZ = 8e6, OFDM_MAX_GAP_HZ = 480e3;
 const OFDM_ENTER_SHARE = 0.50, OFDM_HOLD_SHARE = 0.40, OFDM_HOLD_SECONDS = 0.45;
 const CP_MATCH_SECONDS = 0.15, CP_HOLD_SECONDS = 0.75;
+const BARKER_HOLD_SECONDS = 0.75, DSSS_HALF_WIDTH_HZ = 11e6;
 
-let classes = [], meta = null, panels = [], counts = [], hidden = new Set();
+let classes = [], meta = null, panels = [], counts = new Map(), hidden = new Set();
 let demoBand = null, demoBins = [], ofdm = -1, narrowClass = -1, requestedMode = "demo";
 let rowDt = 0.034, rateT0 = performance.now(), rateRows = 0, lastList = 0;
 let view = [0, 512];               // displayed column range (fft-shifted columns)
@@ -118,8 +120,8 @@ const LUT = (() => {
   return lut;
 })();
 const RGB = PALETTE.map(c => [1, 3, 5].map(i => parseInt(c.slice(i, i + 2), 16)));
-const color = c => c === OCCUPIED ? "#7d8896" : PALETTE[c % PALETTE.length];
-const name = c => c === OCCUPIED ? "占用" : classes[c] || "c" + c;
+const color = c => c === DSSS ? DSSS_COLOR : c === OCCUPIED ? "#7d8896" : PALETTE[c % PALETTE.length];
+const name = c => c === DSSS ? "DSSS" : c === OCCUPIED ? "占用" : classes[c] || "c" + c;
 const col = (k, M) => (k + M / 2) % M;                       // channel -> display column (left edge = -fs/2)
 const colHz = x => (x - meta.channels / 2) * meta.rate / meta.channels; // display column -> offset Hz
 const fmtMHz = x => ((meta.freq + colHz(x)) / 1e6).toFixed(2);
@@ -161,7 +163,8 @@ function build() {
                 n: el.querySelector(".n"), sel: el.querySelector(".sel"), plots: el.querySelector(".plots"),
                 octx: off.getContext("2d"), cctx: coff.getContext("2d"), row: new ImageData(M, 1), crow: new ImageData(M, 1),
                 demoOff, demoCtx: demoOff.getContext("2d"), demoRow: new ImageData(M, 1),
-                trk: newTrack(M, Math.max(classes.length, 16)), floor: null, now: null, groups: [], demoGroups: [], cp: null };
+                trk: newTrack(M, Math.max(classes.length, 16)), floor: null, now: null,
+                groups: [], demoGroups: [], wideGroups: [], cp: null, barker: new Map() };
     p.octx.fillStyle = "#06080e"; p.octx.fillRect(0, 0, M, ROWS);
     p.cctx.fillStyle = "#0b0e13"; p.cctx.fillRect(0, 0, M, CROWS);
     p.demoCtx.fillStyle = p.cctx.fillStyle; p.demoCtx.fillRect(0, 0, M, CROWS);
@@ -216,8 +219,10 @@ function onRow(row) {
     if (p.now !== null && (now <= p.now || now - p.now > Math.max(0.25, 3 * rowDt))) {
       p.trk = newTrack(M, C);
       p.demoGroups = [];
+      p.wideGroups = [];
       p.floor = null;
       p.cp = null;
+      p.barker.clear();
     }
     const s = p.s, T = p.trk, D = det[s];
     const f = row.f[s];
@@ -255,6 +260,13 @@ function onRow(row) {
       const cpOffset = row.ofdm_cp?.[s];
       if (demoBand.cyclicPrefix && Number.isFinite(cpOffset)) {
         p.cp = { time: now, column: cpOffset * M / meta.rate + M / 2 };
+      }
+      if (demoBand.barker) {
+        for (const hz of row.dsss_barker?.[s] ?? []) {
+          if (Number.isFinite(hz)) p.barker.set(hz, { time: now, column: (hz - meta.freq) * M / meta.rate + M / 2 });
+        }
+        for (const [hz, hit] of p.barker)
+          if (now - hit.time > BARKER_HOLD_SECONDS) p.barker.delete(hz);
       }
       p.demoGroups = groupDemo(p, now, C);
       drawDemoRow(p, D.cls);
@@ -294,7 +306,7 @@ function groupDemo(p, now, classCount) {
   const T = p.trk, step = meta.rate / meta.channels;
   const maxGap = Math.floor(OFDM_MAX_GAP_HZ / step);
   const [lo, hi] = demoBins;
-  const wide = [];
+  const wide = [], rendered = [];
   for (let x = lo; x < hi;) {
     if (!T.on[x]) { ++x; continue; }
     const left = x;
@@ -321,7 +333,7 @@ function groupDemo(p, now, classCount) {
     }
     const dense = occupied >= (x - left) * 0.75;
     const share = vote / occupied;
-    const previous = p.demoGroups.find(g => g.cls === ofdm &&
+    const previous = p.wideGroups.find(g => (g.cls === ofdm || g.barkerColumns.length > 0) &&
       Math.min(x, g.x1) - Math.max(left, g.x0) >= 0.65 * Math.max(x - left, g.x1 - g.x0));
     const confirmed = !demoBand.cyclicPrefix && dense && share >= OFDM_ENTER_SHARE;
     const held = !demoBand.cyclicPrefix && dense && share >= OFDM_HOLD_SHARE &&
@@ -331,18 +343,51 @@ function groupDemo(p, now, classCount) {
       p.cp.column >= left + margin && p.cp.column < x - margin;
     const cpAt = freshCp ? p.cp.time :
       dense && previous && now - previous.cpAt <= CP_HOLD_SECONDS ? previous.cpAt : undefined;
-    wide.push({
-      x0: left, x1: x, xc: (left + right) / 2,
-      cls: confirmed || held || cpAt !== undefined ? ofdm : OCCUPIED,
+    const within = column => left <= column && column < x;
+    const hits = [...p.barker.values()].filter(hit => within(hit.column)).sort((a, b) => a.column - b.column);
+    // After the label expires, keep the OFDM veto while the same occupied
+    // span persists. A different span must establish its own evidence.
+    const barkerColumns = [...new Set([...(previous?.barkerColumns ?? []).filter(within), ...hits.map(hit => hit.column)])];
+    const labelOfdm = !barkerColumns.length && (confirmed || held || cpAt !== undefined);
+    const band = {
+      x0: left, x1: x, xc: (left + right) / 2, cls: labelOfdm ? ofdm : OCCUPIED,
       conf: share, snr: peak - p.floor, age: now - oldest, bursty: act / occupied < 0.8,
-      confirmedAt: confirmed ? now : previous?.confirmedAt, cpAt,
+      confirmedAt: labelOfdm && confirmed ? now : previous?.confirmedAt, cpAt, barkerColumns,
       recent: cpAt !== undefined && !confirmed && now - cpAt > 0.20,
-    });
+    };
+    wide.push(band);
+    if (hits.length) rendered.push(...renderDsss(p, band, hits, step, now));
+    else rendered.push(band);
   }
+  p.wideGroups = wide;
   const narrow = group(p, now, narrowClass).filter(g =>
     g.x0 >= lo && g.x1 <= hi && (g.x1 - g.x0) * step <= 3e6 &&
     !wide.some(b => b.x0 < g.x1 && g.x0 < b.x1));
-  return wide.concat(narrow).sort((a, b) => a.x0 - b.x0);
+  return rendered.concat(narrow).sort((a, b) => a.x0 - b.x0);
+}
+
+function renderDsss(p, band, hits, step, now) {
+  const groups = [], halfWidth = DSSS_HALF_WIDTH_HZ / step;
+  let cursor = band.x0;
+  const occupied = (left, right) => {
+    if ((right - left) * step >= OFDM_MIN_WIDTH_HZ)
+      groups.push({ ...band, x0: left, x1: right, xc: (left + right - 1) / 2 });
+  };
+  hits.forEach((hit, i) => {
+    const left = Math.max(cursor, Math.ceil(hit.column - halfWidth));
+    const midpoint = hits[i + 1] ? (hit.column + hits[i + 1].column) / 2 : Infinity;
+    const right = Math.min(band.x1, Math.ceil(hit.column + halfWidth), Math.ceil(midpoint));
+    occupied(cursor, left);
+    let peak = -200;
+    for (let x = left; x < right; ++x) peak = Math.max(peak, p.trk.pw[x]);
+    groups.push({
+      ...band, x0: left, x1: right, xc: hit.column, cls: DSSS,
+      snr: peak - p.floor, recent: now - hit.time > 0.20,
+    });
+    cursor = right;
+  });
+  occupied(cursor, band.x1);
+  return groups;
 }
 
 function drawDemoRow(p, detected) {
@@ -352,8 +397,9 @@ function drawDemoRow(p, detected) {
   }
   for (const g of p.demoGroups) {
     if (hidden.has(g.cls)) continue;
-    const rgb = g.cls === OCCUPIED ? [54, 61, 72] : RGB[g.cls % RGB.length];
-    const strength = g.recent ? 0.60 : g.cls === OCCUPIED || g.cpAt !== undefined ? 1 : 0.35 + 0.65 * g.conf;
+    const rgb = g.cls === DSSS ? DSSS_RGB : g.cls === OCCUPIED ? [54, 61, 72] : RGB[g.cls % RGB.length];
+    const strength = g.recent ? 0.60 :
+      g.cls === DSSS || g.cls === OCCUPIED || g.cpAt !== undefined ? 1 : 0.35 + 0.65 * g.conf;
     const rgba = [...rgb.map(value => value * strength), 255];
     for (let x = g.x0; x < g.x1; ++x) pixels.set(rgba, 4 * x);
   }
@@ -410,7 +456,8 @@ function drawList(p) {
 
 function drawLegend() {
   const el = document.getElementById("legend");
-  const options = isDemo() ? [ofdm, narrowClass].filter(c => c > 0) : classes.map((_, c) => c).slice(1);
+  const options = isDemo() ? [ofdm, ...(demoBand.barker ? [DSSS] : []), ...[narrowClass].filter(c => c > 0)] :
+    classes.map((_, c) => c).slice(1);
   if (el.dataset.classes !== options.join(",")) {
     el.dataset.classes = options.join(",");
     el.replaceChildren(...options.map(c => {
@@ -431,15 +478,16 @@ function drawLegend() {
     const c = Number(chip.dataset.c), shown = !hidden.has(c);
     chip.classList.toggle("off", !shown);
     chip.setAttribute("aria-pressed", shown);
-    chip.lastElementChild.textContent = counts[c] || 0;
+    chip.lastElementChild.textContent = counts.get(c) ?? 0;
   }
 }
 
 function refreshLists() {
-  counts = new Array(classes.length).fill(0);
+  counts = new Map();
   for (const p of panels) {
     for (const g of groupsFor(p)) {
-      if (g.cls > 0 && !(document.getElementById("steady").checked && g.bursty)) ++counts[g.cls];
+      if (g.cls !== OCCUPIED && !(document.getElementById("steady").checked && g.bursty))
+        counts.set(g.cls, (counts.get(g.cls) ?? 0) + 1);
     }
     drawList(p);
     updatePanelInfo(p);
@@ -457,6 +505,7 @@ function updatePanelInfo(p) {
 
 function evidenceLabel(g) {
   if (g.cls === OCCUPIED) return "—";
+  if (g.cls === DSSS) return "Barker‑11";
   if (g.cpAt !== undefined) return "循环前缀";
   return Math.round(g.conf * 100) + "% 票";
 }

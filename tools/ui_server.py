@@ -12,7 +12,8 @@ Replay of a recorded feed (curf_classify --ui-out FEED.jsonl), at the recorded p
 
 Then open http://<host>:8080/. Standard library only. Rows are JSON lines (see bench/classify.cpp):
 {"meta": {...}} once, then {"w", "t", "p": [S*M dBFS], "f": [S floor dB], "r": [[stream, channel, cls, prob%]]},
-with optional "ofdm_cp": [estimated offset in Hz or null per receiver], and {"end": {stats}} at the end.
+with optional "ofdm_cp": [estimated offset in Hz or null per receiver] and "dsss_barker": [matched RF centres in Hz per receiver].
+The feed ends with {"end": {stats}}.
 """
 
 import argparse

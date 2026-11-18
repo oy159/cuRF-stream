@@ -31,8 +31,9 @@ build/cuda-release/bench/curf_classify --source file --file capture.p12 \
 python3 tools/ui_server.py --bind 127.0.0.1 --replay capture.feed --loop
 ```
 
-2.4 GHz 演示汇总相邻信道的 OFDM 票。5 GHz 演示依据与占用频带匹配的循环前缀，支持 40–65 MS/s 的输入。
-证据不足的宽带显示为「占用」。用「原始分类」查看逐信道模型的结果。
+2.4 GHz 演示优先显示有 Barker‑11 证据的 DSSS。DSSS 色带限在对应信道的占用子区段，其余宽带按相邻信道的 OFDM 票判决。
+同一片占用的 Barker 标签过期后显示「占用」。5 GHz 演示依据与占用频带匹配的循环前缀。
+物理层证据检测支持 40–65 MS/s 的输入。用「原始分类」查看逐信道模型的结果。
 
 ## 目录
 

@@ -24,7 +24,7 @@
 #include "curf/engine/model.hpp"
 #include "curf/runtime/classifier.hpp"
 #include "curf/sources.hpp"
-#include "ofdm_probe.hpp"
+#include "dsss_probe.hpp"
 #ifdef CURF_HAVE_OMNICORE
 #include "curf/omnicore_source.hpp"
 #endif
@@ -221,10 +221,40 @@ int main(int argc, char **argv) {
     std::vector<std::optional<double>> probe_centres(S);
     if (probe_ofdm) {
         ofdm_probe = std::make_unique<OfdmProbe>(fmt.sample_rate);
-        cfg.on_first_block = [&](std::uint64_t window, std::span<const std::uint8_t> wire) {
+        cfg.on_input_block = [&](std::uint64_t window, bool first, std::span<const std::uint8_t> wire) {
+            if (!first) return;
             for (std::uint32_t s = 0; s < S; ++s) {
                 probe_windows[(window % 2) * S + s] = probe_centres[s]
                     ? ofdm_probe->observe(wire, fmt, s, *probe_centres[s]) : OfdmEvidence{};
+            }
+        };
+    }
+    const bool probe_dsss = ui && 2400e6 <= ui_frequency && ui_frequency < 2483.5e6 &&
+                            40e6 <= fmt.sample_rate && fmt.sample_rate <= 65e6;
+    std::unique_ptr<DsssProbe> dsss_probe;
+    std::vector<std::vector<unsigned>> dsss_channels(S);
+    std::vector<std::array<std::uint64_t, kBarkerChannels>> dsss_probe_until(S);
+    std::vector<unsigned> dsss_windows(2 * S), ui_dsss(S);
+    if (probe_dsss) {
+        dsss_probe = std::make_unique<DsssProbe>(fmt.sample_rate);
+        cfg.on_input_block = [&](std::uint64_t window, bool first, std::span<const std::uint8_t> wire) {
+            const auto slice_bytes = DsssProbe::input_frames * fmt.frame_bytes();
+            const auto slices = wire.size() / slice_bytes;
+            for (std::uint32_t s = 0; s < S; ++s) {
+                auto &evidence = dsss_windows[(window % 2) * S + s];
+                if (first) evidence = 0;
+                const auto &channels = dsss_channels[s];
+                if (channels.empty() || !slices) continue;
+                // Sample different parts of both blocks so periodic beacons do
+                // not always land between observations.
+                for (std::size_t i = 0; i < std::min<std::size_t>(2, slices); ++i) {
+                    const auto channel = channels[(window + i + !first) % channels.size()];
+                    if (evidence & (1u << channel)) continue;
+                    const auto slice = (window + window / 17 + s + i * (slices / 2)) % slices;
+                    if (dsss_probe->observes_barker(wire.subspan(slice * slice_bytes), fmt, s,
+                                                    barker_frequency(channel) - ui_frequency))
+                        evidence |= 1u << channel;
+                }
             }
         };
     }
@@ -260,7 +290,10 @@ int main(int argc, char **argv) {
                 std::fill(ui_hits.begin(), ui_hits.end(), std::uint8_t{0});
                 std::fill(ui_ofdm.begin(), ui_ofdm.end(), OfdmEvidence{});
                 std::fill(probe_counts.begin(), probe_counts.end(), 0u);
+                std::fill(ui_dsss.begin(), ui_dsss.end(), 0u);
             }
+            if (probe_dsss)
+                for (std::uint32_t s = 0; s < S; ++s) ui_dsss[s] |= dsss_windows[(w % 2) * S + s];
             if (probe_ofdm) {
                 for (std::uint32_t s = 0; s < S; ++s) {
                     const auto &result = probe_windows[(w % 2) * S + s];
@@ -323,6 +356,30 @@ int main(int argc, char **argv) {
                         std::snprintf(b, sizeof b, "%.0f", ui_ofdm[s].offset_hz);
                         line += b;
                     }
+                }
+                line += "]";
+            }
+            if (probe_dsss) {
+                line += ",\"dsss_barker\":[";
+                for (std::uint32_t s = 0; s < S; ++s) {
+                    const auto offset = std::size_t{s} * M;
+                    const auto detected = barker_probe_channels(std::span{ui_hits}.subspan(offset, M),
+                                                                std::span{ui_max}.subspan(offset, M),
+                                                                fmt.sample_rate, ui_frequency);
+                    for (const auto ch : detected)
+                        dsss_probe_until[s][ch] = first + static_cast<std::uint64_t>(0.30 * fmt.sample_rate);
+                    dsss_channels[s].clear();
+                    for (unsigned ch = 0; ch < kBarkerChannels; ++ch)
+                        if (first < dsss_probe_until[s][ch]) dsss_channels[s].push_back(ch);
+                    line += s ? ",[" : "[";
+                    bool next = false;
+                    for (unsigned ch = 0; ch < kBarkerChannels; ++ch) {
+                        if (!(ui_dsss[s] & (1u << ch))) continue;
+                        std::snprintf(b, sizeof b, next ? ",%.0f" : "%.0f", barker_frequency(ch));
+                        line += b;
+                        next = true;
+                    }
+                    line += "]";
                 }
                 line += "]";
             }
