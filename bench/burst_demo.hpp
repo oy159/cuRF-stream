@@ -7,6 +7,9 @@
 #include <string_view>
 
 namespace curf {
+    struct RxCorrection;
+    void write_rx_correction(std::FILE *, const RxCorrection *);
     std::string run_burst_demo(ISource &, const engine::Model &, const BurstConfig &, std::FILE *feed,
-                               std::FILE *trace, std::string_view source, unsigned rx, unsigned every);
+                               std::FILE *trace, std::string_view source, unsigned rx, unsigned every,
+                               const RxCorrection *);
 }

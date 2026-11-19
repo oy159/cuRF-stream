@@ -127,6 +127,10 @@ def receiver_settings(data: dict) -> dict:
         if key != "frequency_mhz" and value != int(value):
             raise ValueError(key)
         settings[key] = round(value * 1e6) / 1e6 if key == "frequency_mhz" else int(value)
+    if "rx_correction" in data:
+        if type(data["rx_correction"]) is not bool:
+            raise ValueError("rx_correction")
+        settings["rx_correction"] = data["rx_correction"]
     return settings
 
 
@@ -158,6 +162,8 @@ class LiveReceiver:
                 "--freq", str(round(settings["frequency_mhz"] * 1e6)),
                 "--gain", str(settings["gain_db"]), "--seconds", str(settings["seconds"]),
             ]
+            if "rx_correction" in settings:
+                command += ["--rx-correction", "on" if settings["rx_correction"] else "off"]
             if self.remote:
                 command = ["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
                            "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2",
@@ -340,7 +346,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 settings = receiver_settings(data)
             except (ValueError, OverflowError):
-                self._json({"error": "中心频率、增益或时长超出可用范围。"}, 422)
+                self._json({"error": "接收设置无效，请检查频率、增益、时长及校正选项。"}, 422)
                 return
             self.receiver.apply(settings)
         elif action == "stop":

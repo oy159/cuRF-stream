@@ -29,10 +29,12 @@
                              padding: 2px 6px; font: inherit; cursor: pointer; }
   .receiver { margin: 4px 16px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); }
   .receiver-fields { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 15px; }
-  .receiver-fields input, .receiver-fields select, .receiver-fields button { min-height: 28px; }
-  .receiver-fields input { width: 8ch; padding: 2px 5px; color: var(--text); background: var(--bg);
+  .receiver-fields input[type="number"], .receiver-fields select, .receiver-fields button { min-height: 28px; }
+  .receiver-fields input[type="number"] { width: 8ch; padding: 2px 5px; color: var(--text); background: var(--bg);
                            border-radius: 4px; border: 1px solid var(--line); font: 12px var(--mono); }
   .receiver-fields input[aria-invalid="true"] { border-color: #ff9b91; }
+  .receiver-fields input[type="checkbox"] { accent-color: var(--focus); }
+  .receiver-fields [hidden] { display: none; }
   .receiver-fields #rx-frequency { width: 13ch; }
   .receiver-fields #rx-apply { color: var(--focus); border-color: var(--focus); min-width: 86px; }
   .receiver-fields button[aria-disabled="true"] { opacity: .45; cursor: default; }
@@ -107,6 +109,9 @@
     <label class="ctl">时长
       <input id="rx-seconds" type="number" step="1" required aria-describedby="rx-duration-help" aria-errormessage="rx-message">
       <span id="rx-duration-help">秒（0 不限）</span>
+    </label>
+    <label class="ctl" id="rx-correction-control" title="硬件直流偏置和 I/Q 幅相跟踪，应用设置后生效" hidden>
+      <input id="rx-correction" type="checkbox">直流 / I/Q 校正跟踪
     </label>
     <div class="ctl">
       <button id="rx-apply" type="submit">开始接收</button>
@@ -918,8 +923,11 @@ function receiverControls() {
   };
   const apply = document.getElementById("rx-apply");
   const stop = document.getElementById("rx-stop");
+  const correction = document.getElementById("rx-correction");
+  const correctionControl = document.getElementById("rx-correction-control");
   const message = document.getElementById("rx-message");
   let edited = false, pending = false, localError = "";
+  let correctionDraft = null, correctionReadback = null;
 
   const getPreset = () => ["2441", "5770"].includes(inputs.frequency_mhz.value) ? inputs.frequency_mhz.value : "";
   const active = () => ["running", "starting"].includes(receiverState?.state);
@@ -929,11 +937,27 @@ function receiverControls() {
     form.setAttribute("aria-busy", busy);
     apply.setAttribute("aria-disabled", busy || receiverState?.state === "starting");
     stop.setAttribute("aria-disabled", busy || !active());
+    correction.disabled = busy || receiverState?.state === "starting";
     apply.textContent = active() ? "应用设置" : "开始接收";
     const text = localError || receiverState?.error || "";
     if (message.textContent !== text) message.textContent = text;
     message.hidden = !text;
   }
+
+  function showCorrection(readback) {
+    correctionReadback = readback;
+    correctionControl.hidden = !readback;
+    if (readback && correctionDraft === null) {
+      correction.checked = readback.dc && readback.iq;
+      correction.indeterminate = readback.dc !== readback.iq;
+    }
+  }
+
+  correction.onchange = () => {
+    correctionDraft = correction.checked;
+    localError = "";
+    render();
+  };
 
   for (const input of Object.values(inputs)) {
     input.oninput = () => {
@@ -992,6 +1016,10 @@ function receiverControls() {
       input.removeAttribute("aria-invalid");
       data[key] = input.valueAsNumber;
     }
+    if (correctionDraft !== null) data.rx_correction = correctionDraft;
+    else if (correctionReadback && correctionReadback.dc === correctionReadback.iq)
+      data.rx_correction = correctionReadback.dc;
+    correctionDraft = null;
     edited = false;
     request(data);
   };
@@ -999,7 +1027,7 @@ function receiverControls() {
     if (stop.getAttribute("aria-disabled") !== "true") request({ action: "stop" });
   };
 
-  return state => {
+  function onStatus(state) {
     const first = !receiverState;
     if (receiverState?.run !== state.run && state.state === "starting") {
       // A retune starts a new time axis, frequency view, and signal history.
@@ -1022,7 +1050,7 @@ function receiverControls() {
       form.hidden = false;
     }
     if (first || (!edited && state.state !== "stopping")) {
-      for (const [key, value] of Object.entries(state.settings)) inputs[key].value = value;
+      for (const [key, input] of Object.entries(inputs)) input.value = state.settings[key];
       preset.value = getPreset();
     }
     const phase = {
@@ -1030,8 +1058,10 @@ function receiverControls() {
       stopping: ["wait", "正在停止接收"], ended: ["ended", "已结束"], error: ["error", "接收失败"],
     };
     setState(...phase[state.state]);
+    if (state.state === "error") showCorrection(correctionReadback);
     render();
-  };
+  }
+  return { onStatus, showCorrection };
 }
 
 async function start() {
@@ -1046,13 +1076,14 @@ async function start() {
     requestedMode = mode.value;
     redrawAll(); refreshLists();
   };
-  const onReceiver = receiverControls();
+  const receiver = receiverControls();
   const es = new EventSource("/feed");
   es.onmessage = ev => {
     const m = JSON.parse(ev.data);
-    if (m.receiver) onReceiver(m.receiver);
+    if (m.receiver) receiver.onStatus(m.receiver);
     else if (m.meta) {
       meta = m.meta;
+      if (receiverState) receiver.showCorrection(meta.rx_correction ?? null);
       const nextClasses = Array.isArray(meta.classes) ? meta.classes : defaultClasses;
       if (classes.join(",") !== nextClasses.join(",")) hidden.clear();
       classes = nextClasses;

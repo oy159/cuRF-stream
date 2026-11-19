@@ -1,4 +1,5 @@
 #include "burst_demo.hpp"
+#include "curf/omnicore_source.hpp"
 #include "dsss_probe.hpp"
 #include "wifi_ltf_probe.hpp"
 
@@ -267,8 +268,15 @@ namespace curf {
         }
     }
 
+    void write_rx_correction(std::FILE *feed, const RxCorrection *correction) {
+        if (correction)
+            std::fprintf(feed, ",\"rx_correction\":{\"dc\":%s,\"iq\":%s}",
+                         correction->dc_tracking ? "true" : "false", correction->iq_tracking ? "true" : "false");
+    }
+
     std::string run_burst_demo(ISource &source, const engine::Model &net, const BurstConfig &cfg, std::FILE *feed,
-                               std::FILE *trace, std::string_view source_name, unsigned rx, unsigned every) {
+                               std::FILE *trace, std::string_view source_name, unsigned rx, unsigned every,
+                               const RxCorrection *correction) {
         const auto fmt = source.format();
         every = std::max(1u, every);
         Observations probe(fmt, cfg.tune_hz);
@@ -280,12 +288,16 @@ namespace curf {
         std::uint64_t first_in_row = 0, last = 0;
         unsigned blocks = 0;
         peak.fill(-150);
-        if (feed) std::fprintf(feed, "{\"meta\":{\"streams\":1,\"channels\":%u,\"rate\":%.0f,\"freq\":%.0f,"
+        if (feed) {
+            std::fprintf(feed, "{\"meta\":{\"streams\":1,\"channels\":%u,\"rate\":%.0f,\"freq\":%.0f,"
             "\"window\":%u,\"every\":%u,\"source\":\"%.*s\",\"rx\":[%u],\"profile\":\"burst\","
             "\"power_window\":%u,\"power_gate_db\":%d,"
-            "\"classes\":[\"noise\",\"ofdm\",\"dsss\",\"gfsk\",\"fm\",\"am\",\"other_signal\"]}}\n",
+            "\"classes\":[\"noise\",\"ofdm\",\"dsss\",\"gfsk\",\"fm\",\"am\",\"other_signal\"]",
             burst_bins, fmt.sample_rate, cfg.tune_hz, burst_block_frames * 2 / burst_bins, every,
             static_cast<int>(source_name.size()), source_name.data(), rx, burst_power_frames, BandPower::gate_db);
+            write_rx_correction(feed, correction);
+            std::fputs("}}\n", feed);
+        }
         if (trace) std::fputs("start,end,freq_hz,bw_hz,label,proof,noise,ofdm,dsss,gfsk,fm,am,other_signal\n", trace);
         auto flush = [&](float floor) {
             if (feed && blocks) {

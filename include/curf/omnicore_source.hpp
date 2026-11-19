@@ -13,6 +13,7 @@
 #include <atomic>
 #include <exception>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -21,6 +22,10 @@ struct och_device;
 struct och_stream;
 
 namespace curf {
+
+    struct RxCorrection {
+        bool dc_tracking, iq_tracking;
+    };
 
     struct OmniCoreConfig {
         std::string serial;              // empty: the only connected board
@@ -34,6 +39,7 @@ namespace curf {
         std::uint32_t iq_bits = 12;      // 12: packed12 wire; 8: signed8 wire (the driver needs both TX and RX
                                          // masks = 3 for it; no TX stream is created)
         std::uint32_t host_buffer_mib = 256; // driver ring between the USB thread and read()
+        std::optional<bool> rx_correction; // unset: preserve the board's DC/IQ tracking state
 
         // Optional loopback transmitter on TX1, same LO frequency and bandwidth as RX: the file (sc16 I/Q
         // interleaved, one channel) is sent in a loop from start() to stop(). The TX attenuation is set in the
@@ -67,6 +73,7 @@ namespace curf {
 
         OmniCoreStats stats() const;
         std::string device_name() const { return name_; }
+        const std::optional<RxCorrection> &rx_correction() const { return correction_; }
 
     private:
         OmniCoreConfig config_;
@@ -88,6 +95,7 @@ namespace curf {
         SampleClock clock_;
         std::uint64_t discontinuities_ = 0;
         std::string name_;
+        std::optional<RxCorrection> correction_;
     };
 
 } // namespace curf

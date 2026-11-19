@@ -14,6 +14,7 @@
 //                 [--neighbor-db 6] [--band-mhz B]  (detection: leakage rejection; only report +- B/2 around the
 //                                                    centre - default the whole band, 52 MHz for omnicore)
 //   omnicore:     [--rx 1|2|1,2] [--serial S] [--freq HZ] [--gain DB] [--agc 0..3] [--iq-bits 12|8] [--bandwidth HZ]
+//                 [--rx-correction on|off]  (DC and I/Q tracking; default: preserve the hardware state)
 //                 [--tx-file SC16 --tx-atten DB]  (loopback: send the file on TX1 in a loop; DB >= 40)
 //                 (--streams / --rate as for the other sources; drop mode is implied: hardware cannot wait)
 //   file:         [--freq HZ]  (recording centre frequency for display; defaults to baseband)
@@ -25,11 +26,9 @@
 #include "curf/engine/model.hpp"
 #include "curf/runtime/classifier.hpp"
 #include "curf/sources.hpp"
+#include "curf/omnicore_source.hpp"
 #include "burst_demo.hpp"
 #include "dsss_probe.hpp"
-#ifdef CURF_HAVE_OMNICORE
-#include "curf/omnicore_source.hpp"
-#endif
 
 #include <algorithm>
 #include <cmath>
@@ -37,6 +36,7 @@
 #include <cstdlib>
 #include <memory>
 #include <numbers>
+#include <optional>
 #include <random>
 #include <sstream>
 #include <string>
@@ -63,6 +63,7 @@ int main(int argc, char **argv) {
     int dc_guard = -1;    // channels at DC never reported; default 0 (omnicore: 1, the LO leakage channel)
     std::string calibrate_path, shape_path; // noise shape: write (no signal at the input) / use
     [[maybe_unused]] std::uint32_t rx_mask = 0; // omnicore --rx 1 | 2 | 1,2 (default: from --streams)
+    std::optional<bool> rx_correction;
     [[maybe_unused]] std::string tx_file;
     [[maybe_unused]] double tx_atten = 89.75;
     bool int8 = false, burst = false, threshold_given = false, buckets_given = false, ring_given = false;
@@ -117,6 +118,14 @@ int main(int argc, char **argv) {
         else if (a == "--gain") gain = std::stod(next());
         else if (a == "--bandwidth") bandwidth = std::stod(next());
         else if (a == "--agc") agc = static_cast<std::uint32_t>(std::stoul(next()));
+        else if (a == "--rx-correction") {
+            const auto value = next();
+            if (value != "on" && value != "off") {
+                std::fputs("--rx-correction expects on or off\n", stderr);
+                return 2;
+            }
+            rx_correction = value == "on";
+        }
         else if (a == "--iq-bits") iq_bits = static_cast<std::uint32_t>(std::stoul(next()));
         else if (a == "--tx-file") tx_file = next();
         else if (a == "--tx-atten") tx_atten = std::stod(next());
@@ -139,6 +148,10 @@ int main(int argc, char **argv) {
         std::fprintf(stderr, "--freq requires a finite, nonnegative frequency in Hz\n");
         return 2;
     }
+    if (rx_correction && source != "omnicore") {
+        std::fputs("--rx-correction requires --source omnicore\n", stderr);
+        return 2;
+    }
     const auto model = engine::Model::load(std::filesystem::path(model_dir) / "amc.curf");
     if (int8) {
         cfg.engine.int8 = true;
@@ -146,6 +159,7 @@ int main(int argc, char **argv) {
         cfg.engine.calibration = engine::Golden::load(std::filesystem::path(model_dir) / "amc.golden", model).input;
     }
     std::unique_ptr<ISource> src;
+    const RxCorrection *correction = nullptr;
 #ifdef CURF_HAVE_OMNICORE
     OmniCoreSource *och = nullptr;
 #endif
@@ -162,11 +176,13 @@ int main(int argc, char **argv) {
         oc.bandwidth_hz = static_cast<std::uint32_t>(std::llround(bandwidth));
         oc.gain_db[0] = oc.gain_db[1] = gain;
         oc.agc = agc;
+        oc.rx_correction = rx_correction;
         oc.iq_bits = iq_bits;
         oc.tx_file = tx_file;
         oc.tx_attenuation_db = tx_atten;
         auto o = std::make_unique<OmniCoreSource>(oc);
         och = o.get();
+        if (och->rx_correction()) correction = &*och->rx_correction();
         fmt = o->format();
         std::fprintf(stderr, "omnicore: %s, %.6g MSPS x %u, %.6g MHz%s\n", o->device_name().c_str(), fmt.sample_rate / 1e6,
                      fmt.channels, freq / 1e6,
@@ -222,7 +238,7 @@ int main(int argc, char **argv) {
             };
             auto feed = open(ui_path), trace = open(dump_path);
             auto js = run_burst_demo(*src, model, bc, feed.get(), trace.get(), source, rx_mask == 2 ? 2 : 1,
-                                     static_cast<unsigned>(ui_every));
+                                     static_cast<unsigned>(ui_every), correction);
 #ifdef CURF_HAVE_OMNICORE
             if (och) {
                 const auto o = och->stats();
@@ -318,9 +334,11 @@ int main(int argc, char **argv) {
     if (ui) {
         // physical receiver of each stream, for the panel titles (omnicore --rx 2: the only stream is RX2)
         const std::string rx = rx_mask == 2 ? "[2]" : S == 2 ? "[1,2]" : "[1]";
-        std::fprintf(ui, "{\"meta\":{\"streams\":%u,\"channels\":%u,\"rate\":%.17g,\"freq\":%.17g,\"window\":%u,\"every\":%llu,\"source\":\"%s\",\"rx\":%s}}\n",
+        std::fprintf(ui, "{\"meta\":{\"streams\":%u,\"channels\":%u,\"rate\":%.17g,\"freq\":%.17g,\"window\":%u,\"every\":%llu,\"source\":\"%s\",\"rx\":%s",
                      S, M, fmt.sample_rate, ui_frequency, cfg.window,
                      static_cast<unsigned long long>(ui_every), source.c_str(), rx.c_str());
+        write_rx_correction(ui, correction);
+        std::fputs("}}\n", ui);
     }
     // Noise-shape calibration: per channel, the median power over (up to the first 4096) windows, divided by
     // the median over the stream's in-band channels. Run with no signal at the input.
