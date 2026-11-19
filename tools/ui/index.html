@@ -49,6 +49,8 @@
   .rows th { text-align: right; color: var(--dim); font-weight: 500; position: sticky; top: 0; background: var(--panel); padding: 0 4px; }
   .rows td { text-align: right; padding: 0 4px; white-space: nowrap; }
   .rows th:nth-child(3), .rows td:nth-child(3) { text-align: left; }
+  .rows td:nth-child(3), .rows td:nth-child(4) { white-space: normal; }
+  .rows th:last-child { white-space: nowrap; }
   .rows tr:hover td, .rows tr:focus-within td { background: var(--hi); }
   .rows button { border: 0; background: none; color: inherit; font: inherit; cursor: pointer; padding: 0; }
   :is(button, select, input):focus-visible { outline: 2px solid #7aa7ff; outline-offset: 2px; }
@@ -99,6 +101,7 @@ const OFDM_MIN_WIDTH_HZ = 8e6, OFDM_MAX_GAP_HZ = 480e3;
 const OFDM_ENTER_SHARE = 0.50, OFDM_HOLD_SHARE = 0.40, OFDM_HOLD_SECONDS = 0.45;
 const CP_MATCH_SECONDS = 0.15, CP_HOLD_SECONDS = 0.75;
 const BARKER_HOLD_SECONDS = 0.75, DSSS_HALF_WIDTH_HZ = 11e6;
+const BURST_ACTIVITY_SECONDS = 1, SUSTAINED_ENTER = 0.80, SUSTAINED_EXIT = 0.70;
 
 let classes = [], meta = null, panels = [], counts = new Map(), hidden = new Set();
 let demoBand = null, demoBins = [], ofdm = -1, narrowClass = -1, requestedMode = "demo";
@@ -166,7 +169,7 @@ function build() {
                 octx: off.getContext("2d"), cctx: coff.getContext("2d"), row: new ImageData(M, 1), crow: new ImageData(M, 1),
                 demoOff, demoCtx: demoOff.getContext("2d"), demoRow: new ImageData(M, 1),
                 trk: newTrack(M, Math.max(classes.length, 16)), floor: null, now: null,
-                groups: [], demoGroups: [], wideGroups: [], cp: null, barker: new Map() };
+                groups: [], demoGroups: [], wideGroups: [], cp: null, barker: new Map(), burstActivity: null };
     p.octx.fillStyle = "#06080e"; p.octx.fillRect(0, 0, M, ROWS);
     p.cctx.fillStyle = "#0b0e13"; p.cctx.fillRect(0, 0, M, CROWS);
     p.demoCtx.fillStyle = p.cctx.fillStyle; p.demoCtx.fillRect(0, 0, M, CROWS);
@@ -256,10 +259,10 @@ function onRow(row) {
     }
     p.octx.drawImage(p.off, 0, 0, M, ROWS - 1, 0, 1, M, ROWS - 1); p.octx.putImageData(p.row, 0, 0);
     p.cctx.drawImage(p.coff, 0, 0, M, CROWS - 1, 0, 1, M, CROWS - 1); p.cctx.putImageData(p.crow, 0, 0);
-    p.now = now;
     p.groups = group(p, now);
     if (burstFeed()) {
       const fresh = groupBursts(p, row.bursts ?? []);
+      updateBurstActivity(p, fresh, now);
       // Keep recent labels readable in the list while the history draws only
       // actual observations in this row.
       const recent = p.demoGroups.filter(g => g.cls !== OCCUPIED && now - g.last <= 0.18 &&
@@ -281,6 +284,7 @@ function onRow(row) {
       p.demoGroups = groupDemo(p, now, C);
       drawDemoRow(p, D.cls);
     }
+    p.now = now;
     blit(p); drawLabels(p); updatePanelInfo(p);
   }
   document.getElementById("t").textContent = row.t.toFixed(2) + " s";
@@ -402,7 +406,8 @@ function renderDsss(p, band, hits, step, now) {
 
 function sameBurstBand(a, b) {
   const wa = a.x1 - a.x0, wb = b.x1 - b.x0;
-  return Math.abs(a.xc - b.xc) <= Math.max(4, Math.min(wa, wb) * 0.18) &&
+  return a.x0 < b.x1 && b.x0 < a.x1 &&
+    Math.abs(a.xc - b.xc) <= Math.max(4, Math.min(wa, wb) * 0.18) &&
     Math.max(wa, wb) <= 2 * Math.min(wa, wb);
 }
 
@@ -413,16 +418,70 @@ function groupBursts(p, observations) {
     const xc = bin(hz), x0 = Math.max(0, Math.ceil(bin(hz - bw / 2)));
     const x1 = Math.min(meta.channels, Math.ceil(bin(hz + bw / 2)));
     if (x1 <= x0) continue;
-    const g = { x0, x1, xc, cls: kind || OCCUPIED, conf, proof, last,
-      snr: Math.max(...p.trk.pw.subarray(x0, x1)) - p.floor, age: last - first, bursty: true };
+    const g = { x0, x1, xc, cls: kind || OCCUPIED, conf, proof, last };
     const i = groups.findIndex(old => old.cls === g.cls && sameBurstBand(old, g));
-    if (i < 0) groups.push(g);
-    else if (g.proof > groups[i].proof || (g.proof === groups[i].proof && g.conf > groups[i].conf)) {
-      g.last = Math.max(g.last, groups[i].last);
-      groups[i] = g;
-    } else groups[i].last = Math.max(g.last, groups[i].last);
+    if (i < 0) {
+      groups.push({ ...g, intervals: [[first, last]] });
+    } else {
+      const old = groups[i];
+      const merged = proof > old.proof || (proof === old.proof && conf > old.conf) ? g : old;
+      old.intervals.push([first, last]);
+      merged.intervals = old.intervals;
+      merged.last = Math.max(last, old.last);
+      groups[i] = merged;
+    }
   }
-  return groups.sort((a, b) => a.x0 - b.x0);
+  for (const g of groups)
+    g.snr = Math.max(...p.trk.pw.subarray(g.x0, g.x1)) - p.floor;
+  return groups;
+}
+
+function updateBurstActivity(p, fresh, now) {
+  // Burst feed timestamps mark the start of the last block in a display row.
+  const blockDt = rowDt / meta.every;
+  const end = now + blockDt;
+  const reset = !p.burstActivity || now <= p.now || now - p.now > rowDt + 1e-6;
+  const start = reset ? Math.max(0, end - rowDt) : p.now + blockDt;
+  if (reset) {
+    p.burstActivity = { start, tracks: [] };
+    p.demoGroups = [];
+  }
+  const history = p.burstActivity;
+  const cutoff = Math.max(history.start, end - BURST_ACTIVITY_SECONDS);
+  history.ready = end - history.start >= BURST_ACTIVITY_SECONDS - 1e-6;
+  history.tracks = history.tracks.filter(track => track.intervals.at(-1)?.[1] > cutoff);
+  const matched = new Set();
+  for (const g of fresh) {
+    const { cls, x0, x1, xc } = g;
+    let track;
+    for (const candidate of history.tracks)
+      if (!matched.has(candidate) && candidate.cls === cls && sameBurstBand(candidate, g) &&
+          (!track || Math.abs(candidate.xc - xc) < Math.abs(track.xc - xc))) track = candidate;
+    if (!track) {
+      track = { cls, x0, x1, xc, intervals: [], status: "pending" };
+      history.tracks.push(track);
+    }
+    matched.add(track);
+    g.activity = track;
+    // Count the union of measured spans. Model and preamble hits can overlap.
+    for (const [first, last] of g.intervals.sort((a, b) => a[0] - b[0])) {
+      const lo = Math.max(first, start, cutoff), hi = Math.min(last, end);
+      if (hi <= lo) continue;
+      const tail = track.intervals.at(-1);
+      if (tail && lo <= tail[1]) tail[1] = Math.max(tail[1], hi);
+      else track.intervals.push([lo, hi]);
+    }
+  }
+  for (const track of history.tracks) {
+    const spans = track.intervals;
+    let expired = 0;
+    while (expired < spans.length && spans[expired][1] <= cutoff) expired++;
+    spans.splice(0, expired);
+    const occupied = spans.reduce((seconds, [lo, hi]) => seconds + (hi - Math.max(lo, cutoff)), 0);
+    track.duty = Math.min(1, occupied / (end - cutoff));
+    const threshold = track.status === "sustained" ? SUSTAINED_EXIT : SUSTAINED_ENTER;
+    track.status = !history.ready ? "pending" : track.duty >= threshold ? "sustained" : "burst";
+  }
 }
 
 function drawDemoRow(p, detected, groups = p.demoGroups) {
@@ -456,7 +515,7 @@ function drawLabels(p) {
   const gs = visible(p), cx = gs.map(g => (xOf(g.x0, w) + xOf(g.x1, w)) / 2), lineEnd = [-Infinity, -Infinity];
   gs.forEach((g, i) => {
     const x0 = xOf(g.x0, w), x1 = xOf(g.x1, w);
-    ctx.globalAlpha = g.bursty || g.recent ? 0.45 : 1;
+    ctx.globalAlpha = !isSustained(g) || g.recent ? 0.45 : 1;
     ctx.fillStyle = color(g.cls);
     ctx.fillRect(x0 + 0.5, h - 10, Math.max(2, x1 - x0 - 1), 10);
     ctx.globalAlpha = 1;
@@ -471,10 +530,22 @@ function drawLabels(p) {
   p.hint = !shown || named === shown ? "" : named ? ` · 已标注 ${named}/${shown}，继续放大可看全部` : " · 颜色即类别，拖动放大显示类别名";
 }
 
-// Signals shown: not hidden by the legend, inside the view, and (optionally) not bursty.
+const isSustained = g => g.activity ? g.activity.status === "sustained" : !g.bursty;
+function activitySuffix(g) {
+  if (g.activity?.status === "pending") return " 观察中";
+  if (isSustained(g)) return g.activity ? " 持续" : "";
+  return " 突发";
+}
+
+function dutyLabel(activity) {
+  if (activity.status === "pending") return "—";
+  const percent = 100 * activity.duty;
+  return percent > 0 && percent < 0.1 ? "＜0.1%" : percent.toFixed(1) + "%";
+}
+
 function visible(p) {
   const steady = document.getElementById("steady").checked;
-  return groupsFor(p).filter(g => !hidden.has(g.cls) && g.x1 > view[0] && g.x0 < view[1] && !(steady && g.bursty));
+  return groupsFor(p).filter(g => !hidden.has(g.cls) && g.x1 > view[0] && g.x0 < view[1] && (!steady || isSustained(g)));
 }
 
 function drawList(p) {
@@ -482,11 +553,17 @@ function drawList(p) {
   const gs = visible(p);
   p.n.textContent = `${gs.length} 个`;
   const bw = meta.rate / meta.channels;
-  p.rows.innerHTML = `<table><thead><tr><th scope="col">频率 MHz</th><th scope="col">带宽 kHz</th><th scope="col">类别</th><th scope="col">依据</th><th scope="col">SNR</th><th scope="col">持续</th></tr></thead><tbody>` +
+  const showActivity = burstFeed() && isDemo();
+  const timeHeader = showActivity ?
+    `<th scope="col" title="最近 ${BURST_ACTIVITY_SECONDS} 秒内同类别、同频带的占用比例">占空比</th>` : '<th scope="col">持续</th>';
+  let empty = "当前范围没有可显示的信号";
+  if (document.getElementById("steady").checked)
+    empty = showActivity && !p.burstActivity?.ready ? "正在积累接收数据" : "当前范围没有持续信号";
+  p.rows.innerHTML = `<table><thead><tr><th scope="col">频率 MHz</th><th scope="col">带宽 kHz</th><th scope="col">类别</th><th scope="col">依据</th><th scope="col">SNR</th>${timeHeader}</tr></thead><tbody>` +
     gs.map(g => `<tr><td><button type="button" data-x="${g.xc}" aria-label="放大 ${fmtMHz(g.xc)} MHz">${fmtMHz(g.xc)}</button></td><td>${Math.round((g.x1 - g.x0) * bw / 1e3)}</td>` +
-      `<td><i style="background:${color(g.cls)};opacity:${g.bursty || g.recent ? 0.45 : 1}"></i>${name(g.cls)}${g.bursty ? " 突发" : ""}${g.recent ? " 近期" : ""}</td><td>${evidenceLabel(g)}</td>` +
-      `<td>${g.snr.toFixed(0)} dB</td><td>${g.age < 60 ? g.age.toFixed(1) + " s" : (g.age / 60).toFixed(1) + " min"}</td></tr>`).join("") +
-    (gs.length ? "" : '<tr><td colspan="6">当前范围没有可显示的信号</td></tr>') + "</tbody></table>";
+      `<td><i style="background:${color(g.cls)};opacity:${!isSustained(g) || g.recent ? 0.45 : 1}"></i>${name(g.cls)}${activitySuffix(g)}${g.recent ? " 近期" : ""}</td><td>${evidenceLabel(g)}</td>` +
+      `<td>${g.snr.toFixed(0)} dB</td><td>${g.activity ? dutyLabel(g.activity) : g.age < 60 ? g.age.toFixed(1) + " s" : (g.age / 60).toFixed(1) + " min"}</td></tr>`).join("") +
+    (gs.length ? "" : `<tr><td colspan="6">${empty}</td></tr>`) + "</tbody></table>";
   for (const button of p.rows.querySelectorAll("button[data-x]"))
     button.onclick = () => { const x = Number(button.dataset.x); setView(x - 24, x + 24); };
 }
@@ -522,9 +599,10 @@ function drawLegend() {
 
 function refreshLists() {
   counts = new Map();
+  const steady = document.getElementById("steady").checked;
   for (const p of panels) {
     for (const g of groupsFor(p)) {
-      if (g.cls !== OCCUPIED && !(document.getElementById("steady").checked && g.bursty))
+      if (g.cls !== OCCUPIED && (!steady || isSustained(g)))
         counts.set(g.cls, (counts.get(g.cls) ?? 0) + 1);
     }
     drawList(p);
@@ -575,8 +653,8 @@ function hookMouse(p, cv) {
     const k = (x + M / 2) % M;
     tip.style.display = "block";
     tip.style.left = (e.clientX + 14) + "px"; tip.style.top = (e.clientY + 12) + "px";
-    const g = groupsFor(p).find(signal => signal.x0 <= x && x < signal.x1 && !hidden.has(signal.cls));
-    const label = g ? `${name(g.cls)}${g.recent ? "（近期）" : ""}  ${evidenceLabel(g)}` :
+    const g = visible(p).find(signal => signal.x0 <= x && x < signal.x1);
+    const label = g ? `${name(g.cls)}${activitySuffix(g)}${g.recent ? "（近期）" : ""}  ${evidenceLabel(g)}` :
       T.on[x] ? "检测到占用" : "未跟踪";
     tip.textContent = `${fmtMHz(x)} MHz  (信道 ${k})\n功率 ${T.pw[x].toFixed(0)} dBFS · 高于本底 ${(T.pw[x] - p.floor).toFixed(0)} dB\n` +
       label;
