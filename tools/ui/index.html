@@ -16,6 +16,7 @@
   .kv { color: var(--dim); font-family: var(--mono); font-size: 12px; }
   .kv b { color: var(--text); font-weight: 500; }
   #state.live b { color: #6fd08c; } #state.ended b { color: #e0b050; } #state.wait b { color: var(--dim); }
+  #state.error b, .receiver-message { color: #ff9b91; }
   .bar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 18px; padding: 8px 16px 4px; }
   .legend { display: flex; flex-wrap: wrap; gap: 4px 6px; }
   .chip { display: inline-flex; align-items: center; gap: 6px; padding: 2px 8px; border: 1px solid var(--line); border-radius: 12px;
@@ -26,6 +27,16 @@
   .ctl { display: flex; align-items: center; gap: 8px; color: var(--dim); font-size: 12px; }
   .ctl select, .ctl button { background: var(--panel); color: var(--text); border: 1px solid var(--line); border-radius: 4px;
                              padding: 2px 6px; font: inherit; cursor: pointer; }
+  .receiver { margin: 4px 16px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); }
+  .receiver-fields { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 15px; }
+  .receiver-fields input, .receiver-fields select, .receiver-fields button { min-height: 28px; }
+  .receiver-fields input { width: 8ch; padding: 2px 5px; color: var(--text); background: var(--bg);
+                           border-radius: 4px; border: 1px solid var(--line); font: 12px var(--mono); }
+  .receiver-fields input[aria-invalid="true"] { border-color: #ff9b91; }
+  .receiver-fields #rx-frequency { width: 13ch; }
+  .receiver-fields #rx-apply { color: var(--focus); border-color: var(--focus); min-width: 86px; }
+  .receiver-fields button[aria-disabled="true"] { opacity: .45; cursor: default; }
+  .receiver-message { margin: 6px 0 0; font-size: 12px; overflow-wrap: anywhere; }
   main { padding: 8px 16px 16px; display: grid; gap: 14px; }
   .stream { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px 10px;
             display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 10px; }
@@ -77,6 +88,33 @@
   <span class="kv">时间 <b id="t">-</b></span>
   <span class="kv">行/秒 <b id="rps">-</b></span>
 </header>
+<form class="receiver" id="receiver" aria-label="实时接收" novalidate hidden>
+  <div class="receiver-fields">
+    <div class="ctl">
+      <label for="rx-preset">频段</label>
+      <select id="rx-preset">
+        <option value="2441">2.4 GHz</option>
+        <option value="5770">5.8 GHz</option>
+        <option value="">自定义</option>
+      </select>
+    </div>
+    <label class="ctl">中心频率
+      <input id="rx-frequency" type="number" step="any" required aria-errormessage="rx-message"> MHz
+    </label>
+    <label class="ctl">增益
+      <input id="rx-gain" type="number" step="1" required aria-errormessage="rx-message"> dB
+    </label>
+    <label class="ctl">时长
+      <input id="rx-seconds" type="number" step="1" required aria-describedby="rx-duration-help" aria-errormessage="rx-message">
+      <span id="rx-duration-help">秒（0 不限）</span>
+    </label>
+    <div class="ctl">
+      <button id="rx-apply" type="submit">开始接收</button>
+      <button id="rx-stop" type="button">停止</button>
+    </div>
+  </div>
+  <p class="receiver-message" id="rx-message" role="status" hidden></p>
+</form>
 <div class="bar">
   <div class="legend" id="legend"></div>
   <label class="ctl">视图
@@ -119,6 +157,7 @@ let classes = [], meta = null, panels = [], counts = new Map(), hidden = new Set
 let demoBand = null, demoBins = [], ofdm = -1, narrowClass = -1, requestedMode = "demo";
 let rowDt = 0.034, rateT0 = performance.now(), rateRows = 0, lastList = 0;
 let view = [0, 512];               // displayed column range (fft-shifted columns)
+let receiverState = null;
 const mode = document.getElementById("view-mode");
 const burstFeed = () => meta?.profile === "burst";
 const isDemo = () => (burstFeed() || demoBand !== null) && mode.value === "demo";
@@ -313,7 +352,7 @@ function onRow(row) {
   const t = performance.now();
   if (t - rateT0 > 1000) { document.getElementById("rps").textContent = (rateRows * 1000 / (t - rateT0)).toFixed(1); rateT0 = t; rateRows = 0; }
   if (t - lastList > 250) { lastList = t; refreshLists(); } // lists at 4 Hz
-  if (!document.getElementById("state").classList.contains("live")) {
+  if (!receiverState && !document.getElementById("state").classList.contains("live")) {
     setState("live", meta.replay ? "回放中" : "运行中");
   }
 }
@@ -861,12 +900,138 @@ function setState(cls, text) {
 }
 
 function onEnd(st) {
-  setState("ended", meta?.loop ? "回放间隔" : "已结束");
+  if (!receiverState) setState("ended", meta?.loop ? "回放间隔" : "已结束");
   const el = document.getElementById("end");
   el.style.display = "block";
   const keys = ["wall_s", "x_realtime", "windows", "classified", "dropped_frames", "gap_frames", "latency_ms",
     "processing_p99_ms", "queue_p99_ms", "skipped", "evidence_skipped"];
   el.textContent = "运行统计  " + keys.filter(k => k in st).map(k => `${k}=${JSON.stringify(st[k])}`).join("  ");
+}
+
+function receiverControls() {
+  const form = document.getElementById("receiver");
+  const preset = document.getElementById("rx-preset");
+  const inputs = {
+    frequency_mhz: document.getElementById("rx-frequency"),
+    gain_db: document.getElementById("rx-gain"),
+    seconds: document.getElementById("rx-seconds"),
+  };
+  const apply = document.getElementById("rx-apply");
+  const stop = document.getElementById("rx-stop");
+  const message = document.getElementById("rx-message");
+  let edited = false, pending = false, localError = "";
+
+  const getPreset = () => ["2441", "5770"].includes(inputs.frequency_mhz.value) ? inputs.frequency_mhz.value : "";
+  const active = () => ["running", "starting"].includes(receiverState?.state);
+
+  function render() {
+    const busy = pending || receiverState?.state === "stopping";
+    form.setAttribute("aria-busy", busy);
+    apply.setAttribute("aria-disabled", busy || receiverState?.state === "starting");
+    stop.setAttribute("aria-disabled", busy || !active());
+    apply.textContent = active() ? "应用设置" : "开始接收";
+    const text = localError || receiverState?.error || "";
+    if (message.textContent !== text) message.textContent = text;
+    message.hidden = !text;
+  }
+
+  for (const input of Object.values(inputs)) {
+    input.oninput = () => {
+      edited = true;
+      localError = "";
+      input.removeAttribute("aria-invalid");
+      preset.value = getPreset();
+      render();
+    };
+  }
+  preset.onchange = () => {
+    if (preset.value) {
+      inputs.frequency_mhz.value = preset.value;
+      inputs.frequency_mhz.oninput();
+    } else {
+      edited = true;
+      inputs.frequency_mhz.focus();
+    }
+  };
+
+  async function request(data) {
+    pending = true;
+    localError = "";
+    render();
+    try {
+      const response = await fetch("/receiver", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(data), signal: AbortSignal.timeout(12000),
+      });
+      if (!response.ok) localError = (await response.json()).error || "接收设置未生效，请重试。";
+    } catch {
+      localError = "未收到接收服务的响应。请查看当前状态后重试。";
+    } finally {
+      pending = false;
+      render();
+    }
+  }
+
+  form.onsubmit = event => {
+    event.preventDefault();
+    if (apply.getAttribute("aria-disabled") === "true") return;
+    const data = { action: "apply" };
+    const notice = {
+      frequency_mhz: "请输入 70–6000 MHz 的中心频率。",
+      gain_db: "请输入 −3 至 76 的整数增益（dB）。",
+      seconds: "请输入非负整数秒，0 表示不限时。",
+    };
+    for (const [key, input] of Object.entries(inputs)) {
+      if (!input.validity.valid || !Number.isFinite(input.valueAsNumber)) {
+        localError = notice[key];
+        input.setAttribute("aria-invalid", "true");
+        input.focus();
+        render();
+        return;
+      }
+      input.removeAttribute("aria-invalid");
+      data[key] = input.valueAsNumber;
+    }
+    edited = false;
+    request(data);
+  };
+  stop.onclick = () => {
+    if (stop.getAttribute("aria-disabled") !== "true") request({ action: "stop" });
+  };
+
+  return state => {
+    const first = !receiverState;
+    if (receiverState?.run !== state.run && state.state === "starting") {
+      // A retune starts a new time axis, frequency view, and signal history.
+      meta = null;
+      demoBand = null;
+      panels = [];
+      rateRows = 0;
+      rateT0 = performance.now();
+      document.getElementById("streams").replaceChildren();
+      for (const id of ["src", "rate", "fc", "t", "rps"]) document.getElementById(id).textContent = "–";
+      document.getElementById("end").style.display = "none";
+      refreshLists();
+    }
+    receiverState = state;
+    if (first) {
+      for (const [key, [min, max]] of Object.entries(state.limits)) {
+        inputs[key].min = min;
+        if (max !== null) inputs[key].max = max;
+      }
+      form.hidden = false;
+    }
+    if (first || (!edited && state.state !== "stopping")) {
+      for (const [key, value] of Object.entries(state.settings)) inputs[key].value = value;
+      preset.value = getPreset();
+    }
+    const phase = {
+      idle: ["wait", "已停止"], starting: ["wait", "正在启动接收"], running: ["live", "运行中"],
+      stopping: ["wait", "正在停止接收"], ended: ["ended", "已结束"], error: ["error", "接收失败"],
+    };
+    setState(...phase[state.state]);
+    render();
+  };
 }
 
 async function start() {
@@ -881,10 +1046,12 @@ async function start() {
     requestedMode = mode.value;
     redrawAll(); refreshLists();
   };
+  const onReceiver = receiverControls();
   const es = new EventSource("/feed");
   es.onmessage = ev => {
     const m = JSON.parse(ev.data);
-    if (m.meta) {
+    if (m.receiver) onReceiver(m.receiver);
+    else if (m.meta) {
       meta = m.meta;
       const nextClasses = Array.isArray(meta.classes) ? meta.classes : defaultClasses;
       if (classes.join(",") !== nextClasses.join(",")) hidden.clear();
@@ -897,7 +1064,7 @@ async function start() {
       document.getElementById("end").style.display = "none";
       build();
       refreshLists();
-      setState("live", meta.replay ? "回放中" : "运行中");
+      if (!receiverState) setState("live", meta.replay ? "回放中" : "运行中");
     } else if (m.end) onEnd(m.end);
     else if (meta) onRow(m);
   };
