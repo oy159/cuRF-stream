@@ -21,6 +21,9 @@ namespace curf {
         static constexpr unsigned input_frames = 8192;
         struct Match { unsigned sample; float score; };
 
+        // The most recent full input window, after tuning to the candidate center.
+        std::span<const Complex, input_frames> mixed_input() const { return base_; }
+
         explicit WifiLtfProbe(double fs) : stride_(fs / rate) {
             constexpr std::array<int, symbol> ltf{
                 0,0,0,0,0,0,1,1,-1,-1,1,1,-1,1,-1,1,1,1,1,1,1,-1,-1,1,1,-1,1,-1,1,1,1,1,

@@ -1,6 +1,7 @@
 #include "burst_demo.hpp"
 #include "curf/omnicore_source.hpp"
 #include "dsss_probe.hpp"
+#include "fm_broadcast_probe.hpp"
 #include "wifi_ltf_probe.hpp"
 
 #include <algorithm>
@@ -17,7 +18,7 @@ namespace curf {
         static_assert(DsssProbe::input_frames == probe_frames);
         constexpr unsigned job_stride = probe_frames / 2;
         enum Label : unsigned { occupied, ofdm, dsss, gfsk, fm, am, other };
-        enum Proof : unsigned { model, legacy_ltf, barker };
+        enum Proof : unsigned { model, legacy_ltf, barker, fm_pilot };
         struct Mark {
             unsigned first, last;
             double offset_hz, width_hz;
@@ -128,13 +129,14 @@ namespace curf {
             const StreamFormat fmt;
             const double tune;
             const bool ism;
-            std::uint64_t ltf_matches = 0, barker_matches = 0, jobs_skipped = 0;
+            std::uint64_t ltf_matches = 0, barker_matches = 0, jobs_skipped = 0, throttled_blocks = 0;
 
             Observations(StreamFormat f, double hz)
                 : workers{Probes(f.sample_rate), Probes(f.sample_rate), Probes(f.sample_rate)},
                   fmt(f), tune(hz), ism(hz >= 2390e6 && hz <= 2490e6) {}
 
-            std::vector<Mark> inspect(std::span<const BurstRegion> candidates, std::span<const std::uint8_t> wire) {
+            std::vector<Mark> inspect(std::span<const BurstRegion> candidates, std::span<const std::uint8_t> wire,
+                                      double queue_ms) {
                 std::vector<Mark> evidence;
                 if (!ism && !(tune >= 5100e6 && tune <= 5850e6)) return evidence;
                 // Candidate regions choose a small set of channel / time pairs.
@@ -178,7 +180,11 @@ namespace curf {
                 std::vector<Job> jobs;
                 jobs.reserve(pending.size());
                 for (const auto &x : pending) jobs.push_back(x.second);
-                constexpr std::size_t primary_budget = 96, total_budget = 128;
+                // Preserve the strongest primary jobs while the receiver catches up.
+                const double block_ms = 1000. * burst_block_frames / fmt.sample_rate;
+                const bool catching_up = queue_ms >= 2 * block_ms;
+                const std::size_t primary_budget = catching_up ? (queue_ms >= 4 * block_ms ? 24 : 48) : 96;
+                const std::size_t total_budget = catching_up ? primary_budget + 12 : 128;
                 if (jobs.size() > primary_budget) {
                     const auto original = jobs.size();
                     std::stable_sort(jobs.begin(), jobs.end(), [](const Job &a, const Job &b) {
@@ -190,6 +196,7 @@ namespace curf {
                         jobs.erase(jobs.begin() + primary_budget, secondary);
                     if (jobs.size() > total_budget) jobs.resize(total_budget);
                     jobs_skipped += original - jobs.size();
+                    if (catching_up && jobs.size() < original) ++throttled_blocks;
                 }
                 const auto frame_bytes = fmt.frame_bytes();
                 const auto guard = static_cast<unsigned>(std::lround(fmt.sample_rate * 8e-6));
@@ -208,7 +215,7 @@ namespace curf {
                                              offset, 16.5e6, ofdm, m.score, legacy_ltf});
                         }
                         if (job.inspect_barker) {
-                            if (const auto at = worker.dsss_probe.barker_first(slice, fmt, 0, offset)) {
+                            if (const auto at = worker.dsss_probe.barker_first_mixed(worker.ltf.mixed_input())) {
                                 const auto first = start + *at;
                                 const auto length = static_cast<unsigned>(std::lround(32e-6 * fmt.sample_rate));
                                 found.push_back({first, std::min(burst_block_frames, first + length),
@@ -280,8 +287,17 @@ namespace curf {
         const auto fmt = source.format();
         every = std::max(1u, every);
         Observations probe(fmt, cfg.tune_hz);
+        FmBroadcastProbe fm_probe(fmt, cfg.tune_hz, cfg.band_hz);
         std::array<float, burst_bins> peak{};
+        std::array<float, burst_bins> broadcast_floor{};
+        std::array<bool, burst_bins> broadcast_valid{};
         const double step = fmt.sample_rate / burst_bins;
+        if (fm_probe.enabled()) {
+            for (unsigned k = 0; k < burst_bins; ++k) {
+                const auto offset = (static_cast<int>(k) - static_cast<int>(burst_bins / 2)) * step;
+                broadcast_valid[k] = k != burst_bins / 2 && std::abs(offset) <= cfg.band_hz / 2;
+            }
+        }
         std::array<std::uint64_t, burst_classes> counts{};
         std::vector<TimedMark> marks;
         BandPower band_power;
@@ -295,6 +311,7 @@ namespace curf {
             "\"classes\":[\"noise\",\"ofdm\",\"dsss\",\"gfsk\",\"fm\",\"am\",\"other_signal\"]",
             burst_bins, fmt.sample_rate, cfg.tune_hz, burst_block_frames * 2 / burst_bins, every,
             static_cast<int>(source_name.size()), source_name.data(), rx, burst_power_frames, BandPower::gate_db);
+            if (fm_probe.enabled()) std::fputs(",\"fm_broadcast\":true", feed);
             write_rx_correction(feed, correction);
             std::fputs("}}\n", feed);
         }
@@ -346,13 +363,20 @@ namespace curf {
         };
         float last_floor = -100;
         const auto stats = run_burst_classifier(source, net, cfg, [&](std::uint64_t first, std::span<const float> p,
-                float floor, std::span<const BurstRegion> regions, std::span<const std::uint8_t> wire, BurstPower power) {
+                float floor, std::span<const BurstRegion> regions, std::span<const std::uint8_t> wire,
+                BurstPower power, double queue_ms) {
             if (blocks && first != first_in_row + blocks * burst_block_frames) flush(last_floor);
             if (!blocks) first_in_row = first;
             ++blocks; last = first; last_floor = floor;
-            if (feed) band_power.append(power);
+            const auto fm_hits = fm_probe.observe(first, power, wire);
+            if (feed && fm_probe.enabled()) {
+                // Compare continuous broadcasts to neighboring spectrum noise,
+                // rather than a per-bin estimate that eventually follows the carrier.
+                broadcast_floor.fill(fm_probe.noise());
+                band_power.append({power.windows, broadcast_floor, broadcast_valid});
+            } else if (feed) band_power.append(power);
             for (unsigned k = 0; k < burst_bins; ++k) peak[k] = std::max(peak[k], p[k]);
-            const auto confirmed = probe.inspect(regions, wire);
+            const auto confirmed = probe.inspect(regions, wire, cfg.drop_when_full ? queue_ms : 0.);
             const auto add = [&](const Mark &mark, const BurstRegion *result) {
                 ++counts[mark.label];
                 if (feed) marks.push_back({mark, first});
@@ -367,11 +391,15 @@ namespace curf {
                 }
             };
             for (const auto &c : regions) {
-                const auto cls = choose_label(c, confirmed, probe.ism);
+                const double hz = cfg.tune_hz + c.offset_hz;
+                const auto cls = fm_probe.enabled() && hz >= fm_band_low_hz && hz <= fm_band_high_hz ?
+                    occupied : choose_label(c, confirmed, probe.ism);
                 add({c.first, c.last, c.offset_hz, c.bandwidth_hz, cls,
                      *std::max_element(c.probabilities.begin(), c.probabilities.end()), model}, &c);
             }
             for (const auto &x : confirmed) add(x, nullptr);
+            for (const auto &x : fm_hits)
+                add({x.first, x.last, x.offset_hz, FmBroadcastProbe::bandwidth_hz, fm, 1.f, fm_pilot}, nullptr);
             if (blocks >= every) flush(floor);
         });
         flush(last_floor);
@@ -381,13 +409,13 @@ namespace curf {
         std::snprintf(result, sizeof result, "{\"profile\":\"burst\",\"frames\":%llu,\"blocks\":%llu,"
             "\"regions\":%llu,\"skipped\":%llu,\"dropped_frames\":%llu,\"gap_frames\":%llu,\"wall_s\":%.3f,"
             "\"processing_p99_ms\":%.3f,\"queue_p99_ms\":%.3f,\"wifi_ltf\":%llu,\"barker11\":%llu,"
-            "\"evidence_skipped\":%llu,\"classes\":[%s]}",
+            "\"evidence_skipped\":%llu,\"evidence_throttled_blocks\":%llu,\"classes\":[%s]}",
             static_cast<unsigned long long>(stats.frames), static_cast<unsigned long long>(stats.blocks),
             static_cast<unsigned long long>(stats.regions), static_cast<unsigned long long>(stats.skipped),
             static_cast<unsigned long long>(stats.dropped), static_cast<unsigned long long>(stats.gaps), stats.wall_s,
             stats.processing_p99_ms, stats.queue_p99_ms, static_cast<unsigned long long>(probe.ltf_matches),
             static_cast<unsigned long long>(probe.barker_matches), static_cast<unsigned long long>(probe.jobs_skipped),
-            histogram.c_str());
+            static_cast<unsigned long long>(probe.throttled_blocks), histogram.c_str());
         if (feed) std::fprintf(feed, "{\"end\":%s}\n", result);
         return result;
     }

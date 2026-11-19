@@ -281,7 +281,8 @@ namespace curf {
                 }
                 ring.mark_submitted();
                 const auto begin = Clock::now();
-                queued.push_back(std::chrono::duration<double, std::milli>(begin - slot->filled_at).count());
+                const double queue_ms = std::chrono::duration<double, std::milli>(begin - slot->filled_at).count();
+                queued.push_back(queue_ms);
                 const auto first = slot->first_sample;
                 const bool gap = stats.blocks && (slot->discontinuity || first != expected);
                 if (gap && first > expected) stats.gaps += first - expected;
@@ -347,7 +348,7 @@ namespace curf {
                     for (auto &pr : regions[i].probabilities) pr /= sum;
                 }
                 if (callback) callback(first, spectrum, db(*mid), regions, {slot->data, bytes},
-                                       {{host_power.get(), rows * bins}, {host_floor.get(), bins}, valid});
+                                       {{host_power.get(), rows * bins}, {host_floor.get(), bins}, valid}, queue_ms);
                 ring.release_oldest();
                 stats.frames += frames; ++stats.blocks; stats.regions += regions.size();
                 latency.push_back(std::chrono::duration<double, std::milli>(Clock::now() - begin).count());

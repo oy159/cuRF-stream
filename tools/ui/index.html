@@ -470,6 +470,7 @@ function renderDsss(p, band, hits, step, now) {
 }
 
 function sameBurstBand(a, b) {
+  if (a.proof === 3 && b.proof === 3) return a.xc === b.xc;
   const wa = a.x1 - a.x0, wb = b.x1 - b.x0;
   return a.x0 < b.x1 && b.x0 < a.x1 &&
     Math.abs(a.xc - b.xc) <= Math.max(4, Math.min(wa, wb) * 0.18) &&
@@ -526,7 +527,7 @@ function updateBurstActivity(p, fresh, now) {
       if (!matched.has(candidate) && candidate.cls === cls && sameBurstBand(candidate, g) &&
           (!track || Math.abs(candidate.xc - xc) < Math.abs(track.xc - xc))) track = candidate;
     if (!track) {
-      track = { cls, x0, x1, xc, intervals: [], status: "pending" };
+      track = { cls, x0, x1, xc, proof: g.proof, intervals: [], status: "pending" };
       history.tracks.push(track);
     }
     matched.add(track);
@@ -780,7 +781,7 @@ function drawList(p) {
 function drawLegend() {
   const el = document.getElementById("legend");
   const options = isDemo() ? (burstFeed() ?
-    ["ofdm", "dsss", "gfsk"].map(name => classes.indexOf(name)).filter(c => c > 0) :
+    (meta.fm_broadcast ? ["fm", "gfsk"] : ["ofdm", "dsss", "gfsk"]).map(name => classes.indexOf(name)).filter(c => c > 0) :
     [ofdm, ...(demoBand.barker ? [DSSS] : []), ...[narrowClass].filter(c => c > 0)]) : classes.map((_, c) => c).slice(1);
   if (el.dataset.classes !== options.join(",")) {
     el.dataset.classes = options.join(",");
@@ -843,6 +844,7 @@ function evidenceLabel(g) {
   if (g.cls === OCCUPIED) return "—";
   if (g.proof === 1) return "Wi‑Fi 长训练序列";
   if (g.proof === 2) return "Barker‑11";
+  if (g.proof === 3) return "19 kHz 立体声导频";
   if (burstFeed() && g.proof === 0) return "模型 " + Math.round(g.conf * 100) + "%";
   if (g.cls === DSSS) return "Barker‑11";
   if (g.cpAt !== undefined) return "循环前缀";
@@ -909,7 +911,7 @@ function onEnd(st) {
   const el = document.getElementById("end");
   el.style.display = "block";
   const keys = ["wall_s", "x_realtime", "windows", "classified", "dropped_frames", "gap_frames", "latency_ms",
-    "processing_p99_ms", "queue_p99_ms", "skipped", "evidence_skipped"];
+    "processing_p99_ms", "queue_p99_ms", "skipped", "evidence_skipped", "evidence_throttled_blocks"];
   el.textContent = "运行统计  " + keys.filter(k => k in st).map(k => `${k}=${JSON.stringify(st[k])}`).join("  ");
 }
 

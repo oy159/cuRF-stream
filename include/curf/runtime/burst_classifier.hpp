@@ -48,7 +48,7 @@ namespace curf {
 
     // The peak spectrum is in FFT order. All views are valid only inside the callback.
     using BurstCallback = std::function<void(std::uint64_t, std::span<const float>, float,
-        std::span<const BurstRegion>, std::span<const std::uint8_t>, BurstPower)>;
+        std::span<const BurstRegion>, std::span<const std::uint8_t>, BurstPower, double queue_ms)>;
 
     BurstStats run_burst_classifier(ISource &, const engine::Model &, const BurstConfig &, const BurstCallback &);
 

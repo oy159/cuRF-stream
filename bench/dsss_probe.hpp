@@ -90,10 +90,14 @@ namespace curf {
                 mixed_[k] = Complex{z.re, z.im} * phase;
                 phase *= rotation;
             }
+            return barker_first_mixed(mixed_);
+        }
+
+        std::optional<unsigned> barker_first_mixed(std::span<const Complex, input_frames> mixed) {
             for (std::size_t j = 0; j < positions_.size(); ++j) {
                 const auto [first, fraction] = positions_[j];
                 Complex value;
-                for (unsigned i = 0; i < kTaps; ++i) value += mixed_[first + i] * filter_[fraction][i];
+                for (unsigned i = 0; i < kTaps; ++i) value += mixed[first + i] * filter_[fraction][i];
                 waveform_[j] = value;
             }
             const auto span = kHalfSymbols * kSymbol;
