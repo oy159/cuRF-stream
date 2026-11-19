@@ -105,7 +105,8 @@ let demoBand = null, demoBins = [], ofdm = -1, narrowClass = -1, requestedMode =
 let rowDt = 0.034, rateT0 = performance.now(), rateRows = 0, lastList = 0;
 let view = [0, 512];               // displayed column range (fft-shifted columns)
 const mode = document.getElementById("view-mode");
-const isDemo = () => demoBand !== null && mode.value === "demo";
+const burstFeed = () => meta?.profile === "burst";
+const isDemo = () => (burstFeed() || demoBand !== null) && mode.value === "demo";
 const groupsFor = p => isDemo() ? p.demoGroups : p.groups;
 
 const LUT = (() => {
@@ -121,7 +122,8 @@ const LUT = (() => {
 })();
 const RGB = PALETTE.map(c => [1, 3, 5].map(i => parseInt(c.slice(i, i + 2), 16)));
 const color = c => c === DSSS ? DSSS_COLOR : c === OCCUPIED ? "#7d8896" : PALETTE[c % PALETTE.length];
-const name = c => c === DSSS ? "DSSS" : c === OCCUPIED ? "占用" : classes[c] || "c" + c;
+const name = c => c === DSSS ? "DSSS" : c === OCCUPIED ? "占用" :
+  burstFeed() ? (classes[c] || "c" + c).toUpperCase() : classes[c] || "c" + c;
 const col = (k, M) => (k + M / 2) % M;                       // channel -> display column (left edge = -fs/2)
 const colHz = x => (x - meta.channels / 2) * meta.rate / meta.channels; // display column -> offset Hz
 const fmtMHz = x => ((meta.freq + colHz(x)) / 1e6).toFixed(2);
@@ -145,8 +147,8 @@ function build() {
     const bin = hz => Math.ceil((hz - meta.freq) * M / meta.rate + M / 2);
     demoBins = [Math.max(0, bin(demoBand.low)), Math.min(M, bin(demoBand.high))];
   }
-  mode.disabled = !demoBand;
-  mode.value = demoBand ? requestedMode : "raw";
+  mode.disabled = !demoBand && !burstFeed();
+  mode.value = mode.disabled ? "raw" : requestedMode;
   for (let s = 0; s < meta.streams; s++) {
     const el = document.createElement("section");
     el.className = "stream";
@@ -256,7 +258,15 @@ function onRow(row) {
     p.cctx.drawImage(p.coff, 0, 0, M, CROWS - 1, 0, 1, M, CROWS - 1); p.cctx.putImageData(p.crow, 0, 0);
     p.now = now;
     p.groups = group(p, now);
-    if (demoBand) {
+    if (burstFeed()) {
+      const fresh = groupBursts(p, row.bursts ?? []);
+      // Keep recent labels readable in the list while the history draws only
+      // actual observations in this row.
+      const recent = p.demoGroups.filter(g => g.cls !== OCCUPIED && now - g.last <= 0.18 &&
+        !fresh.some(n => n.cls !== OCCUPIED && sameBurstBand(g, n)));
+      p.demoGroups = fresh.concat(recent.map(g => ({ ...g, recent: true }))).sort((a, b) => a.x0 - b.x0);
+      drawDemoRow(p, D.cls, fresh);
+    } else if (demoBand) {
       const cpOffset = row.ofdm_cp?.[s];
       if (demoBand.cyclicPrefix && Number.isFinite(cpOffset)) {
         p.cp = { time: now, column: cpOffset * M / meta.rate + M / 2 };
@@ -390,16 +400,43 @@ function renderDsss(p, band, hits, step, now) {
   return groups;
 }
 
-function drawDemoRow(p, detected) {
+function sameBurstBand(a, b) {
+  const wa = a.x1 - a.x0, wb = b.x1 - b.x0;
+  return Math.abs(a.xc - b.xc) <= Math.max(4, Math.min(wa, wb) * 0.18) &&
+    Math.max(wa, wb) <= 2 * Math.min(wa, wb);
+}
+
+function groupBursts(p, observations) {
+  const step = meta.rate / meta.channels, groups = [];
+  const bin = hz => (hz - meta.freq) / step + meta.channels / 2;
+  for (const [first, last, hz, bw, kind, conf, proof] of observations) {
+    const xc = bin(hz), x0 = Math.max(0, Math.ceil(bin(hz - bw / 2)));
+    const x1 = Math.min(meta.channels, Math.ceil(bin(hz + bw / 2)));
+    if (x1 <= x0) continue;
+    const g = { x0, x1, xc, cls: kind || OCCUPIED, conf, proof, last,
+      snr: Math.max(...p.trk.pw.subarray(x0, x1)) - p.floor, age: last - first, bursty: true };
+    const i = groups.findIndex(old => old.cls === g.cls && sameBurstBand(old, g));
+    if (i < 0) groups.push(g);
+    else if (g.proof > groups[i].proof || (g.proof === groups[i].proof && g.conf > groups[i].conf)) {
+      g.last = Math.max(g.last, groups[i].last);
+      groups[i] = g;
+    } else groups[i].last = Math.max(g.last, groups[i].last);
+  }
+  return groups.sort((a, b) => a.x0 - b.x0);
+}
+
+function drawDemoRow(p, detected, groups = p.demoGroups) {
   const pixels = p.demoRow.data, hit = [40, 44, 54, 255], empty = [11, 14, 19, 255];
   for (let x = 0; x < meta.channels; ++x) {
     pixels.set(detected[x] >= 0 ? hit : empty, 4 * x);
   }
-  for (const g of p.demoGroups) {
+  const ordered = burstFeed() ? [...groups].sort((a, b) =>
+    Number(a.cls !== OCCUPIED) - Number(b.cls !== OCCUPIED) || (b.x1 - b.x0) - (a.x1 - a.x0)) : groups;
+  for (const g of ordered) {
     if (hidden.has(g.cls)) continue;
     const rgb = g.cls === DSSS ? DSSS_RGB : g.cls === OCCUPIED ? [54, 61, 72] : RGB[g.cls % RGB.length];
     const strength = g.recent ? 0.60 :
-      g.cls === DSSS || g.cls === OCCUPIED || g.cpAt !== undefined ? 1 : 0.35 + 0.65 * g.conf;
+      g.cls === DSSS || g.cls === OCCUPIED || g.cpAt !== undefined || g.proof ? 1 : 0.35 + 0.65 * g.conf;
     const rgba = [...rgb.map(value => value * strength), 255];
     for (let x = g.x0; x < g.x1; ++x) pixels.set(rgba, 4 * x);
   }
@@ -456,8 +493,9 @@ function drawList(p) {
 
 function drawLegend() {
   const el = document.getElementById("legend");
-  const options = isDemo() ? [ofdm, ...(demoBand.barker ? [DSSS] : []), ...[narrowClass].filter(c => c > 0)] :
-    classes.map((_, c) => c).slice(1);
+  const options = isDemo() ? (burstFeed() ?
+    ["ofdm", "dsss", "gfsk"].map(name => classes.indexOf(name)).filter(c => c > 0) :
+    [ofdm, ...(demoBand.barker ? [DSSS] : []), ...[narrowClass].filter(c => c > 0)]) : classes.map((_, c) => c).slice(1);
   if (el.dataset.classes !== options.join(",")) {
     el.dataset.classes = options.join(",");
     el.replaceChildren(...options.map(c => {
@@ -505,6 +543,9 @@ function updatePanelInfo(p) {
 
 function evidenceLabel(g) {
   if (g.cls === OCCUPIED) return "—";
+  if (g.proof === 1) return "Wi‑Fi 长训练序列";
+  if (g.proof === 2) return "Barker‑11";
+  if (burstFeed() && g.proof === 0) return "模型 " + Math.round(g.conf * 100) + "%";
   if (g.cls === DSSS) return "Barker‑11";
   if (g.cpAt !== undefined) return "循环前缀";
   return Math.round(g.conf * 100) + "% 票";
@@ -560,13 +601,15 @@ function onEnd(st) {
   setState("ended", meta?.loop ? "回放间隔" : "已结束");
   const el = document.getElementById("end");
   el.style.display = "block";
-  const keys = ["wall_s", "x_realtime", "windows", "classified", "dropped_frames", "gap_frames", "latency_ms"];
+  const keys = ["wall_s", "x_realtime", "windows", "classified", "dropped_frames", "gap_frames", "latency_ms",
+    "processing_p99_ms", "queue_p99_ms", "skipped", "evidence_skipped"];
   el.textContent = "运行统计  " + keys.filter(k => k in st).map(k => `${k}=${JSON.stringify(st[k])}`).join("  ");
 }
 
 async function start() {
   try { classes = await (await fetch("/classes")).json(); } catch { classes = []; }
   if (!Array.isArray(classes)) classes = [];
+  const defaultClasses = classes;
   ofdm = classes.indexOf("ofdm");
   drawLegend();
   document.getElementById("reset").onclick = () => meta && setView(0, meta.channels);
@@ -580,6 +623,10 @@ async function start() {
     const m = JSON.parse(ev.data);
     if (m.meta) {
       meta = m.meta;
+      const nextClasses = Array.isArray(meta.classes) ? meta.classes : defaultClasses;
+      if (classes.join(",") !== nextClasses.join(",")) hidden.clear();
+      classes = nextClasses;
+      ofdm = classes.indexOf("ofdm");
       document.getElementById("src").textContent = meta.replay ? `回放 · ${meta.source}` : meta.source;
       document.getElementById("rate").textContent = (meta.rate / 1e6).toFixed(2) + " MSPS × " + meta.streams;
       document.getElementById("fc").textContent = meta.freq ? (meta.freq / 1e6).toFixed(3) + " MHz" : "基带（相对频率）";

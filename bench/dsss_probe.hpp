@@ -9,6 +9,7 @@
 #include <complex>
 #include <cstddef>
 #include <numbers>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -74,8 +75,13 @@ namespace curf {
         }
 
         bool observes_barker(std::span<const std::uint8_t> wire, StreamFormat format, unsigned stream, double offset) {
+            return barker_first(wire, format, stream, offset).has_value();
+        }
+
+        std::optional<unsigned> barker_first(std::span<const std::uint8_t> wire, StreamFormat format,
+                                              unsigned stream, double offset) {
             const auto stride = format.frame_bytes();
-            if (wire.size() / stride < input_frames) return false;
+            if (wire.size() / stride < input_frames) return std::nullopt;
             const auto stream_offset = stream * wire_sample_bytes(format.wire);
             const auto rotation = std::polar(1.0f, static_cast<float>(-2 * std::numbers::pi * offset / format.sample_rate));
             Complex phase{1, 0};
@@ -110,12 +116,13 @@ namespace curf {
                     // Both consecutive halves must match the same chip order.
                     for (unsigned order = 0; order < 2; ++order) {
                         const float score = energy > 0 ? projection[order] / (kChips * energy) : 0;
-                        if (score >= 0.76f && previous[order] >= 0.76f) return true;
+                        if (score >= 0.76f && previous[order] >= 0.76f)
+                            return static_cast<unsigned>(positions_[begin - span].first + kHalfTaps);
                         previous[order] = score;
                     }
                 }
             }
-            return false;
+            return std::nullopt;
         }
 
     private:

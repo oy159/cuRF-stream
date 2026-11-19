@@ -8,6 +8,7 @@
 //                 [--fp32-input]   (INT8: gather fp32 windows; default fp16, which the fused stem rounds to anyway)
 //
 //                 [--ui-out PATH] [--ui-every N]   (display feed, see tools/ui_server.py)
+//                 [--burst --model DIR] [--exclude-hz HZ]  (whole-signal demo model, one receiver)
 //                 [--noise-shape F] [--calibrate-noise F]  (front-end noise shape: use / measure with no signal)
 //                 [--dc-guard N]  (channels at DC never reported; omnicore default 1)
 //                 [--neighbor-db 6] [--band-mhz B]  (detection: leakage rejection; only report +- B/2 around the
@@ -24,6 +25,7 @@
 #include "curf/engine/model.hpp"
 #include "curf/runtime/classifier.hpp"
 #include "curf/sources.hpp"
+#include "burst_demo.hpp"
 #include "dsss_probe.hpp"
 #ifdef CURF_HAVE_OMNICORE
 #include "curf/omnicore_source.hpp"
@@ -63,7 +65,8 @@ int main(int argc, char **argv) {
     [[maybe_unused]] std::uint32_t rx_mask = 0; // omnicore --rx 1 | 2 | 1,2 (default: from --streams)
     [[maybe_unused]] std::string tx_file;
     [[maybe_unused]] double tx_atten = 89.75;
-    bool int8 = false;
+    bool int8 = false, burst = false, threshold_given = false, buckets_given = false, ring_given = false;
+    std::vector<double> excluded;
     bool fp32_input = false;     // INT8 engine, calibrated on the model directory's golden windows
     ClassifierConfig cfg;
     cfg.engine.tune_iters = 10;
@@ -88,7 +91,10 @@ int main(int argc, char **argv) {
         else if (a == "--detect") {
             const auto m = next();
             cfg.detect.mode = m == "all" ? cuda::DetectMode::all : m == "absolute" ? cuda::DetectMode::absolute : cuda::DetectMode::relative;
-        } else if (a == "--threshold-db") cfg.detect.threshold_db = std::stof(next());
+        } else if (a == "--threshold-db") {
+            cfg.detect.threshold_db = std::stof(next());
+            threshold_given = true;
+        }
         else if (a == "--neighbor-db") cfg.detect.neighbor_reject_db = std::stof(next());
         else if (a == "--band-mhz") band_mhz = std::stod(next());
         else if (a == "--dc-guard") dc_guard = std::stoi(next());
@@ -97,11 +103,12 @@ int main(int argc, char **argv) {
         else if (a == "--seconds") cfg.seconds = std::stod(next());
         else if (a == "--windows") cfg.max_windows = std::stoull(next());
         else if (a == "--buckets") {
+            buckets_given = true;
             cfg.engine.buckets.clear();
             std::stringstream ss(next());
             for (std::string x; std::getline(ss, x, ',');) cfg.engine.buckets.push_back(std::stoi(x));
         } else if (a == "--drop") cfg.drop_when_full = true;
-        else if (a == "--ring") cfg.ring_slots = std::stoull(next());
+        else if (a == "--ring") { cfg.ring_slots = std::stoull(next()); ring_given = true; }
         else if (a == "--dump") dump_path = next();
         else if (a == "--ui-out") ui_path = next();
         else if (a == "--ui-every") ui_every = std::max<std::uint64_t>(1, std::stoull(next()));
@@ -120,6 +127,8 @@ int main(int argc, char **argv) {
         else if (a == "--print") print = std::stoull(next());
         else if (a == "--label") label = next();
         else if (a == "--int8") int8 = true;
+        else if (a == "--burst") burst = true;
+        else if (a == "--exclude-hz") excluded.push_back(std::stod(next()));
         else if (a == "--fp32-input") fp32_input = true;
         else if (a == "--calib-percentile") cfg.engine.calib_percentile = std::stod(next());
         else if (a == "--tune-cache") cfg.engine.tune_cache = next();
@@ -191,6 +200,50 @@ int main(int argc, char **argv) {
         src = std::make_unique<SyntheticSource>(sc);
     }
 
+    if (burst) {
+        try {
+            BurstConfig bc;
+            bc.engine = cfg.engine;
+            if (!buckets_given) bc.engine.buckets = {1, 8, 32, 64};
+            bc.seconds = cfg.seconds;
+            bc.max_blocks = cfg.max_windows;
+            bc.tune_hz = freq_given || source == "omnicore" ? freq : 0;
+            bc.band_hz = std::min(fmt.sample_rate, band_mhz > 0 ? band_mhz * 1e6 : 50e6);
+            bc.threshold_db = threshold_given ? cfg.detect.threshold_db : 12.f;
+            bc.dc_guard_hz = static_cast<float>(std::max(0, dc_guard) * fmt.sample_rate / 512);
+            bc.exclude_hz = excluded;
+            bc.drop_when_full = cfg.drop_when_full;
+            if (ring_given) bc.ring_slots = static_cast<unsigned>(cfg.ring_slots);
+            const auto open = [](const std::string &path) {
+                const auto close = [](std::FILE *f) { std::fclose(f); };
+                std::unique_ptr<std::FILE, decltype(close)> f(path.empty() ? nullptr : std::fopen(path.c_str(), "w"), close);
+                if (!path.empty() && !f) throw std::runtime_error("cannot open " + path);
+                return f;
+            };
+            auto feed = open(ui_path), trace = open(dump_path);
+            auto js = run_burst_demo(*src, model, bc, feed.get(), trace.get(), source, rx_mask == 2 ? 2 : 1,
+                                     static_cast<unsigned>(ui_every));
+#ifdef CURF_HAVE_OMNICORE
+            if (och) {
+                const auto o = och->stats();
+                char info[400];
+                std::snprintf(info, sizeof info, "\"omnicore\":{\"samples\":%llu,\"host_dropped\":%llu,"
+                    "\"device_overflows\":%llu,\"transfer_errors\":%llu,\"resyncs\":%llu,\"discontinuities\":%llu,\"tx_samples\":%llu},",
+                    static_cast<unsigned long long>(o.samples), static_cast<unsigned long long>(o.host_dropped),
+                    static_cast<unsigned long long>(o.device_overflows), static_cast<unsigned long long>(o.transfer_errors),
+                    static_cast<unsigned long long>(o.resyncs), static_cast<unsigned long long>(o.discontinuities),
+                    static_cast<unsigned long long>(o.tx_samples));
+                js.insert(1, info);
+            }
+#endif
+            std::puts(js.c_str());
+            return 0;
+        } catch (const std::exception &e) {
+            std::fprintf(stderr, "%s\n", e.what());
+            return 2;
+        }
+    }
+    if (!excluded.empty()) { std::fputs("--exclude-hz requires --burst\n", stderr); return 2; }
     if (band_mhz > 0) cfg.detect.band = static_cast<float>(std::min(1.0, band_mhz * 1e6 / fmt.sample_rate));
     if (dc_guard > 0) cfg.detect.dc_guard = static_cast<std::uint32_t>(dc_guard);
     if (!shape_path.empty()) {

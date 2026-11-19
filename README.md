@@ -35,6 +35,21 @@ python3 tools/ui_server.py --bind 127.0.0.1 --replay capture.feed --loop
 同一片占用的 Barker 标签过期后显示「占用」。5 GHz 演示依据与占用频带匹配的循环前缀。
 物理层证据检测支持 40–65 MS/s 的输入。用「原始分类」查看逐信道模型的结果。
 
+## 重训版实时演示
+
+使用七类 demo 模型的导出目录。以下命令以 RX2 只收模式采集 30 秒，并同时保存瀑布和逐突发标签。
+
+```sh
+build/cuda-release/bench/curf_classify --burst --model model/artifacts/demo/export \
+  --int8 --streams 1 --rx 2 --source omnicore --freq 2441e6 \
+  --gain 18 --bandwidth 56e6 --band-mhz 50 --ring 128 --seconds 30 \
+  --exclude-hz 2457600000 --ui-out rx2.feed
+python3 tools/ui_server.py --bind 127.0.0.1 --replay rx2.feed --loop
+```
+
+5.8 GHz 可用 `--freq 5770e6 --gain 40 --band-mhz 44`。实时运行时，把采集命令放在
+`tools/ui_server.py --bind 127.0.0.1 --` 后并省略 `--ui-out`。信号列表显示模型置信度或逐包证据。
+
 ## 目录
 
 ```
