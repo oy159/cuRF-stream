@@ -3,6 +3,7 @@
 #   pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu128
 torch==2.11.0
 numpy>=2.0
+scipy
 onnx>=1.23
 onnxruntime>=1.32
 onnxscript

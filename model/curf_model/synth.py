@@ -98,13 +98,15 @@ def fir_complex(x: torch.Tensor, taps: torch.Tensor) -> torch.Tensor:
 
 
 class Synth:
+    classes = CLASSES
+
     def __init__(self, cfg: SynthConfig | None = None, device: str | torch.device = "cuda", seed: int = 0):
         self.cfg = cfg or SynthConfig()
         self.device = torch.device(device)
         self.gen = torch.Generator(device=self.device).manual_seed(seed)
         self.cpu_gen = torch.Generator().manual_seed(seed + 1)  # for per-chunk scalar choices
         self.const = {c: constellation(c, self.device) for c in LINEAR}
-        self.class_index = {c: i for i, c in enumerate(CLASSES)}
+        self.class_index = {c: i for i, c in enumerate(self.classes)}
 
     # ------------------------------------------------------------------ utils
     def _u(self, n: int, lo: float, hi: float) -> torch.Tensor:
