@@ -77,7 +77,7 @@
   <div class="ctl">平滑
     <select id="tau"><option value="0.15">0.15 s</option><option value="0.5" selected>0.5 s</option><option value="2">2 s</option></select>
   </div>
-  <label class="ctl"><input type="checkbox" id="steady">只看持续信号</label>
+  <label class="ctl"><input type="checkbox" id="steady"><span id="steady-label">只看持续信号</span></label>
   <div class="ctl"><button id="reset">全带宽</button><span>在瀑布图上拖动可放大频段，双击复原</span></div>
 </div>
 <main id="streams"></main>
@@ -102,6 +102,7 @@ const OFDM_ENTER_SHARE = 0.50, OFDM_HOLD_SHARE = 0.40, OFDM_HOLD_SECONDS = 0.45;
 const CP_MATCH_SECONDS = 0.15, CP_HOLD_SECONDS = 0.75;
 const BARKER_HOLD_SECONDS = 0.75, DSSS_HALF_WIDTH_HZ = 11e6;
 const BURST_ACTIVITY_SECONDS = 1, SUSTAINED_ENTER = 0.80, SUSTAINED_EXIT = 0.70;
+const ACTIVITY_SLICES = 8, RECURRENT_ENTER = 6, RECURRENT_EXIT = 5;
 
 let classes = [], meta = null, panels = [], counts = new Map(), hidden = new Set();
 let demoBand = null, demoBins = [], ofdm = -1, narrowClass = -1, requestedMode = "demo";
@@ -448,6 +449,7 @@ function updateBurstActivity(p, fresh, now) {
   }
   const history = p.burstActivity;
   const cutoff = Math.max(history.start, end - BURST_ACTIVITY_SECONDS);
+  const sliceDt = BURST_ACTIVITY_SECONDS / ACTIVITY_SLICES;
   history.ready = end - history.start >= BURST_ACTIVITY_SECONDS - 1e-6;
   history.tracks = history.tracks.filter(track => track.intervals.at(-1)?.[1] > cutoff);
   const matched = new Set();
@@ -477,10 +479,24 @@ function updateBurstActivity(p, fresh, now) {
     let expired = 0;
     while (expired < spans.length && spans[expired][1] <= cutoff) expired++;
     spans.splice(0, expired);
-    const occupied = spans.reduce((seconds, [lo, hi]) => seconds + (hi - Math.max(lo, cutoff)), 0);
+    let occupied = 0, activeSlices = 0, seenThrough = 0;
+    for (const [lo, hi] of spans) {
+      const first = Math.max(lo, cutoff);
+      occupied += hi - first;
+      // Spans are ordered. Count each slice that contains any measured activity once.
+      const firstSlice = Math.floor((first - cutoff) / sliceDt);
+      const pastLastSlice = Math.min(ACTIVITY_SLICES, Math.ceil((hi - cutoff) / sliceDt));
+      activeSlices += pastLastSlice - Math.max(seenThrough, firstSlice);
+      seenThrough = pastLastSlice;
+    }
     track.duty = Math.min(1, occupied / (end - cutoff));
-    const threshold = track.status === "sustained" ? SUSTAINED_EXIT : SUSTAINED_ENTER;
-    track.status = !history.ready ? "pending" : track.duty >= threshold ? "sustained" : "burst";
+    track.activeSlices = activeSlices;
+    const dutyThreshold = track.status === "sustained" ? SUSTAINED_EXIT : SUSTAINED_ENTER;
+    const sliceThreshold = track.status === "recurrent" || track.status === "sustained" ? RECURRENT_EXIT : RECURRENT_ENTER;
+    if (!history.ready) track.status = "pending";
+    else if (track.duty >= dutyThreshold) track.status = "sustained";
+    else if (activeSlices >= sliceThreshold) track.status = "recurrent";
+    else track.status = "burst";
   }
 }
 
@@ -503,7 +519,7 @@ function drawDemoRow(p, detected, groups = p.demoGroups) {
   p.demoCtx.putImageData(p.demoRow, 0, 0);
 }
 
-// Label strip: every signal gets a colour bar (class colour; bursty signals half transparent). The class name
+// Label strip: every signal gets a colour bar (class colour; intermittent signals are dimmed). The class name
 // is written where the gap to the neighbouring signals holds it - at full band ~100 signals share ~800 px,
 // so names appear once you zoom in. No greedy "first label that fits" choice: that made a different signal win the
 // space every row and the labels flicker.
@@ -515,7 +531,7 @@ function drawLabels(p) {
   const gs = visible(p), cx = gs.map(g => (xOf(g.x0, w) + xOf(g.x1, w)) / 2), lineEnd = [-Infinity, -Infinity];
   gs.forEach((g, i) => {
     const x0 = xOf(g.x0, w), x1 = xOf(g.x1, w);
-    ctx.globalAlpha = !isSustained(g) || g.recent ? 0.45 : 1;
+    ctx.globalAlpha = signalOpacity(g);
     ctx.fillStyle = color(g.cls);
     ctx.fillRect(x0 + 0.5, h - 10, Math.max(2, x1 - x0 - 1), 10);
     ctx.globalAlpha = 1;
@@ -530,11 +546,20 @@ function drawLabels(p) {
   p.hint = !shown || named === shown ? "" : named ? ` · 已标注 ${named}/${shown}，继续放大可看全部` : " · 颜色即类别，拖动放大显示类别名";
 }
 
-const isSustained = g => g.activity ? g.activity.status === "sustained" : !g.bursty;
+function isStable(g) {
+  if (!g.activity) return !g.bursty;
+  return g.activity.status === "sustained" || g.activity.status === "recurrent";
+}
+const signalOpacity = g => !isStable(g) || g.recent ? 0.45 : 1;
+
 function activitySuffix(g) {
-  if (g.activity?.status === "pending") return " 观察中";
-  if (isSustained(g)) return g.activity ? " 持续" : "";
-  return " 突发";
+  switch (g.activity?.status) {
+  case "pending": return " 观察中";
+  case "sustained": return " 连续占用";
+  case "recurrent": return " 稳定出现";
+  case "burst": return " 偶发";
+  default: return g.bursty ? " 突发" : "";
+  }
 }
 
 function dutyLabel(activity) {
@@ -545,7 +570,7 @@ function dutyLabel(activity) {
 
 function visible(p) {
   const steady = document.getElementById("steady").checked;
-  return groupsFor(p).filter(g => !hidden.has(g.cls) && g.x1 > view[0] && g.x0 < view[1] && (!steady || isSustained(g)));
+  return groupsFor(p).filter(g => !hidden.has(g.cls) && g.x1 > view[0] && g.x0 < view[1] && (!steady || isStable(g)));
 }
 
 function drawList(p) {
@@ -557,11 +582,13 @@ function drawList(p) {
   const timeHeader = showActivity ?
     `<th scope="col" title="最近 ${BURST_ACTIVITY_SECONDS} 秒内同类别、同频带的占用比例">占空比</th>` : '<th scope="col">持续</th>';
   let empty = "当前范围没有可显示的信号";
-  if (document.getElementById("steady").checked)
-    empty = showActivity && !p.burstActivity?.ready ? "正在积累接收数据" : "当前范围没有持续信号";
+  if (document.getElementById("steady").checked) {
+    empty = showActivity ? "当前范围没有稳定出现的信号" : "当前范围没有持续信号";
+    if (showActivity && !p.burstActivity?.ready) empty = "正在积累接收数据";
+  }
   p.rows.innerHTML = `<table><thead><tr><th scope="col">频率 MHz</th><th scope="col">带宽 kHz</th><th scope="col">类别</th><th scope="col">依据</th><th scope="col">SNR</th>${timeHeader}</tr></thead><tbody>` +
     gs.map(g => `<tr><td><button type="button" data-x="${g.xc}" aria-label="放大 ${fmtMHz(g.xc)} MHz">${fmtMHz(g.xc)}</button></td><td>${Math.round((g.x1 - g.x0) * bw / 1e3)}</td>` +
-      `<td><i style="background:${color(g.cls)};opacity:${!isSustained(g) || g.recent ? 0.45 : 1}"></i>${name(g.cls)}${activitySuffix(g)}${g.recent ? " 近期" : ""}</td><td>${evidenceLabel(g)}</td>` +
+      `<td><i style="background:${color(g.cls)};opacity:${signalOpacity(g)}"></i>${name(g.cls)}${activitySuffix(g)}${g.recent ? " 近期" : ""}</td><td>${evidenceLabel(g)}</td>` +
       `<td>${g.snr.toFixed(0)} dB</td><td>${g.activity ? dutyLabel(g.activity) : g.age < 60 ? g.age.toFixed(1) + " s" : (g.age / 60).toFixed(1) + " min"}</td></tr>`).join("") +
     (gs.length ? "" : `<tr><td colspan="6">${empty}</td></tr>`) + "</tbody></table>";
   for (const button of p.rows.querySelectorAll("button[data-x]"))
@@ -599,10 +626,13 @@ function drawLegend() {
 
 function refreshLists() {
   counts = new Map();
+  const steadyLabel = document.getElementById("steady-label");
+  const filterLabel = burstFeed() && isDemo() ? "只看稳定出现" : "只看持续信号";
+  if (steadyLabel.textContent !== filterLabel) steadyLabel.textContent = filterLabel;
   const steady = document.getElementById("steady").checked;
   for (const p of panels) {
     for (const g of groupsFor(p)) {
-      if (g.cls !== OCCUPIED && (!steady || isSustained(g)))
+      if (g.cls !== OCCUPIED && (!steady || isStable(g)))
         counts.set(g.cls, (counts.get(g.cls) ?? 0) + 1);
     }
     drawList(p);
@@ -656,8 +686,11 @@ function hookMouse(p, cv) {
     const g = visible(p).find(signal => signal.x0 <= x && x < signal.x1);
     const label = g ? `${name(g.cls)}${activitySuffix(g)}${g.recent ? "（近期）" : ""}  ${evidenceLabel(g)}` :
       T.on[x] ? "检测到占用" : "未跟踪";
+    const activity = g?.activity;
+    const detail = activity && activity.status !== "pending" ?
+      `\n占空比 ${dutyLabel(activity)} · 检出时段 ${activity.activeSlices}/${ACTIVITY_SLICES}` : "";
     tip.textContent = `${fmtMHz(x)} MHz  (信道 ${k})\n功率 ${T.pw[x].toFixed(0)} dBFS · 高于本底 ${(T.pw[x] - p.floor).toFixed(0)} dB\n` +
-      label;
+      label + detail;
   });
   cv.addEventListener("mouseleave", () => { tip.style.display = "none"; });
   addEventListener("mouseup", e => {
