@@ -13,6 +13,7 @@ namespace curf {
 
     inline constexpr unsigned burst_bins = 1024;
     inline constexpr unsigned burst_block_frames = 262144;
+    inline constexpr unsigned burst_power_frames = 2 * burst_bins;
     inline constexpr unsigned burst_classes = 7;
 
     struct BurstRegion {
@@ -39,9 +40,15 @@ namespace curf {
         double wall_s = 0, processing_p99_ms = 0, queue_p99_ms = 0;
     };
 
-    // Spectrum columns are in FFT order. All views are valid only inside the callback.
+    struct BurstPower {
+        std::span<const float> windows; // short windows, each with burst_bins FFT-shifted values
+        std::span<const float> floor;
+        std::span<const bool> valid;
+    };
+
+    // The peak spectrum is in FFT order. All views are valid only inside the callback.
     using BurstCallback = std::function<void(std::uint64_t, std::span<const float>, float,
-        std::span<const BurstRegion>, std::span<const std::uint8_t>)>;
+        std::span<const BurstRegion>, std::span<const std::uint8_t>, BurstPower)>;
 
     BurstStats run_burst_classifier(ISource &, const engine::Model &, const BurstConfig &, const BurstCallback &);
 

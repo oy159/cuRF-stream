@@ -19,7 +19,7 @@ namespace curf {
         using cuda::PinnedBuffer;
         constexpr unsigned bins = burst_bins;
         constexpr unsigned frames = burst_block_frames;
-        constexpr unsigned row_frames = 2 * bins;
+        constexpr unsigned row_frames = burst_power_frames;
         constexpr unsigned rows = frames / row_frames;
         constexpr unsigned max_regions = 128;
         constexpr unsigned length = 1024;
@@ -346,7 +346,8 @@ namespace curf {
                     for (unsigned k = 0; k < burst_classes; ++k) sum += regions[i].probabilities[k] = std::exp(l[k] - high);
                     for (auto &pr : regions[i].probabilities) pr /= sum;
                 }
-                if (callback) callback(first, spectrum, db(*mid), regions, {slot->data, bytes});
+                if (callback) callback(first, spectrum, db(*mid), regions, {slot->data, bytes},
+                                       {{host_power.get(), rows * bins}, {host_floor.get(), bins}, valid});
                 ring.release_oldest();
                 stats.frames += frames; ++stats.blocks; stats.regions += regions.size();
                 latency.push_back(std::chrono::duration<double, std::milli>(Clock::now() - begin).count());

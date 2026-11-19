@@ -7,6 +7,7 @@
 #include <cmath>
 #include <future>
 #include <map>
+#include <string_view>
 #include <tuple>
 
 namespace curf {
@@ -22,6 +23,98 @@ namespace curf {
             unsigned label;
             float score;
             Proof proof;
+        };
+        struct TimedMark { Mark mark; std::uint64_t base; };
+
+        // Preserve short-window RF power for named footprints throughout their display lifetime.
+        // Prefix sums let overlapping bands share the same work and exclude invalid FFT bins.
+        class BandPower {
+        public:
+            static constexpr int gate_db = 6;
+
+            void append(BurstPower power) {
+                append_prefix(power.floor, power.valid, noise_);
+                append_prefix(power.windows, power.valid, power_);
+            }
+
+            void write(std::FILE *out, std::uint64_t start, std::uint64_t end, double rate,
+                       std::span<const TimedMark> marks) {
+                if (start != last_end_) bands_.clear();
+                last_end_ = end;
+                const auto hold_frames = static_cast<std::uint64_t>(rate);
+                std::erase_if(bands_, [&](const Band &b) { return end - b.last > hold_frames; });
+                const double step = rate / burst_bins;
+                for (const auto &[mark, base] : marks) {
+                    if (!mark.label || (mark.label == gfsk && (mark.width_hz > 2e6 || mark.score < .75f))) continue;
+                    const auto bin = [&](double hz) {
+                        return std::clamp(static_cast<int>(std::ceil(hz / step + burst_bins / 2)), 0, int(burst_bins));
+                    };
+                    const int lo = bin(mark.offset_hz - mark.width_hz / 2);
+                    const int hi = bin(mark.offset_hz + mark.width_hz / 2);
+                    if (lo >= hi) continue;
+                    const Band b{lo, hi, end, mark.proof != model, mark.score};
+                    auto match = std::find_if(bands_.begin(), bands_.end(), [&](const Band &old) {
+                        const int width = std::min(old.hi - old.lo, hi - lo);
+                        return lo < old.hi && old.lo < hi &&
+                            std::abs((old.lo + old.hi) - (lo + hi)) <= 2 * std::max(4., width * .18) &&
+                            std::max(old.hi - old.lo, hi - lo) <= 2 * width;
+                    });
+                    if (match == bands_.end()) bands_.push_back(b);
+                    else if (b.confirmed && !match->confirmed) *match = b;
+                    else {
+                        match->last = end;
+                        match->score = std::max(match->score, b.score);
+                    }
+                }
+                std::stable_sort(bands_.begin(), bands_.end(), [](const Band &a, const Band &b) {
+                    return std::tie(a.confirmed, a.last, a.score) > std::tie(b.confirmed, b.last, b.score);
+                });
+                constexpr std::size_t max_bands = 24;
+                if (bands_.size() > max_bands) bands_.resize(max_bands);
+
+                std::fprintf(out, ",\"power_start\":%.8f,\"band_power\":[", static_cast<double>(start) / rate);
+                bool comma = false;
+                for (const auto &band : bands_) {
+                    std::fprintf(out, "%s[%d,%d,\"", comma ? "," : "", band.lo, band.hi);
+                    for (std::size_t offset = 0; offset < power_.size(); offset += prefix_width) {
+                        const std::size_t block = offset / (prefix_width * windows_per_block);
+                        const auto p = band_sum(power_, offset, band);
+                        const auto floor = band_sum(noise_, block * prefix_width, band);
+                        const double db = 10 * std::log10(std::max(p, 1e-15) / std::max(floor, 1e-15));
+                        const auto code = static_cast<std::size_t>(std::clamp(std::floor(db) + 8, 0., 63.));
+                        std::fputc(codes[code], out);
+                    }
+                    std::fputs("\"]", out);
+                    comma = true;
+                }
+                std::fputc(']', out);
+                power_.clear();
+                noise_.clear();
+            }
+
+        private:
+            struct Band { int lo, hi; std::uint64_t last; bool confirmed; float score; };
+            static constexpr std::size_t prefix_width = burst_bins + 1;
+            static constexpr unsigned windows_per_block = burst_block_frames / burst_power_frames;
+            static constexpr std::string_view codes = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-_";
+            std::vector<double> power_, noise_;
+            std::vector<Band> bands_;
+            std::uint64_t last_end_ = 0;
+
+            static void append_prefix(std::span<const float> bins, std::span<const bool> valid, std::vector<double> &out) {
+                const auto begin = out.size();
+                out.resize(begin + bins.size() / burst_bins * prefix_width);
+                for (std::size_t row = 0; row < bins.size() / burst_bins; ++row) {
+                    auto *prefix = out.data() + begin + row * prefix_width;
+                    prefix[0] = 0;
+                    for (unsigned k = 0; k < burst_bins; ++k)
+                        prefix[k + 1] = prefix[k] + (valid[k] ? bins[row * burst_bins + k] : 0.f);
+                }
+            }
+
+            static double band_sum(const std::vector<double> &prefix, std::size_t start, const Band &b) {
+                return prefix[start + b.hi] - prefix[start + b.lo];
+            }
         };
 
         struct Observations {
@@ -182,16 +275,17 @@ namespace curf {
         std::array<float, burst_bins> peak{};
         const double step = fmt.sample_rate / burst_bins;
         std::array<std::uint64_t, burst_classes> counts{};
-        struct TimedMark { Mark mark; std::uint64_t base; };
         std::vector<TimedMark> marks;
+        BandPower band_power;
         std::uint64_t first_in_row = 0, last = 0;
         unsigned blocks = 0;
         peak.fill(-150);
         if (feed) std::fprintf(feed, "{\"meta\":{\"streams\":1,\"channels\":%u,\"rate\":%.0f,\"freq\":%.0f,"
             "\"window\":%u,\"every\":%u,\"source\":\"%.*s\",\"rx\":[%u],\"profile\":\"burst\","
+            "\"power_window\":%u,\"power_gate_db\":%d,"
             "\"classes\":[\"noise\",\"ofdm\",\"dsss\",\"gfsk\",\"fm\",\"am\",\"other_signal\"]}}\n",
             burst_bins, fmt.sample_rate, cfg.tune_hz, burst_block_frames * 2 / burst_bins, every,
-            static_cast<int>(source_name.size()), source_name.data(), rx);
+            static_cast<int>(source_name.size()), source_name.data(), rx, burst_power_frames, BandPower::gate_db);
         if (trace) std::fputs("start,end,freq_hz,bw_hz,label,proof,noise,ofdm,dsss,gfsk,fm,am,other_signal\n", trace);
         auto flush = [&](float floor) {
             if (feed && blocks) {
@@ -231,17 +325,20 @@ namespace curf {
                                  a.width_hz, a.label, a.score, a.proof);
                     comma = true;
                 }
-                std::fputs("]}\n", feed);
+                std::fputc(']', feed);
+                band_power.write(feed, first_in_row, last + burst_block_frames, fmt.sample_rate, marks);
+                std::fputs("}\n", feed);
                 std::fflush(feed);
             }
             blocks = 0; marks.clear(); peak.fill(-150);
         };
         float last_floor = -100;
         const auto stats = run_burst_classifier(source, net, cfg, [&](std::uint64_t first, std::span<const float> p,
-                float floor, std::span<const BurstRegion> regions, std::span<const std::uint8_t> wire) {
+                float floor, std::span<const BurstRegion> regions, std::span<const std::uint8_t> wire, BurstPower power) {
             if (blocks && first != first_in_row + blocks * burst_block_frames) flush(last_floor);
             if (!blocks) first_in_row = first;
             ++blocks; last = first; last_floor = floor;
+            if (feed) band_power.append(power);
             for (unsigned k = 0; k < burst_bins; ++k) peak[k] = std::max(peak[k], p[k]);
             const auto confirmed = probe.inspect(regions, wire);
             const auto add = [&](const Mark &mark, const BurstRegion *result) {

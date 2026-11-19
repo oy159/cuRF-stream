@@ -33,6 +33,11 @@
   .stream h2 { font-size: 12px; font-weight: 600; margin: 0 0 6px; display: flex; justify-content: space-between; color: var(--dim); }
   .stream h2 span:first-child { color: var(--text); }
   .plots { position: relative; min-width: 0; }
+  .plot-caption, .power-detail p { margin: 3px 0; color: var(--dim); font-size: 11px; }
+  .power-detail { margin-top: 8px; border-top: 1px solid var(--line); }
+  .power-detail h3 { margin: 6px 0 3px; font-size: 12px; }
+  .power-detail canvas { height: 106px; }
+  .power-detail canvas[hidden] { display: none; }
   canvas { display: block; width: 100%; }
   canvas.wf { height: 250px; cursor: crosshair; }
   canvas.cls { height: 80px; margin-top: 3px; cursor: crosshair; }
@@ -50,12 +55,15 @@
   .rows td { text-align: right; padding: 0 4px; white-space: nowrap; }
   .rows th:nth-child(3), .rows td:nth-child(3) { text-align: left; }
   .rows td:nth-child(3), .rows td:nth-child(4) { white-space: normal; }
+  .signal-family, .activity-state span { white-space: nowrap; }
+  .activity-state { display: block; color: var(--dim); font-size: 11px; }
   .rows th:last-child { white-space: nowrap; }
   .rows tr:hover td, .rows tr:focus-within td { background: var(--hi); }
   .rows button { border: 0; background: none; color: inherit; font: inherit; cursor: pointer; padding: 0; }
   :is(button, select, input):focus-visible { outline: 2px solid #7aa7ff; outline-offset: 2px; }
   .chip { background: none; font-family: inherit; }
   .rows i { width: 9px; height: 9px; border-radius: 2px; display: inline-block; margin-right: 5px; }
+  @media (max-width: 470px) { .rows th, .rows td { padding-inline: 2px; } }
   #end { margin: 0 16px 16px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px; font-family: var(--mono); font-size: 12px; color: var(--dim); white-space: pre-wrap; display: none; }
 </style>
 </head>
@@ -103,6 +111,9 @@ const CP_MATCH_SECONDS = 0.15, CP_HOLD_SECONDS = 0.75;
 const BARKER_HOLD_SECONDS = 0.75, DSSS_HALF_WIDTH_HZ = 11e6;
 const BURST_ACTIVITY_SECONDS = 1, SUSTAINED_ENTER = 0.80, SUSTAINED_EXIT = 0.70;
 const ACTIVITY_SLICES = 8, RECURRENT_ENTER = 6, RECURRENT_EXIT = 5;
+const DEMO_GFSK_MAX_HZ = 2e6, DEMO_GFSK_MIN_DUTY = 0.002, DEMO_MODEL_CONFIDENCE = 0.75;
+const BAND_POWER_CODES = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-_";
+const POWER_VIEW_SECONDS = 0.15;
 
 let classes = [], meta = null, panels = [], counts = new Map(), hidden = new Set();
 let demoBand = null, demoBins = [], ofdm = -1, narrowClass = -1, requestedMode = "demo";
@@ -111,7 +122,7 @@ let view = [0, 512];               // displayed column range (fft-shifted column
 const mode = document.getElementById("view-mode");
 const burstFeed = () => meta?.profile === "burst";
 const isDemo = () => (burstFeed() || demoBand !== null) && mode.value === "demo";
-const groupsFor = p => isDemo() ? p.demoGroups : p.groups;
+const groupsFor = p => isDemo() ? (burstFeed() ? p.displayGroups : p.demoGroups) : p.groups;
 
 const LUT = (() => {
   const stops = [[0, 6, 8, 14], [0.25, 20, 40, 110], [0.5, 30, 140, 150], [0.75, 235, 200, 70], [1, 255, 255, 240]];
@@ -157,11 +168,15 @@ function build() {
     const el = document.createElement("section");
     el.className = "stream";
     el.innerHTML = `<div class="plots"><h2><span>RX${(meta.rx || [])[s] || s + 1}</span><span class="info"></span></h2>
-        <canvas class="axis"></canvas><canvas class="labels"></canvas><canvas class="wf"></canvas><canvas class="cls"></canvas>
+        <canvas class="axis"></canvas><canvas class="labels"></canvas>
+        <div class="plot-caption">峰值功率 · 约 ${(rowDt * 1000).toFixed(0)} ms/行</div>
+        <canvas class="wf"></canvas><canvas class="cls"></canvas>
+        <section class="power-detail" hidden><h3></h3><p></p><canvas></canvas></section>
         <div class="sel"></div></div>
       <div class="list"><h3><span>信号列表</span><span class="n"></span></h3><div class="rows"></div></div>`;
     root.appendChild(el);
     const [axis, labels, wf, cls] = el.querySelectorAll("canvas");
+    const detail = el.querySelector(".power-detail");
     const off = document.createElement("canvas"); off.width = M; off.height = ROWS;
     const coff = document.createElement("canvas"); coff.width = M; coff.height = CROWS;
     const demoOff = document.createElement("canvas"); demoOff.width = M; demoOff.height = CROWS;
@@ -170,7 +185,8 @@ function build() {
                 octx: off.getContext("2d"), cctx: coff.getContext("2d"), row: new ImageData(M, 1), crow: new ImageData(M, 1),
                 demoOff, demoCtx: demoOff.getContext("2d"), demoRow: new ImageData(M, 1),
                 trk: newTrack(M, Math.max(classes.length, 16)), floor: null, now: null,
-                groups: [], demoGroups: [], wideGroups: [], cp: null, barker: new Map(), burstActivity: null };
+                groups: [], demoGroups: [], displayGroups: [], wideGroups: [], cp: null, barker: new Map(), burstActivity: null,
+                detail, powerRows: [], selected: null };
     p.octx.fillStyle = "#06080e"; p.octx.fillRect(0, 0, M, ROWS);
     p.cctx.fillStyle = "#0b0e13"; p.cctx.fillRect(0, 0, M, CROWS);
     p.demoCtx.fillStyle = p.cctx.fillStyle; p.demoCtx.fillRect(0, 0, M, CROWS);
@@ -211,7 +227,7 @@ function blit(p) {
   }
 }
 
-function redrawAll() { for (const p of panels) { drawAxis(p); blit(p); drawLabels(p); } }
+function redrawAll() { for (const p of panels) { drawAxis(p); blit(p); drawLabels(p); drawPowerDetail(p); } }
 
 // One feed row: update tracks, push one waterfall row, redraw.
 function onRow(row) {
@@ -264,12 +280,15 @@ function onRow(row) {
     if (burstFeed()) {
       const fresh = groupBursts(p, row.bursts ?? []);
       updateBurstActivity(p, fresh, now);
-      // Keep recent labels readable in the list while the history draws only
-      // actual observations in this row.
-      const recent = p.demoGroups.filter(g => g.cls !== OCCUPIED && now - g.last <= 0.18 &&
-        !fresh.some(n => n.cls !== OCCUPIED && sameBurstBand(g, n)));
-      p.demoGroups = fresh.concat(recent.map(g => ({ ...g, recent: true }))).sort((a, b) => a.x0 - b.x0);
-      drawDemoRow(p, D.cls, fresh);
+      const shown = new Set(updateDemoLabels(p, fresh, now));
+      p.unclassified = fresh.filter(g => !shown.has(g)).length;
+      drawDemoRow(p, D.cls, fresh.map(g => shown.has(g) ? g : { ...g, cls: OCCUPIED, proof: 0 }));
+      if (meta.power_window && Number.isFinite(row.power_start)) {
+        const end = now + rowDt / meta.every;
+        if (Math.abs((p.powerRows.at(-1)?.end ?? row.power_start) - row.power_start) > 1e-6) p.powerRows = [];
+        p.powerRows.push({ start: row.power_start, end, bands: row.band_power ?? [] });
+        while (p.powerRows[0].end <= end - BURST_ACTIVITY_SECONDS) p.powerRows.shift();
+      }
     } else if (demoBand) {
       const cpOffset = row.ofdm_cp?.[s];
       if (demoBand.cyclicPrefix && Number.isFinite(cpOffset)) {
@@ -286,7 +305,8 @@ function onRow(row) {
       drawDemoRow(p, D.cls);
     }
     p.now = now;
-    blit(p); drawLabels(p); updatePanelInfo(p);
+    blit(p);
+    if (!(burstFeed() && isDemo())) { drawLabels(p); updatePanelInfo(p); }
   }
   document.getElementById("t").textContent = row.t.toFixed(2) + " s";
   rateRows++;
@@ -446,6 +466,8 @@ function updateBurstActivity(p, fresh, now) {
   if (reset) {
     p.burstActivity = { start, tracks: [] };
     p.demoGroups = [];
+    p.displayGroups = [];
+    p.powerRows = [];
   }
   const history = p.burstActivity;
   const cutoff = Math.max(history.start, end - BURST_ACTIVITY_SECONDS);
@@ -498,6 +520,48 @@ function updateBurstActivity(p, fresh, now) {
     else if (activeSlices >= sliceThreshold) track.status = "recurrent";
     else track.status = "burst";
   }
+}
+
+function updateDemoLabels(p, fresh, now) {
+  const step = meta.rate / meta.channels;
+  const gfsk = classes.indexOf("gfsk");
+  const candidates = fresh.filter(g => {
+    if (g.cls === OCCUPIED) return false;
+    if (g.proof) return true;
+    if (!isStable(g) || g.conf < DEMO_MODEL_CONFIDENCE) return false;
+    return g.cls !== gfsk ||
+      ((g.x1 - g.x0) * step <= DEMO_GFSK_MAX_HZ && g.activity.duty >= DEMO_GFSK_MIN_DUTY);
+  });
+  candidates.sort((a, b) => Number(!!b.proof) - Number(!!a.proof) ||
+    b.activity.duty - a.activity.duty || b.last - a.last);
+  const result = [];
+  const matches = (a, b) => a.cls === b.cls && sameBurstBand(a, b);
+  const held = p.demoGroups.filter(g => now - g.last <= (g.proof ? 0.30 : 0.18));
+  const confirmed = candidates.concat(held).filter(g => g.proof);
+  const fragment = g => !g.proof && confirmed.some(proof => partOfConfirmedBurst(g, proof));
+  for (const g of candidates)
+    if (!fragment(g) && !result.some(old => matches(old, g))) result.push(g);
+  // Held labels remain readable in the list. Only new observations color the waterfall.
+  const recent = held.filter(g => !fragment(g) && !result.some(n => matches(g, n)));
+  p.demoGroups = result.concat(recent.map(g => ({ ...g, recent: true }))).sort((a, b) => a.x0 - b.x0);
+  return result;
+}
+
+function partOfConfirmedBurst(g, confirmed) {
+  // Require both frequency containment and repeated timing agreement.
+  const width = g.x1 - g.x0;
+  const overlap = Math.min(g.x1, confirmed.x1) - Math.max(g.x0, confirmed.x0);
+  if (g.cls !== confirmed.cls || width > 0.8 * (confirmed.x1 - confirmed.x0) || overlap < 0.85 * width)
+    return false;
+  const fragments = g.activity.intervals, reference = confirmed.activity.intervals;
+  if (!fragments.length) return false;
+  const margin = 0.0005;
+  let j = 0, matched = 0;
+  for (const [lo, hi] of fragments) {
+    while (j < reference.length && reference[j][1] + margin < lo) j++;
+    if (j < reference.length && reference[j][0] <= hi + margin) matched++;
+  }
+  return matched >= 0.75 * fragments.length;
 }
 
 function drawDemoRow(p, detected, groups = p.demoGroups) {
@@ -568,6 +632,66 @@ function dutyLabel(activity) {
   return percent > 0 && percent < 0.1 ? "＜0.1%" : percent.toFixed(1) + "%";
 }
 
+function drawPowerDetail(p) {
+  const signal = p.selected;
+  const detail = p.detail;
+  detail.hidden = !signal || !burstFeed() || !isDemo();
+  if (detail.hidden) return;
+  const [title, summary, canvas] = detail.children;
+  title.textContent = `${fmtMHz(signal.xc)} MHz · 短时带内功率`;
+  canvas.hidden = true;
+  if (!meta.power_window) {
+    summary.textContent = "此录制未保存短窗功率。";
+    return;
+  }
+  const latest = p.powerRows.flatMap(row => row.bands).reduce((best, band) => {
+    const [x0, x1] = band;
+    const score = Math.abs(x0 - signal.x0) + Math.abs(x1 - signal.x1);
+    if (!sameBurstBand(signal, { x0, x1, xc: (x0 + x1) / 2 })) return best;
+    return best && best.score <= score ? best : { x0, x1, score };
+  }, null);
+  if (!latest) {
+    summary.textContent = "正在接收此频带的短窗功率。";
+    return;
+  }
+  const end = p.powerRows.at(-1).end;
+  const dt = meta.power_window / meta.rate;
+  const threshold = meta.power_gate_db;
+  const start = end - POWER_VIEW_SECONDS;
+  canvas.hidden = false;
+  const [ctx, w, h] = fit(canvas);
+  const y = db => (h - 17) * (1 - (Math.max(-8, Math.min(55, db)) + 8) / 63);
+  const x = t => (t - start) / POWER_VIEW_SECONDS * w;
+  ctx.clearRect(0, 0, w, h);
+  ctx.strokeStyle = "#84909f";
+  ctx.setLineDash([3, 4]); ctx.beginPath();
+  ctx.moveTo(0, y(threshold)); ctx.lineTo(w, y(threshold)); ctx.stroke(); ctx.setLineDash([]);
+  let observed = 0, occupied = 0;
+  ctx.strokeStyle = "#59d0c4";
+  for (const row of p.powerRows) {
+    const band = row.bands.find(([x0, x1]) => x0 === latest.x0 && x1 === latest.x1);
+    if (!band) continue;
+    ctx.beginPath();
+    for (let i = 0; i < band[2].length; i++) {
+      const at = row.start + i * dt;
+      const length = Math.min(at + dt, end) - Math.max(at, end - BURST_ACTIVITY_SECONDS);
+      if (length <= 0) continue;
+      const db = BAND_POWER_CODES.indexOf(band[2][i]) - 8;
+      observed += length;
+      if (db >= threshold) occupied += length;
+      if (at + dt >= start) ctx.lineTo(x(at + dt / 2), y(db));
+    }
+    ctx.stroke();
+  }
+  const duty = observed ? occupied / observed : 0;
+  const bw = (latest.x1 - latest.x0) * meta.rate / meta.channels;
+  summary.textContent = `能量占用 ${dutyLabel({ duty })} · 已测 ${observed.toFixed(2)} s · ${(bw / 1e6).toFixed(2)} MHz · 相对底噪 +${threshold} dB 门限`;
+  canvas.setAttribute("aria-label", `最近 ${POWER_VIEW_SECONDS * 1000} ms 的带内功率`);
+  ctx.fillStyle = "#8793a0"; ctx.font = "11px ui-monospace, Menlo, monospace";
+  ctx.textAlign = "left"; ctx.fillText(`−${POWER_VIEW_SECONDS * 1000} ms`, 0, h - 2);
+  ctx.textAlign = "right"; ctx.fillText("0 ms", w, h - 2);
+}
+
 function visible(p) {
   const steady = document.getElementById("steady").checked;
   return groupsFor(p).filter(g => !hidden.has(g.cls) && g.x1 > view[0] && g.x0 < view[1] && (!steady || isStable(g)));
@@ -579,20 +703,34 @@ function drawList(p) {
   p.n.textContent = `${gs.length} 个`;
   const bw = meta.rate / meta.channels;
   const showActivity = burstFeed() && isDemo();
+  if (showActivity) gs.sort((a, b) => Number(!!b.proof) - Number(!!a.proof) || a.x0 - b.x0);
   const timeHeader = showActivity ?
-    `<th scope="col" title="最近 ${BURST_ACTIVITY_SECONDS} 秒内同类别、同频带的占用比例">占空比</th>` : '<th scope="col">持续</th>';
+    `<th scope="col" title="最近 ${BURST_ACTIVITY_SECONDS} 秒内归到此分类的检出时间比例">分类检出<br>占比</th>` : '<th scope="col">持续</th>';
   let empty = "当前范围没有可显示的信号";
   if (document.getElementById("steady").checked) {
     empty = showActivity ? "当前范围没有稳定出现的信号" : "当前范围没有持续信号";
     if (showActivity && !p.burstActivity?.ready) empty = "正在积累接收数据";
   }
   p.rows.innerHTML = `<table><thead><tr><th scope="col">频率 MHz</th><th scope="col">带宽 kHz</th><th scope="col">类别</th><th scope="col">依据</th><th scope="col">SNR</th>${timeHeader}</tr></thead><tbody>` +
-    gs.map(g => `<tr><td><button type="button" data-x="${g.xc}" aria-label="放大 ${fmtMHz(g.xc)} MHz">${fmtMHz(g.xc)}</button></td><td>${Math.round((g.x1 - g.x0) * bw / 1e3)}</td>` +
-      `<td><i style="background:${color(g.cls)};opacity:${signalOpacity(g)}"></i>${name(g.cls)}${activitySuffix(g)}${g.recent ? " 近期" : ""}</td><td>${evidenceLabel(g)}</td>` +
-      `<td>${g.snr.toFixed(0)} dB</td><td>${g.activity ? dutyLabel(g.activity) : g.age < 60 ? g.age.toFixed(1) + " s" : (g.age / 60).toFixed(1) + " min"}</td></tr>`).join("") +
+    gs.map((g, i) => {
+      const activity = activitySuffix(g);
+      const evidence = evidenceLabel(g);
+      const type = `<span class="signal-family"><i style="background:${color(g.cls)};opacity:${signalOpacity(g)}"></i>${name(g.cls)}</span>`;
+      const state = activity || g.recent ?
+        `<span class="activity-state"><span>${activity}</span>${g.recent ? " <span>近期</span>" : ""}</span>` : "";
+      const time = g.activity ? dutyLabel(g.activity) : g.age < 60 ? g.age.toFixed(1) + " s" : (g.age / 60).toFixed(1) + " min";
+      return `<tr><td><button type="button" data-signal="${i}" aria-label="查看 ${fmtMHz(g.xc)} MHz">${fmtMHz(g.xc)}</button></td><td>${Math.round((g.x1 - g.x0) * bw / 1e3)}</td>` +
+        `<td>${type}${state}</td><td title="${evidence}">${g.proof === 1 ? "Wi‑Fi L-LTF" : evidence.replace("Barker‑", "Barker-<wbr>")}</td>` +
+        `<td>${g.snr.toFixed(0)} dB</td><td>${time}</td></tr>`;
+    }).join("") +
     (gs.length ? "" : `<tr><td colspan="6">${empty}</td></tr>`) + "</tbody></table>";
-  for (const button of p.rows.querySelectorAll("button[data-x]"))
-    button.onclick = () => { const x = Number(button.dataset.x); setView(x - 24, x + 24); };
+  for (const button of p.rows.querySelectorAll("button[data-signal]"))
+    button.onclick = () => {
+      const { x0, x1, xc } = gs[Number(button.dataset.signal)];
+      p.selected = { x0, x1, xc };
+      const half = Math.max(24, (x1 - x0) * 0.60);
+      setView(xc - half, xc + half);
+    };
 }
 
 function drawLegend() {
@@ -631,12 +769,19 @@ function refreshLists() {
   if (steadyLabel.textContent !== filterLabel) steadyLabel.textContent = filterLabel;
   const steady = document.getElementById("steady").checked;
   for (const p of panels) {
+    if (burstFeed() && isDemo()) {
+      p.displayGroups = p.demoGroups.map(g => ({ ...g, activity: {
+        status: g.activity.status, duty: g.activity.duty, activeSlices: g.activity.activeSlices,
+      } }));
+      drawLabels(p);
+    }
     for (const g of groupsFor(p)) {
       if (g.cls !== OCCUPIED && (!steady || isStable(g)))
         counts.set(g.cls, (counts.get(g.cls) ?? 0) + 1);
     }
     drawList(p);
     updatePanelInfo(p);
+    drawPowerDetail(p);
   }
   drawLegend();
 }
@@ -645,8 +790,9 @@ function updatePanelInfo(p) {
   if (p.floor === null) return;
   const groups = groupsFor(p);
   const occupied = groups.filter(g => g.cls === OCCUPIED).length;
+  const unclassified = burstFeed() && isDemo() ? p.unclassified : occupied;
   p.info.textContent = `本底 ${p.floor.toFixed(1)} dBFS · 跟踪 ${groups.length - occupied} 个信号` +
-    (occupied ? ` · ${occupied} 段占用` : "") + (p.hint || "");
+    (unclassified ? ` · ${unclassified} 段灰色占用` : "") + (p.hint || "");
 }
 
 function evidenceLabel(g) {
@@ -666,6 +812,12 @@ function setView(a, b) {
   view = [a, b];
   redrawAll();
   for (const p of panels) drawList(p);
+}
+
+function resetView() {
+  if (!meta) return;
+  for (const p of panels) p.selected = null;
+  setView(0, meta.channels);
 }
 
 function hookMouse(p, cv) {
@@ -688,7 +840,7 @@ function hookMouse(p, cv) {
       T.on[x] ? "检测到占用" : "未跟踪";
     const activity = g?.activity;
     const detail = activity && activity.status !== "pending" ?
-      `\n占空比 ${dutyLabel(activity)} · 检出时段 ${activity.activeSlices}/${ACTIVITY_SLICES}` : "";
+      `\n分类检出占比 ${dutyLabel(activity)} · 检出时段 ${activity.activeSlices}/${ACTIVITY_SLICES}` : "";
     tip.textContent = `${fmtMHz(x)} MHz  (信道 ${k})\n功率 ${T.pw[x].toFixed(0)} dBFS · 高于本底 ${(T.pw[x] - p.floor).toFixed(0)} dB\n` +
       label + detail;
   });
@@ -700,7 +852,7 @@ function hookMouse(p, cv) {
     if (e.target === cv && b - a > 6) setView(colAt(a, w), colAt(b, w) + 1);
     drag = null;
   });
-  cv.addEventListener("dblclick", () => setView(0, meta.channels));
+  cv.addEventListener("dblclick", resetView);
 }
 
 function setState(cls, text) {
@@ -723,7 +875,7 @@ async function start() {
   const defaultClasses = classes;
   ofdm = classes.indexOf("ofdm");
   drawLegend();
-  document.getElementById("reset").onclick = () => meta && setView(0, meta.channels);
+  document.getElementById("reset").onclick = resetView;
   document.getElementById("steady").onchange = () => { redrawAll(); refreshLists(); };
   mode.onchange = () => {
     requestedMode = mode.value;
@@ -738,7 +890,8 @@ async function start() {
       if (classes.join(",") !== nextClasses.join(",")) hidden.clear();
       classes = nextClasses;
       ofdm = classes.indexOf("ofdm");
-      document.getElementById("src").textContent = meta.replay ? `回放 · ${meta.source}` : meta.source;
+      const source = burstFeed() && meta.source === "file" ? "IQ 文件" : meta.source;
+      document.getElementById("src").textContent = meta.replay ? `回放 · ${source}` : source;
       document.getElementById("rate").textContent = (meta.rate / 1e6).toFixed(2) + " MSPS × " + meta.streams;
       document.getElementById("fc").textContent = meta.freq ? (meta.freq / 1e6).toFixed(3) + " MHz" : "基带（相对频率）";
       document.getElementById("end").style.display = "none";
