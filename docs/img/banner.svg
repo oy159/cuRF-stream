@@ -3269,13 +3269,13 @@
 <rect x="713" y="298" width="56" height="22" rx="11" fill="#161b22" stroke="#bc8cff"/>
 <text x="740.625" y="314" font-size="12" fill="#bc8cff" text-anchor="middle" font-weight="600" class="mono">DSSS</text>
 <rect x="834" y="298" width="56" height="22" rx="11" fill="#161b22" stroke="#76b900"/>
-<text x="862.5" y="314" font-size="12" fill="#76b900" text-anchor="middle" font-weight="600" class="mono">FSK</text>
+<text x="862.5" y="314" font-size="12" fill="#76b900" text-anchor="middle" font-weight="600" class="mono">GFSK</text>
 <rect x="947" y="298" width="56" height="22" rx="11" fill="#161b22" stroke="#58a6ff"/>
 <text x="975.0" y="314" font-size="12" fill="#58a6ff" text-anchor="middle" font-weight="600" class="mono">OFDM</text>
 <rect width="1200" height="340" fill="url(#fade)"/>
 <text x="56" y="140" font-size="58" fill="#e6edf3" text-anchor="start" font-weight="700">cuRF-Stream</text>
 <text x="58" y="184" font-size="22" fill="#e6edf3" text-anchor="start" font-weight="500">USB3 SDR + 笔记本 GPU 上的实时宽带信号识别</text>
-<text x="58" y="216" font-size="16" fill="#8b949e" text-anchor="start" font-weight="400">2 × 61.44 MHz · 1024 信道 · 自研 INT8 推理引擎 · 不依赖 TensorRT</text>
+<text x="58" y="216" font-size="16" fill="#8b949e" text-anchor="start" font-weight="400">61.44 MSPS 宽带 IQ · 自研 INT8 推理引擎 · 浏览器实时瀑布</text>
 <rect x="58" y="244" width="48" height="26" rx="13" fill="none" stroke="#76b900" stroke-opacity="0.8"/>
 <text x="82.2" y="262" font-size="13" fill="#76b900" text-anchor="middle" font-weight="600" class="mono">CUDA</text>
 <rect x="116.4" y="244" width="109" height="26" rx="13" fill="none" stroke="#76b900" stroke-opacity="0.8"/>
