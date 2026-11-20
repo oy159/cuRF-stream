@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <b>一块自研 USB3 SDR + 一台游戏本，实时识别 2 × 61.44 MHz 带宽内全部 1024 个信道的调制方式。</b>
+  <b>一块自研 USB3 SDR + 一台游戏本，实时显示宽带频谱占用和信号识别结果。</b>
 </p>
 
 <p align="center">
@@ -11,53 +11,37 @@
   <img alt="sm_86" src="https://img.shields.io/badge/GPU-RTX%203050%20Laptop%20%C2%B7%20sm__86-76B900">
   <img alt="C++" src="https://img.shields.io/badge/C%2B%2B-20-00599C?logo=cplusplus&logoColor=white">
   <img alt="CMake" src="https://img.shields.io/badge/build-CMake%20presets-064F8C?logo=cmake&logoColor=white">
-  <img alt="tests" src="https://img.shields.io/badge/tests-41%20(CUDA%2025%20%C2%B7%20CPU%2016)-2ea44f">
-  <img alt="M5" src="https://img.shields.io/badge/M5%20%E8%AF%86%E5%88%AB%E8%B4%A8%E9%87%8F-%E6%9C%AA%E9%80%9A%E8%BF%87-d73a49">
 </p>
 
 <p align="center">
+  <a href="#快速开始">快速开始</a> ·
+  <a href="#重训版实时演示">实时演示</a> ·
   <a href="#硬件omnicore-sdr">硬件</a> ·
   <a href="#系统架构">架构</a> ·
   <a href="#自研推理引擎">推理引擎</a> ·
   <a href="#端到端结果">结果</a> ·
   <a href="#实采与回环">实采</a> ·
   <a href="#工程中的几个发现">发现</a> ·
-  <a href="#快速开始">快速开始</a> ·
   <a href="#局限">局限</a>
 </p>
 
-数据来自自研 USB3 SDR 及其传输层 OmniCore-SDR-Host。GPU 侧依次做解包、多相信道化、能量检测，再用**自研推理引擎**（手写 Tensor Core / INT8 kernel，不依赖 TensorRT）完成识别。整条链路跑在一块 60 W 的 RTX 3050 笔记本 GPU 上。
-
-> [!WARNING]
-> **当前 M5 识别质量未通过**：实采仍有大量未识别候选和已知载波的长时间标签空窗。下列吞吐与零丢样结果属于运行指标，识别修复进展及失败对照见 [M5 识别质量复查](docs/m5-recognition.md)。
+实时演示使用 OmniCore SDR 单路 61.44 MSPS 的宽带 IQ。GPU 定位候选信号后提取 IQ 窗口，交给**自研 INT8 推理引擎**分类。浏览器显示功率瀑布、频段占用、识别依据和信号持续性，也可以直接调整接收频率和增益。
 
 <p align="center">
-  <img src="docs/img/stats.svg" alt="关键指标：1024 信道、300 秒实采零丢样、p99 2.47 ms、INT8 34.3 万窗口/秒、领先 TensorRT 1.32×" width="100%">
+  <img src="docs/img/demo-24ghz.png" alt="2.4 GHz RX2 瀑布图与 OFDM、DSSS、GFSK 标签" width="100%"><br>
+  <sub>RX2 空中实测回放，中心频率 2441 MHz。信号列表显示 Wi‑Fi L‑LTF、DSSS Barker‑11 和 GFSK 的模型置信度。</sub>
 </p>
 
-<p align="center">
-  <img src="docs/img/live-900mhz.png" alt="实采界面：939 MHz，RX2 瀑布图与信号列表" width="100%"><br>
-  <sub>实采界面（RX2，中心 939 MHz）：上方瀑布图 + 识别标注，下方逐信道判决，右侧信号列表。图中大量“未识别信号”即上面提到的 M5 未通过项。</sub>
-</p>
-
-<!-- TODO: 实时界面录屏 docs/img/demo.gif（瀑布图 + 识别标注 + 角落常驻 MS/s、丢样数、p99 延迟） -->
-
-| | |
-|---|---|
-| 📡 输入 | 2 路 × 61.44 MSPS，12 bit，USB3（368.6 MB/s） |
-| 🔀 信道化 | 512 信道 × 120 kHz / 路，2 倍过采样 |
-| 🧠 识别 | 9 类调制 + 噪声，每信道每 4.27 ms 一次 |
-| ⏱️ 实采长测 | **300 秒零丢样**，端到端延迟 p50 1.74 ms / p99 2.47 ms |
-| ⚡ 推理引擎 | INT8 **34.3 万窗口/秒**；FP16 版对 TensorRT 11.4 领先 **1.3–1.4×** |
-| 🔥 全负载（1024 信道全部识别） | 吞吐模式 1.31×；合成源 300 秒实时持平（受笔记本约 38 W 散热上限约束） |
-| 💻 硬件 | RTX 3050 Laptop（4 GB，sm_86，60 W）、i5-11400H |
+仓库也保留了双路逐信道识别路径和对应的[端到端基准](#端到端结果)，可从合成数据、IQ 文件或硬件运行。
 
 ---
 
 ## 硬件：OmniCore SDR
 
-本项目是 OmniCore SDR 的演示应用：插上板子，任何一台带 USB3 和 NVIDIA 显卡的电脑都能做全带宽的实时信号识别，不需要专用的 GPU 嵌入式平台或 RDMA 网卡。
+本项目是 OmniCore SDR 的演示应用，实测平台为带 USB3 的 Linux 笔记本，配备 RTX 3050 Laptop（4 GB，sm_86）和 i5‑11400H。
 
+| 项目 | 规格 |
+|---|---|
 | 射频 | AD9361，2T2R，70 MHz – 6 GHz，模拟带宽最高 56 MHz |
 | 接口 | USB3（5 Gb/s），C ABI 驱动（OmniCore-SDR-Host） |
 | 采样 | 2 路 61.44 MSPS（12 bit packed 或 8 bit）；12 bit 2R1T 时最高 58.5 MSPS |
@@ -65,13 +49,13 @@
 | 可编程 | RX FIR 可在线加载（本项目用 64 tap ×2 抽取，阻带 −78 dB） |
 | 传输层实测 | `och bench` 2 × 61.44 MSPS：368.8 MB/s，零丢样，零溢出 |
 
-<!-- TODO: 购买 / 联系方式；OmniCore-SDR-Host 仓库链接 -->
-
 cuRF-Stream 只通过 OmniCore 的 C ABI 依赖它（`-DCURF_OMNICORE=ON`）。没有硬件也可以用合成源或录制文件跑通全部流程。
 
 ---
 
 ## 系统架构
+
+下图为逐信道识别路径。`--burst` 演示对单路 packed12 IQ 做 FFT，以频谱功率定位候选信号，再提取 IQ 窗口交给同一推理引擎。
 
 <p align="center">
   <img src="docs/img/architecture.svg" alt="系统架构：CPU 侧 USB 收包与环形缓冲，GPU 侧信道化、检测、gather、INT8 推理" width="100%">
@@ -83,7 +67,7 @@ cuRF-Stream 只通过 OmniCore 的 C ABI 依赖它（`-DCURF_OMNICORE=ON`）。�
 
 ## 自研推理引擎
 
-模型是一个小 ResNet-1D（13.6 万参数，每窗口 50.8 MFLOP，输入 `[B, 2, 1024]`）。引擎从 ONNX 开始全部自己实现：
+归档基准使用小型 ResNet-1D（13.6 万参数，每窗口 50.8 MFLOP，输入 `[B, 2, 1024]`）。引擎从 ONNX 开始全部自己实现：
 
 - **离线转换器**（`model/convert.py`）：BN 折叠、conv + bias + 残差 + ReLU 融合、channels-last 布局、自定义二进制格式，同时导出逐层 golden 激活。
 - **运行时**（`src/engine/`）：按张量生命周期做静态内存规划（arena 是不复用时的 1/2.5），热路径零 `cudaMalloc`；按 batch 档位分别捕获 CUDA Graph；每层多个 kernel 变体在线自动调优，结果可缓存。
@@ -140,6 +124,14 @@ batch 512，CUDA Graph，冷机。每一级都有 Nsight Compute 数据支撑。
 
 ## 端到端结果
 
+本节记录 RTX 3050 Laptop 上的逐信道实测。重训版突发分类使用独立的模型与运行路径。
+
+<p align="center">
+  <img src="docs/img/stats.svg" alt="逐信道基准，1024 信道、300 秒实采零丢样、p99 2.47 ms、INT8 34.3 万窗口每秒" width="100%">
+</p>
+
+基准输入为双路 61.44 MSPS packed12 IQ，USB3 吞吐 368.6 MB/s。每路输出 512 个间隔 120 kHz 的信道，采用两倍过采样。模型每 4.27 ms 对活跃信道判决一次，覆盖 9 类调制和噪声。
+
 ### 负载与 CPU 基线
 
 全部 1024 个信道都识别时，需要每秒 24 万个窗口。
@@ -181,10 +173,16 @@ batch 512，CUDA Graph，冷机。每一级都有 Nsight Compute 数据支撑。
 
 - **300 秒实采**：2 × 61.44 MSPS，驱动层和流水线均零丢样，没有出现不连续。主机队列峰值只有 0.9 MiB。
 - **线缆回环**：TX1 发射 104 个已知调制的信号（9 类，在频域按整周期构造，循环发射无接缝），TX 衰减从 89.75 dB 逐级降到 50 dB，测量识别率随 SNR 的变化。软件把 TX 衰减锁在 ≥ 40 dB，低于这个值时拒绝打开设备，保护 RX 端。
-- **空中实测**：900 MHz 的 LTE/NR 下行、2.4 GHz 的 WiFi 突发、FM 电台都能被检测并识别。
+- **空中实测**：记录了 900 MHz 下行信号、2.4 GHz Wi-Fi 突发和 FM 广播。实采仍会出现未识别信号和标签空窗。
 - **前端噪声形状校准**：AD9361 的通带边缘有 5–9 dB 的噪声抬升，大小由增益决定。先在无信号时校准一次噪声形状，检测时按形状白化后用全局本底判断，误报减少一半到三分之二。
 - **实时界面**：信道跟踪（指数衰减投票）、信号出现 / 消失的迟滞判断、相邻同类信道合并、区分突发和持续信号、拖动放大、信号列表。
 
+<details>
+<summary>逐信道实采界面（RX2，中心频率 939 MHz）</summary>
+
+<img src="docs/img/live-900mhz.png" alt="逐信道版本的 939 MHz 实测瀑布和信号列表" width="100%">
+
+</details>
 
 ---
 
@@ -197,7 +195,7 @@ batch 512，CUDA Graph，冷机。每一级都有 Nsight Compute 数据支撑。
 - **有记录的负结果**：例如把 gather 并进 stem 融合块（访存跨度 4 KB，每个 sector 只用到 8 字节），以及在融合块上移植 swizzle 和双缓冲。都测过、写清原因后删除或保留为变体。
 - **主机侧忙等也耗电**：`cudaEventSynchronize` 默认自旋，会占满一个 CPU 核；改用 blocking sync 后 CPU 占用从 90% 降到 30%。笔记本的 CPU 和 GPU 共用散热，CPU 少发热，GPU 就能维持更高的时钟。
 
-**正确性**：每个 GPU kernel 都先有 CPU 参考实现或 golden 数据。解包、信道化线格式融合、fp16 输入等路径与参考逐位一致；推理的每个 kernel 变体都逐层对齐 golden。共 41 个测试（CUDA 25 个，CPU 16 个）。
+**正确性**：每个 GPU kernel 都先有 CPU 参考实现或 golden 数据。解包、信道化线格式融合、fp16 输入等路径与参考逐位一致；推理的每个 kernel 变体都逐层对齐 golden。
 
 ---
 
@@ -213,10 +211,10 @@ cmake --build --preset cpu-debug
 ctest --preset cpu-debug
 ```
 
-CUDA 部分（Linux，sm_86，CUDA 12.8）：
+CUDA 部分（Linux，sm_86，CUDA 12.8）。预设默认启用 TensorRT 基线，有 TensorRT 时设置 `TENSORRT_ROOT`，仅用自研引擎时可关闭该选项。
 
 ```sh
-cmake --preset cuda-release
+cmake --preset cuda-release -DCURF_TENSORRT=OFF
 cmake --build --preset cuda-release
 ctest --preset cuda-release
 ```
@@ -231,18 +229,92 @@ ctest --preset cuda-release
 
 ### 模型
 
-模型文件不进仓库，用自带的 GPU 合成器训练（RTX 3050 Laptop 上约 37 分钟），然后导出、转换：
+模型文件在本地训练、导出和转换。下面生成实时演示的 `demo` 模型。运行逐信道路径时，把 `profile=demo` 改为 `profile=run1`。
 
 ```sh
-pip install -r model/requirements.txt   # torch 需从 cu128 源安装，见文件内注释
-python model/train.py   --out model/artifacts/run2 --steps 30000
-python model/export.py  --ckpt model/artifacts/run2/best.pt --out model/artifacts/run2/export
-python model/convert.py --onnx model/artifacts/run2/export/amc_fp32.onnx \
-                        --ref  model/artifacts/run2/export/reference.npz \
-                        --out  model/artifacts/run2/export
+pip install -r model/requirements.txt   # torch 的 CUDA 安装方式见文件内注释
+profile=demo
+out="model/artifacts/$profile"
+python model/train.py --profile "$profile" --out "$out" --steps 30000
+python model/export.py --ckpt "$out/best.pt" --out "$out/export"
+python model/convert.py --onnx "$out/export/amc_fp32.onnx" \
+  --ref "$out/export/reference.npz" --out "$out/export"
 ```
 
-### 运行
+命令默认使用合成训练数据。复现实采训练时，可通过 `--train-iq` 和 `--validation-iq` 传入本地标注样本。
+
+### run1 演示回放
+
+单路 packed12 录音可通过 `--freq` 指定采集中心频率，界面按绝对频率显示。
+
+```sh
+mkdir -p docs/results
+build/cuda-release/bench/curf_classify --source file --file /path/to/capture.p12 \
+  --streams 1 --freq 5.77e9 --seconds 0 --int8 --ui-out docs/results/run1.feed
+python3 tools/ui_server.py --bind 127.0.0.1 --replay docs/results/run1.feed --loop
+```
+
+2.4 GHz 演示优先显示有 Barker‑11 证据的 DSSS。DSSS 色带限在对应信道的占用子区段，其余宽带按相邻信道的 OFDM 票判决。
+同一片占用的 Barker 标签过期后显示「占用」。5 GHz 演示依据与占用频带匹配的循环前缀。
+物理层证据检测支持 40–65 MS/s 的输入。用「原始分类」查看逐信道模型的结果。
+
+### 重训版实时演示
+
+先启用 OmniCore 硬件源，再启动浏览器控制服务。
+
+```sh
+cmake --preset cuda-release -DCURF_TENSORRT=OFF -DCURF_OMNICORE=ON \
+  -DCMAKE_PREFIX_PATH=/path/to/omnicore
+cmake --build --preset cuda-release --target curf_classify
+
+python3 tools/ui_server.py --bind 127.0.0.1 --port 8080 --control \
+  --metrics model/artifacts/demo/export/metrics.json -- \
+  build/cuda-release/bench/curf_classify --burst --model model/artifacts/demo/export \
+  --int8 --streams 1 --rx 2 --source omnicore --bandwidth 56e6 --band-mhz 50 --ring 128 \
+  --tune-cache model/artifacts/demo/export/int8.tune
+```
+
+打开 [本地接收界面](http://127.0.0.1:8080)，选择频段，设置增益和接收时长，再点击「开始接收」。时长设为 0 时持续接收。支持相应功能的 OmniCore 驱动会提供直流 / I/Q 校正开关。
+
+SDR 接在另一台 Linux 主机时，可在 `--control` 后加 `--remote user@linux-host`。`--` 后面的可执行文件和模型路径按远端主机解析。
+
+| 频段 | RX2 实测配置 | 界面显示 |
+|---|---|---|
+| 2.4 GHz | 中心 2441 MHz，增益 18 dB | OFDM、Barker‑11 确认的 DSSS、GFSK 等候选 |
+| 5.8 GHz | 中心 5780 MHz，增益 24 dB | 5765 MHz OFDM 及 Wi‑Fi L‑LTF 证据 |
+| 广播 FM | 自定义中心 100 MHz，增益 24 dB | 19 kHz 立体声导频证据及 FM 分类检出占比 |
+
+增益按天线和现场信号调整。灰色带表示检测到的频谱占用。点击信号频点可查看短时间窗的带内功率和能量占用率，信号列表中的分类检出占比按实际分类区间计算。
+
+<details>
+<summary>5.8 GHz 的瀑布与 5765 MHz 带内功率</summary>
+
+<img src="docs/img/demo-58ghz.png" alt="RX2 实测中的 5765 MHz OFDM、Wi‑Fi L‑LTF 证据和短时间带内功率" width="100%">
+
+</details>
+
+<details>
+<summary>同一段 RX2 实测 IQ 的弱 FM 识别对照</summary>
+
+<img src="docs/img/demo-fm.png" alt="91.4 MHz 和 106.1 MHz 的带内功率及更新前后的 FM 检出时间对照" width="100%">
+
+</details>
+
+#### 保存和回放
+
+以下命令只接收 RX2，并保存 30 秒的瀑布和识别数据。回放可在没有 SDR 的机器上运行。
+
+```sh
+mkdir -p docs/results
+build/cuda-release/bench/curf_classify --burst --model model/artifacts/demo/export \
+  --int8 --streams 1 --rx 2 --source omnicore --freq 2441e6 \
+  --gain 18 --bandwidth 56e6 --band-mhz 50 --ring 128 --seconds 30 --ui-out docs/results/rx2.feed
+python3 tools/ui_server.py --bind 127.0.0.1 --port 8080 --replay docs/results/rx2.feed --loop
+```
+
+已保存 packed12 IQ 的场景，可用 `--source file --file capture.p12 --rate 61.44e6 --freq <实际中心频率 Hz> --seconds 0` 重新分类。信号频率按采集中心频率换算。
+
+### 基准与合成场景
 
 ```sh
 # 合成源，每路 64 个活跃信道，按真实速率跑 10 秒
@@ -255,11 +327,6 @@ build/cuda-release/bench/curf_classify --int8 --tune-cache /tmp/i8.tune --detect
 python tools/make_scenario.py --out /tmp/scn --windows 16 --spacing 4 --snr 5 20
 build/cuda-release/bench/curf_classify --int8 --source file --file /tmp/scn/capture.raw --detect relative --dump /tmp/scn/results.csv
 python tools/make_scenario.py --score /tmp/scn
-
-# 实采 + 浏览器界面（http://<host>:8080/）
-python3 tools/ui_server.py --port 8080 -- build/cuda-release/bench/curf_classify --int8 \
-    --tune-cache /tmp/i8.tune --source omnicore --freq 2.44e9 --gain 40 \
-    --noise-shape <校准文件> --threshold-db 4 --band-mhz 60 --seconds 300
 ```
 
 前端噪声形状校准：天线断开（或输入端接负载）时，运行 `curf_classify --source omnicore --calibrate-noise <输出文件>`。换增益后需要重新校准。
@@ -273,15 +340,6 @@ python3 tools/ui_server.py --port 8080 -- build/cuda-release/bench/curf_classify
 | `curf_bench_unpack` / `curf_bench_pcie` | 解包 kernel 带宽；H2D / D2H 与大页的关系 |
 | `curf_pipeline` | P1 流水线吞吐、stream 重叠、延迟 |
 | `curf_bench_channelizer` | 多相信道化 |
-| `curf_check_extraction` | 已知信号参数的 IQ 提取、连续 CPU 参考对齐与导出（见 [M2 验证说明](docs/m2-extraction.md)） |
-| `tools/run_signal_checks.py` | M2 信号级回放、双路 300 秒实时验收（见 [链路与复现说明](docs/m2-pipeline.md)） |
-| `tools/run_display_checks.py` | M3 频段策略、真实模型回放与 ADS-B 联动检查（见 [显示策略说明](docs/m3-display.md)） |
-| `tools/run_room_checks.py` | M4 开发 / 验收种子分离的随机 RF 场景、负样本控制和标签错误率检查（见 [验收口径](docs/m4-evaluation.md)） |
-| `tools/check_display_reduction.py` | 同一冻结 M4 feed 的完整 / 显示判决对照，检查突发覆盖、全部命名保留与原始计数一致性 |
-| `tools/run_live_checks.py` | M5 只接收实采长测、完整模型记录与有界显示合并、驱动与二级运行检查（见 [最终复验](docs/m5-dsss.md)） |
-| `tools/record_live_demo.cjs` | 可选 Playwright / Chrome 实采界面录像，依据实验 manifest 匹配频率与接收路 |
-| `tools/check_dsss_capture.py` | 独立于模型的 Barker-11 相干能量检查，支持 DSSS / OFDM 对照（见 [M5 复验](docs/m5-dsss.md)） |
-| `model/make_room_scene.py` | 分块生成 61.44 MS/s 室内 packed12 场景，保留每个 RX 的包级真值与源文件哈希 |
 | `curf_bench_engine` | 引擎优化阶梯、逐层耗时（`--ops`）、ncu 采集（`--profile`）、库基线 |
 | `curf_classify` | 端到端：吞吐、延迟分位、丢样、准确率 |
 
@@ -310,7 +368,8 @@ tools/                界面、场景生成、回环、FIR 设计、噪声形状
 
 ## 局限
 
-- **模型是在合成数据上训练的**。真实的 FM 广播（带立体声和 RDS）、GSM 与训练数据有域差异；硬件伪影（直流残余、杂散）也会被分到某一类。后续计划：用实采数据微调，并增加“未知”类别。
-- **单个 240 kHz 信道里，宽带类噪声和 OFDM 本来就难以区分**，所以空中实测里 OFDM 的命中只能算定性一致。
+- 合成训练数据与真实空中信号有域差异。直流残余和硬件杂散可能触发误报，弱信号也可能出现标签空窗。
+- 逐信道路径的 OFDM 结果用作定性参考。实时演示在宽带候选中核验 Wi‑Fi L‑LTF，GFSK 标签表示调制类型。
+- 广播 FM 识别覆盖带 19 kHz 立体声导频的电台。较弱的电台在低增益或衰落时仍可能掉标。
 - **全负载在实采时扛不住**：持续 1024 信道识别时，实采只有 0.97×（丢样 3%）。CPU 处理 368 MB/s USB 数据产生的热量会压低 GPU 时钟。要留出余量，需要减少计算（时间复用、模型瘦身），或者走零拷贝 USB → 锁页内存这条路。
 - **只在一台机器上测过**（RTX 3050 Laptop，散热上限约 38–45 W）。

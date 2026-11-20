@@ -8,148 +8,41 @@
 //                 [--fp32-input]   (INT8: gather fp32 windows; default fp16, which the fused stem rounds to anyway)
 //
 //                 [--ui-out PATH] [--ui-every N]   (display feed, see tools/ui_server.py)
+//                 [--burst --model DIR] [--exclude-hz HZ]  (whole-signal demo model, one receiver)
 //                 [--noise-shape F] [--calibrate-noise F]  (front-end noise shape: use / measure with no signal)
 //                 [--dc-guard N]  (channels at DC never reported; omnicore default 1)
-//                 [--stage2 DIR] [--stage2-int8] [--stage1-classify]  (signal-level stage 2: adjacent detected channels -> one signal,
-//                                                    extracted from the raw samples at 2-3x its bandwidth and
-//                                                    classified by DIR/s2.curf; {"sig":{...}} lines in the feed)
-//                 [--stage2-band-dump PATH]  (finite offline file replay only; first 1024 band estimates + PSD)
-//                 [--stage2-input-dump PATH] (finite offline replay only; first 128 broad model input rows)
-//                 [--stage2-bandwidth history|current]  (bandwidth estimator, extraction FIR is unchanged)
-//                 [--stage2-dsss-lock] (experimental Barker-11 carrier frequency evidence)
-//                 [--adsb [HZ]] [--adsb-stream N] [--adsb-threshold T]  (Mode S / ADS-B demodulator on the raw
-//                                                    samples of stream N, carrier HZ (default 1090e6); decoded
-//                                                    messages go to the display feed as {"adsb":{...}} lines.
-//                                                    Tune off the carrier, e.g. --freq 1080e6: DC carries LO leakage)
 //                 [--neighbor-db 6] [--band-mhz B]  (detection: leakage rejection; only report +- B/2 around the
 //                                                    centre - default the whole band, 52 MHz for omnicore)
 //   omnicore:     [--rx 1|2|1,2] [--serial S] [--freq HZ] [--gain DB] [--agc 0..3] [--iq-bits 12|8] [--bandwidth HZ]
+//                 [--rx-correction on|off]  (DC and I/Q tracking; default: preserve the hardware state)
 //                 [--tx-file SC16 --tx-atten DB]  (loopback: send the file on TX1 in a loop; DB >= 40)
 //                 (--streams / --rate as for the other sources; drop mode is implied: hardware cannot wait)
+//   file:         [--freq HZ]  (recording centre frequency for display; defaults to baseband)
 //
 // Synthetic source: noise plus, per stream, N tones at the centres of N channels spread over the band
 // (random phases), so exactly N channels per stream carry energy - the load knob. Prints one JSON line of
 // pipeline statistics; --print N also lists the results of the first N windows.
 
-#include "curf/adsb.hpp"
-#include "curf/channelizer.hpp"
-#include "curf/cuda/adsb.hpp"
 #include "curf/engine/model.hpp"
 #include "curf/runtime/classifier.hpp"
-#include "curf/runtime/signal_stage.hpp"
 #include "curf/sources.hpp"
-#ifdef CURF_HAVE_OMNICORE
 #include "curf/omnicore_source.hpp"
-#endif
+#include "burst_demo.hpp"
+#include "dsss_probe.hpp"
 
 #include <algorithm>
-#include <deque>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <memory>
 #include <numbers>
+#include <optional>
 #include <random>
 #include <sstream>
 #include <string>
 #include <vector>
 
 using namespace curf;
-
-namespace {
-
-    std::string json_quote(const std::string &text) {
-        std::string out = "\"";
-        for (unsigned char c : text) {
-            if (c == '"' || c == '\\') { out += '\\'; out += static_cast<char>(c); }
-            else if (c < 32) { char b[7]; std::snprintf(b, sizeof b, "\\u%04x", c); out += b; }
-            else out += static_cast<char>(c);
-        }
-        return out + '"';
-    }
-
-    // ADS-B on the side of the classifier: GPU demodulation per block, then on the host duplicate removal (one
-    // frame can be found by neighbouring start positions or both sides of a block boundary), address checks for
-    // the address/parity formats, field decoding and CPR positions.
-    struct AdsbTap final : BlockTap {
-        cuda::AdsbDemod demod;
-        adsb::Tracker tracker;
-        double fs;
-        double carrier_hz;
-        std::uint32_t stream;
-        std::FILE *ui;
-        std::deque<std::pair<std::uint64_t, std::array<std::uint8_t, 14>>> recent;
-        std::uint64_t frames = 0, extended = 0, corrected = 0, short_ok = 0, unknown_addr = 0, positions = 0, dups = 0,
-                      overflow = 0;
-        std::vector<cuda::AdsbFrame> buf;
-
-        AdsbTap(const cuda::AdsbConfig &c, const StreamFormat &f, std::size_t block, std::size_t slots, std::FILE *ui_, double carrier)
-            : demod(c, f.wire, f.channels, block, slots), fs(f.sample_rate), carrier_hz(carrier), stream(c.stream), ui(ui_) {}
-
-        void enqueue(std::size_t slot, const std::uint8_t *d_wire, std::size_t n, std::uint64_t first, cudaStream_t s) override {
-            demod.enqueue(d_wire, n, first, slot, s);
-        }
-
-        void retire(std::size_t slot) override {
-            const auto r = demod.results(slot);
-            if (demod.found(slot) > r.size()) overflow += demod.found(slot) - r.size();
-            buf.assign(r.begin(), r.end());
-            std::sort(buf.begin(), buf.end(), [](const auto &a, const auto &b) { return a.sample < b.sample; });
-            const auto window = static_cast<std::uint64_t>(4e-6 * fs);
-            for (const auto &f : buf) {
-                std::array<std::uint8_t, 14> key{};
-                std::copy(f.msg, f.msg + 14, key.begin());
-                while (!recent.empty() && recent.front().first + window < f.sample) recent.pop_front();
-                if (std::any_of(recent.begin(), recent.end(), [&](const auto &e) { return e.second == key; })) {
-                    ++dups;
-                    continue;
-                }
-                recent.emplace_back(f.sample, key);
-                const double t = static_cast<double>(f.sample) / fs;
-                const int df = adsb::downlink_format(f.msg);
-                std::uint32_t addr = 0;
-                if (df == 11 || df == 17 || df == 18) {
-                    if (df != 11) ++extended;
-                    else ++short_ok;
-                } else {
-                    if (!tracker.known(f.remainder, t)) {
-                        ++unknown_addr;
-                        continue;
-                    }
-                    addr = f.remainder;
-                    ++short_ok;
-                }
-                corrected += f.corrected;
-                ++frames;
-                const auto m = adsb::decode(f.msg, f.bits, addr);
-                const auto pos = tracker.position(m, t);
-                if (pos) ++positions;
-                if (ui) {
-                    const float db = 20 * std::log10(std::max(f.signal, 1e-9f));
-                    const auto record = adsb::to_json(m, t, db, pos, f.corrected != 0);
-                    // Demodulation has verified CRC (after the optional one-bit correction). AP formats
-                    // additionally need a known address; only DF17/18 become aircraft in the display policy.
-                    std::fprintf(ui, "{\"adsb\":{\"crc_ok\":true,\"s\":%u,\"freq\":%.0f,%s}\n",
-                                 stream, carrier_hz, record.c_str() + 1);
-                }
-            }
-            if (ui && !buf.empty()) std::fflush(ui);
-        }
-
-        std::string json() const {
-            char b[300];
-            std::snprintf(b, sizeof b,
-                          "\"adsb\":{\"frames\":%llu,\"extended\":%llu,\"short\":%llu,\"corrected\":%llu,\"positions\":%llu,"
-                          "\"aircraft\":%zu,\"unknown_address\":%llu,\"duplicates\":%llu,\"overflow\":%llu},",
-                          static_cast<unsigned long long>(frames), static_cast<unsigned long long>(extended),
-                          static_cast<unsigned long long>(short_ok), static_cast<unsigned long long>(corrected),
-                          static_cast<unsigned long long>(positions), tracker.size(),
-                          static_cast<unsigned long long>(unknown_addr), static_cast<unsigned long long>(dups),
-                          static_cast<unsigned long long>(overflow));
-            return b;
-        }
-    };
-
-} // namespace
 
 int main(int argc, char **argv) {
     std::string source = "synthetic", file, label, model_dir = CURF_MODEL_DIR;
@@ -170,22 +63,11 @@ int main(int argc, char **argv) {
     int dc_guard = -1;    // channels at DC never reported; default 0 (omnicore: 1, the LO leakage channel)
     std::string calibrate_path, shape_path; // noise shape: write (no signal at the input) / use
     [[maybe_unused]] std::uint32_t rx_mask = 0; // omnicore --rx 1 | 2 | 1,2 (default: from --streams)
+    std::optional<bool> rx_correction;
     [[maybe_unused]] std::string tx_file;
     [[maybe_unused]] double tx_atten = 89.75;
-    bool int8 = false;
-    std::string stage2_dir;      // stage-2 model directory (s2.curf, s2.golden)
-    bool stage2_int8 = false;
-    std::string stage2_tune_cache;
-    std::string stage2_band_dump;
-    std::string stage2_input_dump;
-    std::string stage2_bandwidth_mode = "current";
-    bool stage2_dsss_lock = false;
-    std::uint32_t stage2_max_signals = 64, stage2_max_tracks = 256;
-    std::uint32_t stage2_pending = 3;
-    std::size_t stage2_scratch_mib = 32;
-    bool stage1_classify = false;
-    double adsb_hz = 0;          // > 0: ADS-B demodulator on the side, carrier frequency
-    cuda::AdsbConfig adsb_cfg;
+    bool int8 = false, burst = false, threshold_given = false, buckets_given = false, ring_given = false;
+    std::vector<double> excluded;
     bool fp32_input = false;     // INT8 engine, calibrated on the model directory's golden windows
     ClassifierConfig cfg;
     cfg.engine.tune_iters = 10;
@@ -210,7 +92,10 @@ int main(int argc, char **argv) {
         else if (a == "--detect") {
             const auto m = next();
             cfg.detect.mode = m == "all" ? cuda::DetectMode::all : m == "absolute" ? cuda::DetectMode::absolute : cuda::DetectMode::relative;
-        } else if (a == "--threshold-db") cfg.detect.threshold_db = std::stof(next());
+        } else if (a == "--threshold-db") {
+            cfg.detect.threshold_db = std::stof(next());
+            threshold_given = true;
+        }
         else if (a == "--neighbor-db") cfg.detect.neighbor_reject_db = std::stof(next());
         else if (a == "--band-mhz") band_mhz = std::stod(next());
         else if (a == "--dc-guard") dc_guard = std::stoi(next());
@@ -219,11 +104,12 @@ int main(int argc, char **argv) {
         else if (a == "--seconds") cfg.seconds = std::stod(next());
         else if (a == "--windows") cfg.max_windows = std::stoull(next());
         else if (a == "--buckets") {
+            buckets_given = true;
             cfg.engine.buckets.clear();
             std::stringstream ss(next());
             for (std::string x; std::getline(ss, x, ',');) cfg.engine.buckets.push_back(std::stoi(x));
         } else if (a == "--drop") cfg.drop_when_full = true;
-        else if (a == "--ring") cfg.ring_slots = std::stoull(next());
+        else if (a == "--ring") { cfg.ring_slots = std::stoull(next()); ring_given = true; }
         else if (a == "--dump") dump_path = next();
         else if (a == "--ui-out") ui_path = next();
         else if (a == "--ui-every") ui_every = std::max<std::uint64_t>(1, std::stoull(next()));
@@ -232,6 +118,14 @@ int main(int argc, char **argv) {
         else if (a == "--gain") gain = std::stod(next());
         else if (a == "--bandwidth") bandwidth = std::stod(next());
         else if (a == "--agc") agc = static_cast<std::uint32_t>(std::stoul(next()));
+        else if (a == "--rx-correction") {
+            const auto value = next();
+            if (value != "on" && value != "off") {
+                std::fputs("--rx-correction expects on or off\n", stderr);
+                return 2;
+            }
+            rx_correction = value == "on";
+        }
         else if (a == "--iq-bits") iq_bits = static_cast<std::uint32_t>(std::stoul(next()));
         else if (a == "--tx-file") tx_file = next();
         else if (a == "--tx-atten") tx_atten = std::stod(next());
@@ -242,60 +136,35 @@ int main(int argc, char **argv) {
         else if (a == "--print") print = std::stoull(next());
         else if (a == "--label") label = next();
         else if (a == "--int8") int8 = true;
-        else if (a == "--adsb") adsb_hz = i + 1 < argc && argv[i + 1][0] != '-' ? std::stod(next()) : 1090e6;
-        else if (a == "--stage2") stage2_dir = next();
-        else if (a == "--stage2-int8") stage2_int8 = true;
-        else if (a == "--stage2-tune-cache") stage2_tune_cache = next();
-        else if (a == "--stage2-band-dump") stage2_band_dump = next();
-        else if (a == "--stage2-input-dump") stage2_input_dump = next();
-        else if (a == "--stage2-bandwidth") stage2_bandwidth_mode = next();
-        else if (a == "--stage2-dsss-lock") stage2_dsss_lock = true;
-        else if (a == "--stage2-max-signals") stage2_max_signals = static_cast<std::uint32_t>(std::stoul(next()));
-        else if (a == "--stage2-max-tracks") stage2_max_tracks = static_cast<std::uint32_t>(std::stoul(next()));
-        else if (a == "--stage2-scratch-mib") stage2_scratch_mib = std::stoull(next());
-        else if (a == "--stage2-pending") stage2_pending = static_cast<std::uint32_t>(std::stoul(next()));
-        else if (a == "--stage1-classify") stage1_classify = true;
-        else if (a == "--adsb-stream") adsb_cfg.stream = static_cast<std::uint32_t>(std::stoul(next()));
-        else if (a == "--adsb-threshold") adsb_cfg.threshold = std::stof(next());
+        else if (a == "--burst") burst = true;
+        else if (a == "--exclude-hz") excluded.push_back(std::stod(next()));
         else if (a == "--fp32-input") fp32_input = true;
         else if (a == "--calib-percentile") cfg.engine.calib_percentile = std::stod(next());
         else if (a == "--tune-cache") cfg.engine.tune_cache = next();
         else { std::fprintf(stderr, "unknown option %s\n", a.c_str()); return 2; }
     }
 
-    if (!stage2_max_signals || stage2_max_signals > 512 || stage2_max_tracks < stage2_max_signals ||
-        stage2_max_tracks > 4096 || stage2_scratch_mib < 8 || stage2_scratch_mib > 512 || !stage2_pending || stage2_pending > 8) {
-        std::fprintf(stderr, "invalid stage-2 capacities: signals 1..512, tracks signals..4096, scratch 8..512 MiB, pending 1..8\n");
+    if (freq_given && (!std::isfinite(freq) || freq < 0)) {
+        std::fprintf(stderr, "--freq requires a finite, nonnegative frequency in Hz\n");
         return 2;
     }
-
-    if (stage2_bandwidth_mode != "history" && stage2_bandwidth_mode != "current") {
-        std::fprintf(stderr,"stage-2 bandwidth mode must be history or current\n"); return 2;
-    }
-    if ((!stage2_band_dump.empty() || !stage2_input_dump.empty()) && (source != "file" || loop || realtime || stage2_dir.empty() || cfg.seconds != 0)) {
-        std::fprintf(stderr,"stage-2 diagnostics require --source file --stage2 DIR --seconds 0, without --loop or --realtime\n");
+    if (rx_correction && source != "omnicore") {
+        std::fputs("--rx-correction requires --source omnicore\n", stderr);
         return 2;
     }
-    engine::Model model;
-    if (stage2_dir.empty() || stage1_classify) {
-        model = engine::Model::load(std::filesystem::path(model_dir) / "amc.curf");
-    } else {
-        // Detection-only stage 1 needs no trained model. Keep its legacy callback shape as a descriptor.
-        model.tensors = {{2,cfg.window,"input"}, {1,1,"detection"}};
-        model.input = 0; model.output = 1;
-    }
-    if (int8 && (stage2_dir.empty() || stage1_classify)) {
+    const auto model = engine::Model::load(std::filesystem::path(model_dir) / "amc.curf");
+    if (int8) {
         cfg.engine.int8 = true;
         cfg.engine.half_input = !fp32_input;
         cfg.engine.calibration = engine::Golden::load(std::filesystem::path(model_dir) / "amc.golden", model).input;
     }
     std::unique_ptr<ISource> src;
-    std::string receiver_name;
+    const RxCorrection *correction = nullptr;
 #ifdef CURF_HAVE_OMNICORE
     OmniCoreSource *och = nullptr;
 #endif
     if (source == "file") {
-        src = std::make_unique<FileSource>(FileConfig{file, fmt, loop, realtime});
+        src = std::make_unique<FileSource>(FileConfig{file, fmt, loop});
     } else if (source == "omnicore") {
 #ifdef CURF_HAVE_OMNICORE
         OmniCoreConfig oc;
@@ -307,13 +176,14 @@ int main(int argc, char **argv) {
         oc.bandwidth_hz = static_cast<std::uint32_t>(std::llround(bandwidth));
         oc.gain_db[0] = oc.gain_db[1] = gain;
         oc.agc = agc;
+        oc.rx_correction = rx_correction;
         oc.iq_bits = iq_bits;
         oc.tx_file = tx_file;
         oc.tx_attenuation_db = tx_atten;
         auto o = std::make_unique<OmniCoreSource>(oc);
         och = o.get();
+        if (och->rx_correction()) correction = &*och->rx_correction();
         fmt = o->format();
-        receiver_name = o->device_name();
         std::fprintf(stderr, "omnicore: %s, %.6g MSPS x %u, %.6g MHz%s\n", o->device_name().c_str(), fmt.sample_rate / 1e6,
                      fmt.channels, freq / 1e6,
                      tx_file.empty() ? "" : (", TX1 loopback at " + std::to_string(tx_atten) + " dB attenuation").c_str());
@@ -346,6 +216,50 @@ int main(int argc, char **argv) {
         src = std::make_unique<SyntheticSource>(sc);
     }
 
+    if (burst) {
+        try {
+            BurstConfig bc;
+            bc.engine = cfg.engine;
+            if (!buckets_given) bc.engine.buckets = {1, 8, 32, 64};
+            bc.seconds = cfg.seconds;
+            bc.max_blocks = cfg.max_windows;
+            bc.tune_hz = freq_given || source == "omnicore" ? freq : 0;
+            bc.band_hz = std::min(fmt.sample_rate, band_mhz > 0 ? band_mhz * 1e6 : 50e6);
+            bc.threshold_db = threshold_given ? cfg.detect.threshold_db : 12.f;
+            bc.dc_guard_hz = static_cast<float>(std::max(0, dc_guard) * fmt.sample_rate / 512);
+            bc.exclude_hz = excluded;
+            bc.drop_when_full = cfg.drop_when_full;
+            if (ring_given) bc.ring_slots = static_cast<unsigned>(cfg.ring_slots);
+            const auto open = [](const std::string &path) {
+                const auto close = [](std::FILE *f) { std::fclose(f); };
+                std::unique_ptr<std::FILE, decltype(close)> f(path.empty() ? nullptr : std::fopen(path.c_str(), "w"), close);
+                if (!path.empty() && !f) throw std::runtime_error("cannot open " + path);
+                return f;
+            };
+            auto feed = open(ui_path), trace = open(dump_path);
+            auto js = run_burst_demo(*src, model, bc, feed.get(), trace.get(), source, rx_mask == 2 ? 2 : 1,
+                                     static_cast<unsigned>(ui_every), correction);
+#ifdef CURF_HAVE_OMNICORE
+            if (och) {
+                const auto o = och->stats();
+                char info[400];
+                std::snprintf(info, sizeof info, "\"omnicore\":{\"samples\":%llu,\"host_dropped\":%llu,"
+                    "\"device_overflows\":%llu,\"transfer_errors\":%llu,\"resyncs\":%llu,\"discontinuities\":%llu,\"tx_samples\":%llu},",
+                    static_cast<unsigned long long>(o.samples), static_cast<unsigned long long>(o.host_dropped),
+                    static_cast<unsigned long long>(o.device_overflows), static_cast<unsigned long long>(o.transfer_errors),
+                    static_cast<unsigned long long>(o.resyncs), static_cast<unsigned long long>(o.discontinuities),
+                    static_cast<unsigned long long>(o.tx_samples));
+                js.insert(1, info);
+            }
+#endif
+            std::puts(js.c_str());
+            return 0;
+        } catch (const std::exception &e) {
+            std::fprintf(stderr, "%s\n", e.what());
+            return 2;
+        }
+    }
+    if (!excluded.empty()) { std::fputs("--exclude-hz requires --burst\n", stderr); return 2; }
     if (band_mhz > 0) cfg.detect.band = static_cast<float>(std::min(1.0, band_mhz * 1e6 / fmt.sample_rate));
     if (dc_guard > 0) cfg.detect.dc_guard = static_cast<std::uint32_t>(dc_guard);
     if (!shape_path.empty()) {
@@ -366,8 +280,53 @@ int main(int argc, char **argv) {
     // of the time on the cable loopback, a vote over 8 windows (34 ms) ~96 %. Channel order as produced.
     std::FILE *ui = ui_path.empty() ? nullptr : std::fopen(ui_path.c_str(), "w");
     const std::uint32_t S = fmt.channels, M = cfg.channelizer.channels;
-    double channel_noise_gain = 0;
-    for (float h : design_prototype(cfg.channelizer)) channel_noise_gain += static_cast<double>(h) * h;
+    const double ui_frequency = source == "omnicore" || (source == "file" && freq_given) ? freq : 0.0;
+    // The 5 GHz demo can confirm OFDM independently of the narrow-channel model.
+    const bool probe_ofdm = ui && 5150e6 <= ui_frequency && ui_frequency < 5850e6 &&
+                            40e6 <= fmt.sample_rate && fmt.sample_rate <= 65e6;
+    std::unique_ptr<OfdmProbe> ofdm_probe;
+    std::vector<OfdmEvidence> probe_windows(2 * S), ui_ofdm(S);
+    std::vector<unsigned> probe_counts(S);
+    std::vector<std::optional<double>> probe_centres(S);
+    if (probe_ofdm) {
+        ofdm_probe = std::make_unique<OfdmProbe>(fmt.sample_rate);
+        cfg.on_input_block = [&](std::uint64_t window, bool first, std::span<const std::uint8_t> wire) {
+            if (!first) return;
+            for (std::uint32_t s = 0; s < S; ++s) {
+                probe_windows[(window % 2) * S + s] = probe_centres[s]
+                    ? ofdm_probe->observe(wire, fmt, s, *probe_centres[s]) : OfdmEvidence{};
+            }
+        };
+    }
+    const bool probe_dsss = ui && 2400e6 <= ui_frequency && ui_frequency < 2483.5e6 &&
+                            40e6 <= fmt.sample_rate && fmt.sample_rate <= 65e6;
+    std::unique_ptr<DsssProbe> dsss_probe;
+    std::vector<std::vector<unsigned>> dsss_channels(S);
+    std::vector<std::array<std::uint64_t, kBarkerChannels>> dsss_probe_until(S);
+    std::vector<unsigned> dsss_windows(2 * S), ui_dsss(S);
+    if (probe_dsss) {
+        dsss_probe = std::make_unique<DsssProbe>(fmt.sample_rate);
+        cfg.on_input_block = [&](std::uint64_t window, bool first, std::span<const std::uint8_t> wire) {
+            const auto slice_bytes = DsssProbe::input_frames * fmt.frame_bytes();
+            const auto slices = wire.size() / slice_bytes;
+            for (std::uint32_t s = 0; s < S; ++s) {
+                auto &evidence = dsss_windows[(window % 2) * S + s];
+                if (first) evidence = 0;
+                const auto &channels = dsss_channels[s];
+                if (channels.empty() || !slices) continue;
+                // Sample different parts of both blocks so periodic beacons do
+                // not always land between observations.
+                for (std::size_t i = 0; i < std::min<std::size_t>(2, slices); ++i) {
+                    const auto channel = channels[(window + i + !first) % channels.size()];
+                    if (evidence & (1u << channel)) continue;
+                    const auto slice = (window + window / 17 + s + i * (slices / 2)) % slices;
+                    if (dsss_probe->observes_barker(wire.subspan(slice * slice_bytes), fmt, s,
+                                                    barker_frequency(channel) - ui_frequency))
+                        evidence |= 1u << channel;
+                }
+            }
+        };
+    }
     std::vector<float> ui_max(std::size_t{S} * M, 0.f), ui_floor(S, 0.f);
     const auto ncls = static_cast<std::size_t>(model.tensors[model.output].channels);
     std::vector<float> ui_vote(std::size_t{S} * M * ncls, 0.f); // [S][M][classes] summed probabilities
@@ -375,18 +334,11 @@ int main(int argc, char **argv) {
     if (ui) {
         // physical receiver of each stream, for the panel titles (omnicore --rx 2: the only stream is RX2)
         const std::string rx = rx_mask == 2 ? "[2]" : S == 2 ? "[1,2]" : "[1]";
-        std::fprintf(ui, "{\"meta\":{\"version\":2,\"streams\":%u,\"channels\":%u,\"rate\":%.17g,\"freq\":%.17g,\"window\":%u,\"every\":%llu,\"source\":\"%s\",\"rx\":%s,\"stage2\":%s,\"channel_classes\":%s",
-                     S, M, fmt.sample_rate, source == "omnicore" || freq_given ? freq : 0.0, cfg.window,
-                     static_cast<unsigned long long>(ui_every), source.c_str(), rx.c_str(), stage2_dir.empty() ? "false" : "true",
-                     stage2_dir.empty() || stage1_classify ? "true" : "false");
-        if (!stage2_dir.empty())
-            std::fprintf(ui, ",\"signal_classes\":[\"noise\",\"ofdm\",\"fsk\",\"4fsk\",\"psk\",\"qam\",\"dsss\",\"chirp\",\"ook\",\"am\",\"fm\",\"pulse\",\"unknown\"],\"bandwidth_estimator\":\"%s\",\"dsss_frequency_lock\":%s",stage2_bandwidth_mode.c_str(),stage2_dsss_lock?"true":"false");
-        if (source == "omnicore")
-            std::fprintf(ui, ",\"receiver\":{\"device\":%s,\"gain\":%.6g,\"agc\":%u,\"bandwidth\":%.6g,\"iq_bits\":%u,\"noise_shape\":%s}",
-                         json_quote(receiver_name).c_str(), gain, agc, bandwidth > 0 ? bandwidth : std::min(fmt.sample_rate, 56e6),
-                         iq_bits, json_quote(shape_path).c_str());
-        if (adsb_hz > 0) std::fprintf(ui, ",\"adsb\":{\"stream\":%u,\"freq\":%.0f}", adsb_cfg.stream, adsb_hz);
-        std::fprintf(ui, ",\"channel_noise_gain\":%.12g}}\n", channel_noise_gain);
+        std::fprintf(ui, "{\"meta\":{\"streams\":%u,\"channels\":%u,\"rate\":%.17g,\"freq\":%.17g,\"window\":%u,\"every\":%llu,\"source\":\"%s\",\"rx\":%s",
+                     S, M, fmt.sample_rate, ui_frequency, cfg.window,
+                     static_cast<unsigned long long>(ui_every), source.c_str(), rx.c_str());
+        write_rx_correction(ui, correction);
+        std::fputs("}}\n", ui);
     }
     // Noise-shape calibration: per channel, the median power over (up to the first 4096) windows, divided by
     // the median over the stream's in-band channels. Run with no signal at the input.
@@ -401,125 +353,31 @@ int main(int argc, char **argv) {
             if (!calibrate_path.empty() && w >= 4 && cal.size() < std::size_t{4096} * S * M) // first ~17 s
                 cal.insert(cal.end(), p, p + std::size_t{S} * M);
         };
-    std::unique_ptr<AdsbTap> adsb_tap;
-    if (adsb_hz > 0) {
-        adsb_cfg.sample_rate = fmt.sample_rate;
-        // ~15 MS/s after decimation (61.44 MS/s: 4); lower-rate recordings are used as they are
-        adsb_cfg.decimation = std::max<std::uint32_t>(1, static_cast<std::uint32_t>(std::lround(fmt.sample_rate / 15.36e6)));
-        adsb_cfg.offset_hz = adsb_hz - freq; // file / synthetic sources: --freq is the recording's centre
-        if (std::fabs(adsb_cfg.offset_hz) > fmt.sample_rate / 2 - 2e6) {
-            std::fprintf(stderr, "--adsb: %.6g MHz is outside the tuned band\n", adsb_hz / 1e6);
-            return 2;
-        }
-        adsb_tap = std::make_unique<AdsbTap>(adsb_cfg, fmt, cfg.block_frames, cfg.depth, ui, adsb_hz);
-        cfg.taps.push_back(adsb_tap.get());
-        std::fprintf(stderr, "adsb: stream %u, carrier at %+.3f MHz from the centre\n", adsb_cfg.stream, adsb_cfg.offset_hz / 1e6);
-    }
-    // stage 2
-    std::unique_ptr<std::FILE,decltype(&std::fclose)> band_file(nullptr,&std::fclose);
-    std::unique_ptr<std::FILE,decltype(&std::fclose)> input_file(nullptr,&std::fclose);
-    std::uint64_t band_seen = 0, band_written = 0;
-    std::uint64_t input_seen = 0, input_written = 0;
-    if (!stage2_band_dump.empty()) {
-        band_file.reset(std::fopen(stage2_band_dump.c_str(),"wx"));
-        if (!band_file) { std::perror(stage2_band_dump.c_str()); return 1; }
-        std::fprintf(band_file.get(),"{\"meta\":{\"version\":1,\"limit\":1024,\"freq\":%.17g,\"rate\":%.17g}}\n",freq_given?freq:0.,fmt.sample_rate);
-    }
-    if (!stage2_input_dump.empty()) {
-        input_file.reset(std::fopen(stage2_input_dump.c_str(),"wx"));
-        if (!input_file) { std::perror(stage2_input_dump.c_str()); return 1; }
-        std::fprintf(input_file.get(),"{\"meta\":{\"version\":1,\"limit\":128,\"freq\":%.17g,\"layout\":\"Lx3\",\"type\":\"fp32_before_engine_cast\"}}\n",freq_given?freq:0.);
-    }
-    std::unique_ptr<engine::Model> s2_model;
-    std::unique_ptr<SignalStage> stage2;
-    if (!stage2_dir.empty()) {
-        s2_model = std::make_unique<engine::Model>(engine::Model::load(std::filesystem::path(stage2_dir) / "s2.curf"));
-        SignalStageConfig sc;
-        sc.channels = cfg.channelizer.channels;
-        sc.window_frames = cfg.window;
-        sc.max_signals = stage2_max_signals;
-        sc.max_tracks = stage2_max_tracks;
-        sc.pending = stage2_pending;
-        sc.scratch_complex = stage2_scratch_mib * (std::size_t{1} << 20) / sizeof(cf32);
-        sc.drop_when_busy = cfg.drop_when_full;
-        sc.engine.buckets = {1, 4, 16, 64};
-        for (unsigned b = 128; sc.engine.buckets.back() < static_cast<int>(sc.max_signals); b *= 2)
-            sc.engine.buckets.push_back(static_cast<int>(b));
-        sc.engine.tune_iters = 10;
-        sc.engine.tune_cache = stage2_tune_cache;
-        sc.current_hop_bandwidth = stage2_bandwidth_mode == "current";
-        sc.dsss_frequency_lock = stage2_dsss_lock;
-        if (input_file) sc.on_input = [&](const SignalResult &r, std::span<const float> input) {
-            if (r.bw_hz<8e6 || r.bw_hz>24e6 || r.narrow) return;
-            ++input_seen;
-            if (input_written == 128) return;
-            ++input_written; auto *f=input_file.get();
-            std::fprintf(f,"{\"w\":%llu,\"s\":%u,\"id\":%u,\"f\":%.9g,\"bw\":%.9g,\"fs\":%.9g,\"t0\":%.9g,\"c\":%u,\"p\":%.8g,\"input\":[",
-                         static_cast<unsigned long long>(r.window),r.stream,r.track,r.extraction_fc_hz,r.bw_hz,r.fs_hz,r.t0_s,r.cls,static_cast<double>(r.prob));
-            for (std::size_t i=0;i<input.size();++i) std::fprintf(f,"%s%.9g",i?",":"",static_cast<double>(input[i]));
-            std::fprintf(f,"]}\n");
-        };
-        if (band_file) sc.on_band = [&](const SignalBandEstimate &b, std::span<const float> power) {
-            ++band_seen;
-            if (band_written == 1024) return;
-            ++band_written;
-            auto *f = band_file.get();
-            std::fprintf(f,"{\"w\":%llu,\"s\":%u,\"id\":%u,\"lo\":%.8g,\"hi\":%.8g,\"measured_f\":%.8g,\"measured_bw\":%.8g,\"applied_f\":%.8g,\"applied_bw\":%.8g,\"psd_hops\":%u,\"power\":[",
-                         static_cast<unsigned long long>(b.window),b.stream,b.track,b.lo_hz,b.hi_hz,b.measured_fc_hz,b.measured_bw_hz,b.applied_fc_hz,b.applied_bw_hz,b.current_hop?1u:4u);
-            for (std::size_t i = 0; i < power.size(); ++i) std::fprintf(f,"%s%.7g",i?",":"",static_cast<double>(power[i]));
-            std::fprintf(f,"]}\n");
-        };
-        if (stage2_int8) {
-            sc.engine.int8 = true;
-            sc.engine.calibration = engine::Golden::load(std::filesystem::path(stage2_dir) / "s2.golden", *s2_model).input;
-        }
-        cfg.classify_channels = stage1_classify;
-        cfg.detect.peak_detection = true;
-        stage2 = std::make_unique<SignalStage>(sc, *s2_model, fmt, cfg.block_frames, [ui, &ui_floor, &cfg, fmt, M, channel_noise_gain](const SignalResult &r) {
-            if (!ui) return;
-            double shape = 1;
-            if (!cfg.noise_shape.empty()) {
-                double sum = 0; unsigned count = 0;
-                const std::size_t offset = cfg.noise_shape.size() == M ? 0 : std::size_t{r.stream} * M;
-                for (unsigned k = 0; k < M; ++k) {
-                    const double f = static_cast<double>(k) * fmt.sample_rate / M;
-                    if (std::abs(std::remainder(f-r.extraction_fc_hz, fmt.sample_rate)) <= .375*r.fs_hz) {
-                        sum += cfg.noise_shape[offset+k]; ++count;
-                    }
-                }
-                if (count) shape = sum/static_cast<double>(count);
-            }
-            // Unit-gain PFB noise variance = raw variance * sum(h^2). The finite extraction FIR has
-            // ENBW slightly below 0.75 * output_rate; using that upper bound is conservative.
-            const double window_noise = ui_floor[r.stream] * shape / channel_noise_gain * (.75*r.fs_hz/fmt.sample_rate);
-            const double snr_db = 10*std::log10(std::max(std::pow(10., r.power_db/10.)/std::max(window_noise,1e-30)-1.,1e-9));
-            std::vector<std::size_t> idx(r.probs.size());
-            for (std::size_t i = 0; i < idx.size(); ++i) idx[i] = i;
-            std::partial_sort(idx.begin(), idx.begin() + std::min<std::size_t>(3, idx.size()), idx.end(),
-                              [&](std::size_t a, std::size_t b) { return r.probs[a] > r.probs[b]; });
-            std::fprintf(ui, "{\"sig\":{\"w\":%llu,\"s\":%u,\"id\":%u,\"f\":%.0f,\"bw\":%.0f,\"fs\":%.0f,\"t0\":%.9f,\"t1\":%.9f,\"processing_ms\":%.4f,\"observation_ms\":%.4f,\"c\":%u,\"p\":%.6f,\"db\":%.1f,\"top\":[[%zu,%.6f],[%zu,%.6f],[%zu,%.6f]],\"t\":%.9f,\"activity_fraction\":%.6f,\"probs\":[",
-                         static_cast<unsigned long long>(r.window), r.stream, r.track, r.fc_hz, r.bw_hz, r.fs_hz, r.t0_s, r.t1_s, r.processing_ms, r.observation_ms, r.cls,
-                         static_cast<double>(r.prob), static_cast<double>(r.power_db), idx[0], static_cast<double>(r.probs[idx[0]]),
-                         idx[1], static_cast<double>(r.probs[idx[1]]), idx[2], static_cast<double>(r.probs[idx[2]]),
-                         r.source_time_s, static_cast<double>(r.activity_fraction));
-            for (std::size_t i = 0; i < r.probs.size(); ++i) std::fprintf(ui, "%s%.7g", i ? "," : "", static_cast<double>(r.probs[i]));
-            std::fprintf(ui, "],\"snr_db\":%.3f", snr_db);
-            if (r.dsss_frequency_tested)
-                std::fprintf(ui, ",\"extraction_f\":%.0f,\"dsss_frequency\":{\"offset_hz\":%.0f,\"coherence\":%.6f,\"contrast\":%.6f,\"retained_power\":%.6f,\"valid\":%s}",
-                             r.extraction_fc_hz,static_cast<double>(r.dsss_frequency.offset_hz),static_cast<double>(r.dsss_frequency.coherence),
-                             static_cast<double>(r.dsss_frequency.contrast),static_cast<double>(r.dsss_frequency.retained_power),r.dsss_frequency.valid()?"true":"false");
-            std::fprintf(ui, "}}\n");
-        });
-        cfg.taps.push_back(stage2.get());
-        std::fprintf(stderr, "stage 2: %s%s\n", stage2_dir.c_str(), stage2_int8 ? " (INT8)" : "");
-    }
     std::string line;
-    const auto st = run_classifier(*src, model, cfg, [&](std::uint64_t w, std::uint64_t first, const WindowResult *r, std::size_t n, auto ready_at) {
-        if (stage2) stage2->on_window(w, first, r, n, ready_at);
+    const auto st = run_classifier(*src, model, cfg, [&](std::uint64_t w, std::uint64_t first, const WindowResult *r, std::size_t n) {
         if (ui) { // per channel: vote of this row's windows
             if (w % ui_every == 0) {
                 std::fill(ui_vote.begin(), ui_vote.end(), 0.f);
                 std::fill(ui_hits.begin(), ui_hits.end(), std::uint8_t{0});
+                std::fill(ui_ofdm.begin(), ui_ofdm.end(), OfdmEvidence{});
+                std::fill(probe_counts.begin(), probe_counts.end(), 0u);
+                std::fill(ui_dsss.begin(), ui_dsss.end(), 0u);
+            }
+            if (probe_dsss)
+                for (std::uint32_t s = 0; s < S; ++s) ui_dsss[s] |= dsss_windows[(w % 2) * S + s];
+            if (probe_ofdm) {
+                for (std::uint32_t s = 0; s < S; ++s) {
+                    const auto &result = probe_windows[(w % 2) * S + s];
+                    if (result.contrast == 0) continue;
+                    auto &best = ui_ofdm[s];
+                    if (best.contrast > 0 && std::abs(result.offset_hz - best.offset_hz) <= 3e6) {
+                        ++probe_counts[s];
+                        if (result.contrast > best.contrast) best = result;
+                    } else if (result.contrast > best.contrast && probe_counts[s] < 2) {
+                        best = result;
+                        probe_counts[s] = 1;
+                    }
+                }
             }
             for (std::size_t i = 0; i < n; ++i) {
                 const std::size_t e = std::size_t{r[i].stream} * M + r[i].channel;
@@ -556,7 +414,47 @@ int main(int argc, char **argv) {
                 line += b;
                 comma = true;
             }
-            line += "]}\n";
+            line += "]";
+            if (probe_ofdm) {
+                line += ",\"ofdm_cp\":[";
+                for (std::uint32_t s = 0; s < S; ++s) {
+                    const auto offset = std::size_t{s} * M;
+                    probe_centres[s] = ofdm_probe_centre(std::span{ui_hits}.subspan(offset, M),
+                                                        std::span{ui_max}.subspan(offset, M), fmt.sample_rate);
+                    if (s) line += ',';
+                    if (probe_counts[s] < (ui_every > 1 ? 2u : 1u)) line += "null";
+                    else {
+                        std::snprintf(b, sizeof b, "%.0f", ui_ofdm[s].offset_hz);
+                        line += b;
+                    }
+                }
+                line += "]";
+            }
+            if (probe_dsss) {
+                line += ",\"dsss_barker\":[";
+                for (std::uint32_t s = 0; s < S; ++s) {
+                    const auto offset = std::size_t{s} * M;
+                    const auto detected = barker_probe_channels(std::span{ui_hits}.subspan(offset, M),
+                                                                std::span{ui_max}.subspan(offset, M),
+                                                                fmt.sample_rate, ui_frequency);
+                    for (const auto ch : detected)
+                        dsss_probe_until[s][ch] = first + static_cast<std::uint64_t>(0.30 * fmt.sample_rate);
+                    dsss_channels[s].clear();
+                    for (unsigned ch = 0; ch < kBarkerChannels; ++ch)
+                        if (first < dsss_probe_until[s][ch]) dsss_channels[s].push_back(ch);
+                    line += s ? ",[" : "[";
+                    bool next = false;
+                    for (unsigned ch = 0; ch < kBarkerChannels; ++ch) {
+                        if (!(ui_dsss[s] & (1u << ch))) continue;
+                        std::snprintf(b, sizeof b, next ? ",%.0f" : "%.0f", barker_frequency(ch));
+                        line += b;
+                        next = true;
+                    }
+                    line += "]";
+                }
+                line += "]";
+            }
+            line += "}\n";
             std::fputs(line.c_str(), ui);
             std::fflush(ui);
         }
@@ -615,27 +513,8 @@ int main(int argc, char **argv) {
         js.insert(1, b);
     }
 #endif
-    if (adsb_tap) js.insert(1, adsb_tap->json());
-    if (stage2) {
-        stage2->flush();
-        js.insert(1, "\"stage2\":" + stage2->stats().to_json() + ",");
-    }
-    if (band_file) {
-        std::fprintf(band_file.get(),"{\"end\":{\"observed\":%llu,\"written\":%llu,\"truncated\":%s}}\n",
-                     static_cast<unsigned long long>(band_seen),static_cast<unsigned long long>(band_written),band_seen>band_written?"true":"false");
-        if (std::fflush(band_file.get()) || std::ferror(band_file.get())) {
-            std::fprintf(stderr,"band diagnostic write failed\n"); return 1;
-        }
-    }
-    if (input_file) {
-        std::fprintf(input_file.get(),"{\"end\":{\"observed\":%llu,\"written\":%llu,\"truncated\":%s}}\n",
-                     static_cast<unsigned long long>(input_seen),static_cast<unsigned long long>(input_written),input_seen>input_written?"true":"false");
-        if (std::fflush(input_file.get()) || std::ferror(input_file.get())) {
-            std::fprintf(stderr,"model input diagnostic write failed\n"); return 1;
-        }
-    }
     if (ui) {
-        std::fprintf(ui, "{\"end\":%s}\n", js.c_str());
+        std::fprintf(ui, "{\"end\":%s}\n", st.to_json().c_str());
         std::fclose(ui);
     }
     if (!label.empty()) js.insert(1, "\"label\":\"" + label + "\",");

@@ -13,12 +13,6 @@ spectrum (+-120 kHz) has the same bin spacing as the 256x longer wideband spectr
 bins around channel k. Per-channel SNR is uniform in [lo, hi] dB, defined like the training data: signal
 power over noise power in the channel's 240 kHz.
 
-Conversion of any IQ recording (SigMF, .cf32, .cs16) to a one-stream packed12 file for --source file:
-
-    python tools/make_scenario.py --convert in.sigmf-meta --out out.p12 [--peak-dbfs -6]
-
-prints the sample rate and centre frequency to pass to curf_classify (--rate, --freq, --streams 1).
-
 Reference ("direct"): the same baseband signals, cut into the same 1024-sample windows, plus white noise at the
 same SNR, unit RMS, through the PyTorch model - what the classifier scores on training-like inputs.
 """
@@ -35,7 +29,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "model"))
 from curf_model.net import AmcResNet1D  # noqa: E402
-from curf_model.synth import CLASSES, NARROW, Synth, SynthConfig  # noqa: E402
+from curf_model.synth import CLASSES, Synth, SynthConfig  # noqa: E402
 
 FS, M, D, W, STREAMS = 61.44e6, 512, 256, 1024, 2
 
@@ -53,44 +47,15 @@ def pack12(x: np.ndarray) -> np.ndarray:
     return out
 
 
-def load_iq(path: Path):
-    rate, freq = None, 0.0
-    if path.suffix in (".sigmf-meta", ".sigmf-data"):
-        meta = json.loads(path.with_suffix(".sigmf-meta").read_text())
-        g = meta["global"]
-        rate = g["core:sample_rate"]
-        freq = meta["captures"][0].get("core:frequency", 0.0)
-        dt = g["core:datatype"]
-        data = path.with_suffix(".sigmf-data")
-    else:
-        dt = {".cf32": "cf32_le", ".cs16": "ci16_le", ".sc16": "ci16_le"}[path.suffix]
-        data = path
-    if dt == "cf32_le":
-        x = np.fromfile(data, dtype="<c8")
-    elif dt == "ci16_le":
-        x = np.fromfile(data, dtype="<i2").astype(np.float32).view(np.complex64)
-    else:
-        raise SystemExit(f"unsupported datatype {dt}")
-    return x, rate, freq
-
-
-
-def convert(args):
-    x, rate, freq = load_iq(Path(args.convert))
-    g = 10 ** (args.peak_dbfs / 20) / max(float(np.abs(x).max()), 1e-12)
-    pack12(x * g).tofile(args.out)
-    print(json.dumps({"samples": len(x), "rate": rate, "freq": freq, "output": args.out}))
-
-
 def make(args):
     dev = torch.device("cuda")
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     nb = W * args.windows                 # baseband samples per channel
     n = nb * D                            # wideband samples per stream
-    classes = list(NARROW)  # one channel per signal: no noise, no wide slices
+    classes = [c for c in CLASSES if c != "noise"]
     rng = np.random.default_rng(args.seed)
-    synth = Synth(SynthConfig(length=nb, chunk=1, channel_filter=False, broadcast_fm_prob=0.0), device=dev, seed=args.seed)
+    synth = Synth(SynthConfig(length=nb, chunk=1), device=dev, seed=args.seed)
     ckpt = torch.load(args.ckpt, map_location=dev)
     model = AmcResNet1D(len(CLASSES)).to(dev).eval()
     model.load_state_dict(ckpt["model"])
@@ -178,13 +143,9 @@ def main():
     ap.add_argument("--snr", type=float, nargs=2, default=(5.0, 20.0))
     ap.add_argument("--noise-rms", type=float, default=0.01)
     ap.add_argument("--seed", type=int, default=5)
-    ap.add_argument("--convert", help="IQ recording (SigMF / .cf32 / .cs16) to write to --out as packed12")
-    ap.add_argument("--peak-dbfs", type=float, default=-6, help="--convert: strongest sample at this level")
-    ap.add_argument("--ckpt", default=str(Path(__file__).resolve().parents[1] / "model/artifacts/run2/best.pt"))
+    ap.add_argument("--ckpt", default=str(Path(__file__).resolve().parents[1] / "model/artifacts/run1/best.pt"))
     args = ap.parse_args()
-    if args.convert:
-        convert(args)
-    elif args.score:
+    if args.score:
         score(args)
     else:
         make(args)

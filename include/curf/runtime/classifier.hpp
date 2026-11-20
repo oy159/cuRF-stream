@@ -21,23 +21,12 @@
 #include "curf/source.hpp"
 
 #include <cstdint>
-#include <chrono>
 #include <functional>
+#include <span>
 #include <string>
 #include <vector>
 
 namespace curf {
-
-    // Optional extra GPU work on every raw block (e.g. a protocol demodulator on the wideband samples). enqueue is
-    // called in block order on the compute stream right after the block's channelizer pass, with the device copy
-    // of its wire frames; retire(slot) once that work has completed (host thread, block order). slot < depth.
-    struct BlockTap {
-        virtual ~BlockTap() = default;
-        virtual void enqueue(std::size_t slot, const std::uint8_t *d_wire, std::size_t frames, std::uint64_t first_sample,
-                             cudaStream_t stream) = 0;
-        virtual void retire(std::size_t slot) = 0;
-        virtual void flush() {} // include asynchronous tap tails in the pipeline wall time
-    };
 
     struct ClassifierConfig {
         ChannelizerConfig channelizer;                 // 512 channels, 8 taps / phase
@@ -49,14 +38,14 @@ namespace curf {
         std::size_t ring_slots = 16;
         std::size_t depth = 4;                         // blocks in flight (H2D / channelizer)
         bool drop_when_full = false;
-        bool classify_channels = true;               // false: detection records only, no stage-1 engine
         double seconds = 5.0;                          // 0 = until the source ends or max_windows
         std::uint64_t max_windows = 0;
         // Optional, called in window order right before the results of the same window: mean power of every
         // channel [streams][channels] (linear, full scale = 1; channel k at k * fs / channels, k >= channels / 2
         // negative) and the per-stream noise floor. Setting it adds a 4 KB D2H per window (for displays).
         std::function<void(std::uint64_t window, const float *power, const float *floor)> on_power;
-        std::vector<BlockTap *> taps;
+        // Optional wire block observation on the consumer thread. The span is valid during the call.
+        std::function<void(std::uint64_t window, bool first, std::span<const std::uint8_t>)> on_input_block;
     };
 
     struct WindowResult {
@@ -80,8 +69,7 @@ namespace curf {
 
     // Called in window order; results valid only during the call.
     using ResultCallback =
-            std::function<void(std::uint64_t window, std::uint64_t first_sample, const WindowResult *r, std::size_t n,
-                               std::chrono::steady_clock::time_point ready_at)>;
+            std::function<void(std::uint64_t window, std::uint64_t first_sample, const WindowResult *r, std::size_t n)>;
 
     ClassifierStats run_classifier(ISource &source, const engine::Model &model, const ClassifierConfig &config,
                                    const ResultCallback &on_results = {});

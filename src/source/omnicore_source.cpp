@@ -72,6 +72,33 @@ namespace curf {
             applied.struct_size = sizeof applied;
             check(och_get_config(dev_, &applied), "get_config");
 
+            och_rx_correction_config tracking{};
+            tracking.struct_size = sizeof tracking;
+            const int correction_status = och_get_rx_correction(dev_, &tracking);
+            if (config_.rx_correction) {
+                check(correction_status, "read RX correction");
+                const std::uint32_t enabled = *config_.rx_correction ? 1u : 0u;
+                const auto before = tracking;
+                if (before.dc_enabled != enabled || before.iq_enabled != enabled) {
+                    try {
+                        if (before.dc_enabled != enabled)
+                            check(och_set_rx_dc_correction(dev_, enabled), "set RX DC tracking");
+                        if (before.iq_enabled != enabled)
+                            check(och_set_rx_iq_correction(dev_, enabled), "set RX I/Q tracking");
+                        check(och_get_rx_correction(dev_, &tracking), "verify RX correction");
+                        if (tracking.dc_enabled != enabled || tracking.iq_enabled != enabled)
+                            throw std::runtime_error("OmniCore RX correction readback mismatch");
+                    } catch (...) {
+                        // Restore the original pair if either update failed.
+                        och_set_rx_iq_correction(dev_, before.iq_enabled);
+                        och_set_rx_dc_correction(dev_, before.dc_enabled);
+                        throw;
+                    }
+                }
+            }
+            if (correction_status == OCH_OK)
+                correction_ = RxCorrection{tracking.dc_enabled != 0, tracking.iq_enabled != 0};
+
             // The AD9361 RX FIR lives in the board's RAM (loaded with `och fir rx load`, lost at power-off):
             // record whether this run had it, since it changes the band edges.
             och_fir_config fir{};

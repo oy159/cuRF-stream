@@ -54,7 +54,6 @@ namespace curf {
         std::filesystem::path path; // raw wire frames, no header
         StreamFormat format{};
         bool loop = false;
-        bool realtime = false; // pace replay by the sample clock, including looped captures
     };
 
     // Replays a raw wire capture (e.g. `och` RX capture in packed12/signed8).
@@ -63,7 +62,6 @@ namespace curf {
         explicit FileSource(FileConfig config);
 
         StreamFormat format() const override { return config_.format; }
-        void start() override;
         ReadResult read(std::span<std::uint8_t> dst, std::uint32_t timeout_ms) override;
 
     private:
@@ -71,7 +69,6 @@ namespace curf {
         std::ifstream file_;
         std::uint64_t next_sample_ = 0;
         std::uint64_t file_frames_ = 0;
-        std::chrono::steady_clock::time_point t0_{};
     };
 
 } // namespace curf

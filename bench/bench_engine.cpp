@@ -2,9 +2,6 @@
 //
 //   curf_bench_engine [--model DIR] [--steps naive,smem,wmma.f32.unfused,wmma.f32.fused,wmma.f16.fused,all]
 //                     [--buckets 1,8,32,128,512] [--ms 400] [--no-graph] [--ops] [--profile]
-//                     [--name amc] [--check]   (model files NAME.curf / NAME.golden, e.g. "s2" for the stage-2 model;
-//                                               --check: also run the golden windows and report top-1 agreement and
-//                                               the largest logit error against the fp32 reference)
 //
 // A step is PREFIX[+gap][+stem][+block][+lib]: conv ops are autotuned among variants with that name prefix
 // ("all" = whole registry); +gap fuses global pooling into the last layer, +stem allows the direct stem
@@ -21,7 +18,6 @@
 
 #include <algorithm>
 #include <chrono>
-#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -86,8 +82,7 @@ int main(int argc, char **argv) {
                                    "cudnn",       "cutlass",        "all+gap+stem+block+lib"};
     std::vector<int> buckets{1, 8, 32, 128, 512};
     double ms = 400;
-    bool graph = true, ops = false, profile = false, check = false, reuse = true, tune = true;
-    std::string name = "amc";
+    bool graph = true, ops = false, profile = false;
     std::string block_prefix; // restrict fused-block variants (e.g. "block.f16.l64p.")
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -102,15 +97,11 @@ int main(int argc, char **argv) {
         else if (a == "--no-graph") graph = false;
         else if (a == "--ops") ops = true;
         else if (a == "--block-prefix") block_prefix = next();
-        else if (a == "--name") name = next();
-        else if (a == "--check") check = true;
-        else if (a == "--no-tune") tune = false;
-        else if (a == "--no-reuse") reuse = false; // every tensor its own buffer (memory-plan debugging)
         else if (a == "--profile") profile = true; // one eager run of the largest bucket per step, for ncu --profile-from-start off
         else { std::fprintf(stderr, "unknown option %s\n", a.c_str()); return 2; }
     }
 
-    const auto model = Model::load(std::filesystem::path(dir) / (name + ".curf"));
+    const auto model = Model::load(std::filesystem::path(dir) / "amc.curf");
     const double flops = model.flops_per_window();
     cudaStream_t s;
     CURF_CUDA_CHECK(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
@@ -130,11 +121,9 @@ int main(int argc, char **argv) {
             for (const char *lib : {"cudnn", "cutlass"})
                 if (tok[0].rfind(lib, 0) != 0) cfg.exclude_prefixes.push_back(lib);
         cfg.cuda_graphs = graph;
-        cfg.reuse_memory = reuse;
-        cfg.autotune = tune;
         cfg.tune_iters = 20;
         if (has("int8")) {
-            static const Golden golden = Golden::load(std::filesystem::path(dir) / (name + ".golden"), model);
+            static const Golden golden = Golden::load(std::filesystem::path(dir) / "amc.golden", model);
             cfg.int8 = true;
             cfg.calibration = golden.input;
         }
@@ -147,36 +136,6 @@ int main(int argc, char **argv) {
             CURF_CUDA_CHECK(cudaProfilerStop());
             std::printf("{\"step\":\"%s\",\"profiled_batch\":%d}\n", step.c_str(), buckets.back());
             continue;
-        }
-        if (check) {
-            static const Golden golden = Golden::load(std::filesystem::path(dir) / (name + ".golden"), model);
-            const int n = std::min<int>(static_cast<int>(golden.n_full), e.max_batch());
-            const auto per = model.tensors[model.input].elems_per_window();
-            const int c = static_cast<int>(golden.classes);
-            // on the engine's stream: a plain cudaMemcpy from pageable memory may return before the data reaches the
-            // device, and the non-blocking stream s does not wait for it (this read half-stale inputs at first)
-            CURF_CUDA_CHECK(cudaMemcpyAsync(e.input(), golden.input.data(), per * n * sizeof(float), cudaMemcpyHostToDevice, s));
-            e.run(n, s);
-            CURF_CUDA_CHECK(cudaStreamSynchronize(s));
-            std::vector<float> lg(static_cast<std::size_t>(n) * c);
-            CURF_CUDA_CHECK(cudaMemcpy(lg.data(), e.logits(), lg.size() * sizeof(float), cudaMemcpyDeviceToHost));
-            int agree = 0, label_ok = 0, ref_ok = 0;
-            double err = 0, scale = 0;
-            for (int i = 0; i < n; ++i) {
-                const float *g = &golden.logits[static_cast<std::size_t>(i) * c], *o = &lg[static_cast<std::size_t>(i) * c];
-                const auto am = [c](const float *p) { return static_cast<int>(std::max_element(p, p + c) - p); };
-                agree += am(g) == am(o);
-                label_ok += am(o) == golden.labels[i];
-                ref_ok += am(g) == golden.labels[i];
-                for (int k = 0; k < c; ++k) {
-                    err = std::max(err, static_cast<double>(std::fabs(g[k] - o[k])));
-                    scale = std::max(scale, static_cast<double>(std::fabs(g[k])));
-                }
-            }
-            std::printf("{\"step\":\"%s\",\"check_windows\":%d,\"top1_agree_vs_fp32\":%.4f,\"logit_rel_err\":%.2e,"
-                        "\"acc_engine\":%.4f,\"acc_fp32\":%.4f}\n",
-                        step.c_str(), n, static_cast<double>(agree) / n, err / std::max(scale, 1e-12),
-                        static_cast<double>(label_ok) / n, static_cast<double>(ref_ok) / n);
         }
         for (int b : buckets) {
             const auto r = measure(e, b, ms, graph, s);

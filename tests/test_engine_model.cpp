@@ -60,13 +60,7 @@ TEST_CASE("model file from convert.py loads and validates", "[engine][model]") {
     CHECK(m.ops.size() == 12);
     CHECK(m.tensors[m.input].channels == 2);
     CHECK(m.tensors[m.input].length == 1024);
-    // run1 has ten classes; run2 adds "wide" without changing the backbone.
-    const auto classes = m.tensors[m.output].channels;
-    CHECK((classes == 10 || classes == 11));
-    if (std::filesystem::exists(dir / "amc.golden")) {
-        const auto g = Golden::load(dir / "amc.golden", m);
-        CHECK(g.classes == classes);
-    }
+    CHECK(m.tensors[m.output].channels == 10);
     CHECK(m.flops_per_window() / 1e6 > 50.7);
     CHECK(m.flops_per_window() / 1e6 < 50.9);
     const auto plan = plan_memory(m, 512, 2, true);

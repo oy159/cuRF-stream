@@ -10,19 +10,6 @@ timing offset, carrier phase, carrier frequency offset, optional short
 multipath, and AWGN at a random SNR. SNR is measured over the full fs band:
 signal power / noise power per complex sample.
 
-Channel filter: every window (signal and noise) goes through the channelizer's
-prototype response (Kaiser sinc, -6 dB at 90 kHz, ~75 kHz transition), so noise
-is shaped like real channel output instead of white across the 240 kHz.
-
-"wide": a slice of a signal wider than one channel (0.24-3.8 MHz GFSK, PSK/QAM,
-OFDM, e.g. BLE or WiFi seen through one 120 kHz channel). Generated at R x 240
-kS/s, shifted so the channel lands anywhere inside the signal band, filtered by
-the prototype response at that rate and decimated. Real detections of such
-signals used to be forced into a narrowband class (8psk, fm, ofdm).
-
-"fm" includes broadcast FM (40-75 kHz deviation, stereo MPX with 19 kHz pilot),
-which overfills the channel and is clipped by the channel filter.
-
 Output windows are normalised to unit RMS, exactly as the GPU pre-processing
 stage will do before inference.
 
@@ -38,8 +25,7 @@ from dataclasses import dataclass, field
 import torch
 import torch.nn.functional as F
 
-CLASSES: list[str] = ["noise", "bpsk", "qpsk", "8psk", "16qam", "64qam", "gfsk", "am", "fm", "ofdm", "wide"]
-NARROW: list[str] = [c for c in CLASSES if c not in ("noise", "wide")]  # what fits in one channel
+CLASSES: list[str] = ["noise", "bpsk", "qpsk", "8psk", "16qam", "64qam", "gfsk", "am", "fm", "ofdm"]
 LINEAR = {"bpsk", "qpsk", "8psk", "16qam", "64qam"}
 
 
@@ -55,9 +41,6 @@ class SynthConfig:
     multipath_taps: int = 4                       # max extra taps
     multipath_delay: int = 8                      # max delay in samples
     chunk: int = 32                               # windows sharing class/sps/roll-off
-    channel_filter: bool = True                   # prototype response on signal and noise
-    broadcast_fm_prob: float = 0.5
-    wide_rates: tuple[int, ...] = (4, 8, 16)      # generation rate for "wide", in units of fs
     classes: list[str] = field(default_factory=lambda: list(CLASSES))
 
 
@@ -104,19 +87,6 @@ def gaussian_taps(sps: int, bt: float, span: int = 4) -> torch.Tensor:
     return (g / g.sum()).to(torch.float32)
 
 
-def channel_taps(rate: int = 1, fs: float = 240e3, cutoff_hz: float = 90e3, beta: float = 8.0) -> torch.Tensor:
-    """The channelizer prototype (4096 taps, Kaiser beta 8, -6 dB at 0.75 x 120 kHz at 61.44 MHz) resampled to
-    rate * fs: same duration (66.7 us), so the same frequency response. Unit DC gain."""
-    n = 16 * rate + 1  # 4096 * (rate * fs) / 61.44e6
-    t = torch.arange(n, dtype=torch.float64) - (n - 1) / 2
-    fc = cutoff_hz / (rate * fs)
-    h = torch.where(t == 0, torch.full_like(t, 2 * fc), torch.sin(2 * math.pi * fc * t) / (math.pi * t))
-    r = 2 * t / (n - 1)
-    w = torch.special.i0(beta * torch.sqrt((1 - r * r).clamp_min(0))) / torch.special.i0(torch.tensor(beta, dtype=torch.float64))
-    h = h * w
-    return (h / h.sum()).to(torch.float32)
-
-
 def fir_complex(x: torch.Tensor, taps: torch.Tensor) -> torch.Tensor:
     """'Same'-length FIR of complex rows x [n, N] with real taps."""
     k = taps.numel()
@@ -128,15 +98,15 @@ def fir_complex(x: torch.Tensor, taps: torch.Tensor) -> torch.Tensor:
 
 
 class Synth:
+    classes = CLASSES
+
     def __init__(self, cfg: SynthConfig | None = None, device: str | torch.device = "cuda", seed: int = 0):
         self.cfg = cfg or SynthConfig()
         self.device = torch.device(device)
         self.gen = torch.Generator(device=self.device).manual_seed(seed)
         self.cpu_gen = torch.Generator().manual_seed(seed + 1)  # for per-chunk scalar choices
         self.const = {c: constellation(c, self.device) for c in LINEAR}
-        self.class_index = {c: i for i, c in enumerate(CLASSES)}
-        self.h1 = channel_taps(1).to(self.device)
-        self.h_wide = {r: channel_taps(r).to(self.device) for r in self.cfg.wide_rates}
+        self.class_index = {c: i for i, c in enumerate(self.classes)}
 
     # ------------------------------------------------------------------ utils
     def _u(self, n: int, lo: float, hi: float) -> torch.Tensor:
@@ -190,70 +160,9 @@ class Synth:
         return (1 + mu * self._message(n, length)).to(torch.complex64)
 
     def _fm(self, n: int, length: int) -> torch.Tensor:
-        if self._cu(0, 1) < self.cfg.broadcast_fm_prob:
-            return self._broadcast_fm(n, length)
         dev = self._u(n, 2e3, 25e3)[:, None]
         phase = torch.cumsum(2 * math.pi * dev / self.cfg.fs * self._message(n, length), dim=1)
         return torch.polar(torch.ones_like(phase), phase)
-
-    def _broadcast_fm(self, n: int, length: int) -> torch.Tensor:
-        """Broadcast FM: MPX = 0.9 (mono L+R, stereo L-R on 38 kHz DSB-SC) + 0.1 pilot at 19 kHz, peak deviation
-        40-75 kHz. Instantaneous frequency reaches past the channel edge; the channel filter clips it."""
-        fs = self.cfg.fs
-        t = torch.arange(length, device=self.device)[None, :] / fs
-        a, b = self._message(n, length), self._message(n, length)
-        stereo = (torch.rand(n, 1, generator=self.gen, device=self.device) < 0.7).float()
-        p0 = self._u(n, 0, 2 * math.pi)[:, None]
-        mpx = 0.45 * (a + b) + stereo * 0.45 * (a - b) * torch.cos(2 * (2 * math.pi * 19e3 * t + p0)) \
-            + stereo * 0.1 * torch.cos(2 * math.pi * 19e3 * t + p0)
-        mpx = mpx / mpx.abs().amax(dim=1, keepdim=True).clamp_min(1e-6)
-        dev = self._u(n, 40e3, 75e3)[:, None]
-        phase = torch.cumsum(2 * math.pi * dev / fs * mpx, dim=1)
-        return torch.polar(torch.ones_like(phase), phase)
-
-    def _wide(self, n: int, length: int) -> torch.Tensor:
-        """Slice of a signal wider than the channel, as the channelizer would output it (already channel-filtered)."""
-        R = self.cfg.wide_rates[self._ci(0, len(self.cfg.wide_rates) - 1)]
-        fs_hi, N = self.cfg.fs * R, length * R
-        kind = self._ci(0, 3)
-        if kind == 0:  # GFSK, 2..R samples/symbol at fs_hi: 0.24 .. 1.9 Msym/s at R=16 (BLE, proprietary 2.4 GHz)
-            sps = self._ci(2, max(2, R))
-            h, bt = self._cu(0.3, 1.0), self._cu(0.3, 0.6)
-            nsym = N // sps + 8
-            bits = torch.randint(0, 2, (n, nsym), generator=self.gen, device=self.device).float() * 2 - 1
-            freq = bits.repeat_interleave(sps, dim=1)
-            g = gaussian_taps(sps, bt).to(self.device)
-            freq = F.conv1d(freq[:, None], g.flip(0).view(1, 1, -1), padding=g.numel() // 2)[:, 0, : freq.shape[1]]
-            phase = torch.cumsum(math.pi * h / sps * freq, dim=1)
-            s = torch.polar(torch.ones_like(phase), phase)
-            bw = (1 + h) * fs_hi / sps
-        elif kind in (1, 2):  # PSK/QAM with symbol rate above the channel
-            sps = self._ci(2, max(2, R // 2))
-            beta = self._cu(0.2, 0.5)
-            s = self._linear(["bpsk", "qpsk", "8psk", "16qam", "64qam"][self._ci(0, 4)], n, N, sps, beta)
-            bw = (1 + beta) * fs_hi / sps
-        else:  # wide OFDM (WiFi / LTE-like), 50-90 % of fs_hi occupied
-            nfft = 64 * (2 ** self._ci(0, 2))
-            used = int(nfft * self._cu(0.5, 0.9)) // 2 * 2
-            cp = nfft // 4
-            pts = self.const["qpsk" if self._ci(0, 1) == 0 else "16qam"]
-            nsym = N // (nfft + cp) + 2
-            grid = torch.zeros(n, nsym, nfft, dtype=torch.complex64, device=self.device)
-            bins = torch.cat([torch.arange(1, used // 2 + 1), torch.arange(nfft - used // 2, nfft)]).to(self.device)
-            idx = torch.randint(0, pts.numel(), (n, nsym, bins.numel()), generator=self.gen, device=self.device)
-            grid[:, :, bins] = pts[idx]
-            sym = torch.fft.ifft(grid, dim=-1) * math.sqrt(nfft)
-            s = torch.cat([sym[..., -cp:], sym], dim=-1).reshape(n, -1)
-            bw = fs_hi * used / nfft
-        s = s[:, :N]
-        # put the channel centre anywhere inside the signal band (at least ~one channel spacing wide)
-        half = max(bw / 2 - 30e3, 0.0)
-        f0 = self._u(n, -half, half)[:, None]
-        t = torch.arange(N, device=self.device)[None, :]
-        s = s * torch.polar(torch.ones(n, N, device=self.device), -2 * math.pi * f0 / fs_hi * t)
-        s = fir_complex(s, self.h_wide[R])
-        ph = int(torch.randint(0, R, (1,), generator=self.cpu_gen))
-        return s[:, ph::R][:, :length]
 
     def _ofdm(self, n: int, length: int) -> torch.Tensor:
         nfft = 64 if self._ci(0, 1) == 0 else 128
@@ -286,8 +195,6 @@ class Synth:
             s = self._fm(n, L + guard)
         elif name == "ofdm":
             s = self._ofdm(n, L + guard)
-        elif name == "wide":
-            s = self._wide(n, L + guard)
         else:
             raise ValueError(name)
 
@@ -310,16 +217,11 @@ class Synth:
             s = sum(h[:, k:k + 1] * pad[:, cfg.multipath_delay - k: cfg.multipath_delay - k + L]
                     for k in range(cfg.multipath_delay + 1))
 
-        # Carrier phase and frequency offset ("wide" is already placed at a random point of its band).
-        lo, hi = cfg.cfo_hz if name != "wide" else (0.0, 0.0)
-        if name == "fm":  # a broadcast station is up to half a channel spacing off the nearest channel centre
-            lo, hi = min(lo, -60e3), max(hi, 60e3)
-        cfo = self._u(n, lo, hi)[:, None]
+        # Carrier phase and frequency offset.
+        cfo = self._u(n, *cfg.cfo_hz)[:, None]
         ph = self._u(n, 0, 2 * math.pi)[:, None]
         t = torch.arange(L, device=self.device)[None, :]
         s = s * torch.polar(torch.ones(n, L, device=self.device), 2 * math.pi * cfo / cfg.fs * t + ph)
-        if cfg.channel_filter and name != "wide":
-            s = fir_complex(s, self.h1)
         return s / s.abs().pow(2).mean(dim=1, keepdim=True).sqrt().clamp_min(1e-12)
 
     def batch(self, n: int):
@@ -333,10 +235,7 @@ class Synth:
         s = torch.cat(xs)[:n]
         y = torch.cat(ys)[:n]
         snr = self._u(n, *cfg.snr_db)
-        noise = self._cn(n, cfg.length)
-        if cfg.channel_filter:  # wideband input noise seen through the channel; SNR stays referred to the input
-            noise = fir_complex(noise, self.h1)
-        noise = noise * torch.pow(10.0, -snr / 20)[:, None]
+        noise = self._cn(n, cfg.length) * torch.pow(10.0, -snr / 20)[:, None]
         is_noise = y == self.class_index["noise"]
         x = s + noise
         x = x / x.abs().pow(2).mean(dim=1, keepdim=True).sqrt()

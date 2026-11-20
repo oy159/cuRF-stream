@@ -17,14 +17,14 @@ namespace curf::cuda {
         // W frames ran 4 blocks on a 16-SM GPU: 62 us for the 8 MB window at full load.) floor_flag sums the
         // splits in a fixed order, so the power stays deterministic.
         constexpr unsigned kPowerSplits = 16;
-        __global__ void power_kernel(const float2 *__restrict__ win, float *__restrict__ part, unsigned M, unsigned W, unsigned ignore) {
+        __global__ void power_kernel(const float2 *__restrict__ win, float *__restrict__ part, unsigned M, unsigned W) {
             const unsigned s = blockIdx.y, k = blockIdx.x * blockDim.x + threadIdx.x, z = blockIdx.z;
             if (k >= M) return;
             const unsigned per = (W + kPowerSplits - 1) / kPowerSplits, t0 = z * per, t1 = min(W, t0 + per);
             const float2 *p = win + static_cast<std::size_t>(s) * W * M + k;
             float acc = 0.f;
 #pragma unroll 8
-            for (unsigned t = max(t0, ignore); t < t1; ++t) {
+            for (unsigned t = t0; t < t1; ++t) {
                 const float2 v = p[static_cast<std::size_t>(t) * M];
                 acc = fmaf(v.x, v.x, fmaf(v.y, v.y, acc));
             }
@@ -37,7 +37,6 @@ namespace curf::cuda {
                                           std::uint8_t *__restrict__ flags, unsigned M, unsigned W, DetectConfig cfg,
                                           const float *__restrict__ shape) {
             extern __shared__ float v[];
-            float *peak = v + M;
             const unsigned s = blockIdx.x, S = gridDim.x;
             float *p = power + static_cast<std::size_t>(s) * M;
             const float *sh = shape ? shape + static_cast<std::size_t>(s) * M : nullptr;
@@ -47,14 +46,8 @@ namespace curf::cuda {
             const unsigned usable = (h >= M / 2 ? M : 2 * h + 1) - (dc ? 2 * dc - 1 : 0);
             auto in_band = [=](unsigned i) { const unsigned d = min(i, M - i); return d <= h && d >= dc; };
             for (unsigned i = threadIdx.x; i < M; i += blockDim.x) { // power = mean over the window
-                float e = 0.f, mx = 0.f;
-                const unsigned per = (W + kPowerSplits - 1) / kPowerSplits;
-                for (unsigned z = 0; z < kPowerSplits; ++z) {
-                    const float q = part[(static_cast<std::size_t>(z) * S + s) * M + i];
-                    e += q;
-                    if (z * per < W) mx = fmaxf(mx, q / static_cast<float>(min(per, W - z * per)));
-                }
-                peak[i] = mx;
+                float e = 0.f;
+                for (unsigned z = 0; z < kPowerSplits; ++z) e += part[(static_cast<std::size_t>(z) * S + s) * M + i];
                 p[i] = e / static_cast<float>(W);
                 // outside the usable band: never reported, sorted to the top so the floor ignores it
                 v[i] = in_band(i) ? (sh ? p[i] / sh[i] : p[i]) : INFINITY; // whitened by the noise shape
@@ -87,13 +80,11 @@ namespace curf::cuda {
             }
             const float rej = cfg.neighbor_reject_db > 0.f ? exp10f(cfg.neighbor_reject_db / 10.f) : 0.f;
             for (unsigned i = threadIdx.x; i < M; i += blockDim.x) {
-                const float signal_power = cfg.peak_detection ? peak[i] : p[i];
-                bool f = cfg.mode == DetectMode::all || (signal_power > (sh && cfg.mode == DetectMode::relative ? thr * sh[i] : thr) && in_band(i));
+                bool f = cfg.mode == DetectMode::all || (p[i] > (sh && cfg.mode == DetectMode::relative ? thr * sh[i] : thr) && in_band(i));
                 if (f && cfg.mode != DetectMode::all && rej > 0.f) {
                     // channels k - 1 and k + 1 are frequency neighbours, with wrap-around (0 is next to M - 1)
-                    const float *q = cfg.peak_detection ? peak : p;
-                    const float lo = q[(i + M - 1) & (M - 1)], hi = q[(i + 1) & (M - 1)];
-                    f = fmaxf(lo, hi) <= signal_power * rej;
+                    const float lo = p[(i + M - 1) & (M - 1)], hi = p[(i + 1) & (M - 1)];
+                    f = fmaxf(lo, hi) <= p[i] * rej;
                 }
                 flags[static_cast<std::size_t>(s) * M + i] = f ? 1 : 0;
             }
@@ -224,10 +215,10 @@ namespace curf::cuda {
         CURF_CUDA_CHECK(cudaMemcpy(d_shape_, full.data(), entries() * sizeof(float), cudaMemcpyHostToDevice));
     }
 
-    void WindowStage::detect(const cf32 *d_win, const DetectConfig &cfg, cudaStream_t stream, unsigned ignore_frames) {
+    void WindowStage::detect(const cf32 *d_win, const DetectConfig &cfg, cudaStream_t stream) {
         const auto *win = reinterpret_cast<const float2 *>(d_win);
-        power_kernel<<<dim3((channels_ + 255) / 256, streams_, kPowerSplits), 256, 0, stream>>>(win, d_part_, channels_, window_, ignore_frames);
-        floor_flag_kernel<<<streams_, 512, 2 * channels_ * sizeof(float), stream>>>(d_part_, d_power_, d_floor_, d_flags_, channels_,
+        power_kernel<<<dim3((channels_ + 255) / 256, streams_, kPowerSplits), 256, 0, stream>>>(win, d_part_, channels_, window_);
+        floor_flag_kernel<<<streams_, 512, channels_ * sizeof(float), stream>>>(d_part_, d_power_, d_floor_, d_flags_, channels_,
                                                                                 window_, cfg, d_shape_);
         CURF_CUDA_CHECK(cudaGetLastError());
         if (cfg.compaction == Compaction::ballot) {

@@ -8,7 +8,6 @@
 
 #include <algorithm>
 #include <cmath>
-#include <cstdlib>
 #include <cstdio>
 #include <filesystem>
 #include <memory>
@@ -18,13 +17,7 @@ using namespace curf::engine;
 
 namespace {
 
-    // CURF_TEST_MODEL_DIR / CURF_TEST_MODEL_NAME (environment) point the tests at another converted model, e.g.
-    // the stage-2 classifier: CURF_TEST_MODEL_DIR=model/artifacts/s2_run3/export CURF_TEST_MODEL_NAME=s2
-    const std::filesystem::path kDir = std::getenv("CURF_TEST_MODEL_DIR") ? std::getenv("CURF_TEST_MODEL_DIR") : CURF_MODEL_DIR;
-    const std::string kName = std::getenv("CURF_TEST_MODEL_NAME") ? std::getenv("CURF_TEST_MODEL_NAME") : "amc";
-    // Launch / tensor counts depend on which blocks have a fused kernel of their shape: they are checked for the
-    // stage-1 model the kernels were written for; any other model gets the numerical checks only.
-    const bool kStage1 = kName == "amc";
+    const std::filesystem::path kDir = CURF_MODEL_DIR;
 
     struct Data {
         Model model;
@@ -33,10 +26,10 @@ namespace {
 
     const Data *data() {
         static const std::optional<Data> d = []() -> std::optional<Data> {
-            if (!std::filesystem::exists(kDir / (kName + ".curf")) || !std::filesystem::exists(kDir / (kName + ".golden")))
+            if (!std::filesystem::exists(kDir / "amc.curf") || !std::filesystem::exists(kDir / "amc.golden"))
                 return std::nullopt;
-            Data x{Model::load(kDir / (kName + ".curf")), {}};
-            x.golden = Golden::load(kDir / (kName + ".golden"), x.model);
+            Data x{Model::load(kDir / "amc.curf"), {}};
+            x.golden = Golden::load(kDir / "amc.golden", x.model);
             return x;
         }();
         return d ? &*d : nullptr;
@@ -113,7 +106,7 @@ TEST_CASE("fused BasicBlocks and fused global pooling match the golden", "[cuda]
             cfg.reuse_memory = false;
             Engine e(d->model, cfg);
             // stem + 4 BasicBlocks + head
-            if (kStage1) CHECK(e.steps() == 6);
+            CHECK(e.steps() == 6);
             upload(e, g, 0, n);
             e.run(n, nullptr);
             CURF_CUDA_CHECK(cudaDeviceSynchronize());
@@ -127,7 +120,7 @@ TEST_CASE("fused BasicBlocks and fused global pooling match the golden", "[cuda]
                 CHECK(err < tol);
                 ++checked;
             }
-            if (kStage1) CHECK(checked == (gap ? 5 : 6)); // stem out, 4 block outputs (last one pooled when gap), logits
+            CHECK(checked == (gap ? 5 : 6)); // stem out, 4 block outputs (last one pooled when gap), logits
             const auto logits = e.read_tensor(d->model.output, n);
             int agree = 0;
             for (int i = 0; i < n; ++i) agree += argmax(&logits[i * c], c) == argmax(&g.logits[i * c], c);
@@ -249,7 +242,7 @@ TEST_CASE("fused INT8 BasicBlocks match the golden", "[cuda][engine][int8][fusio
         Engine e(d->model, cfg);
         // stem + 4 blocks + head; unfused blocks as convs (stage3 without a resident block: conv1 + conv2 with the
         // shortcut fused in)
-        if (kStage1) CHECK(e.steps() == (resident ? 7u : k2 ? 9u : 6u));
+        CHECK(e.steps() == (resident ? 7u : k2 ? 9u : 6u));
         upload(e, g, 0, n);
         e.run(n, nullptr);
         CURF_CUDA_CHECK(cudaDeviceSynchronize());
@@ -262,7 +255,7 @@ TEST_CASE("fused INT8 BasicBlocks match the golden", "[cuda][engine][int8][fusio
             CHECK(err < 0.12);
             ++checked;
         }
-        if (kStage1) CHECK(checked == (resident ? 5 : k2 ? 7 : 4)); // stem out + 3 block outputs + the unfused blocks' inner tensors
+        CHECK(checked == (resident ? 5 : k2 ? 7 : 4)); // stem out + 3 block outputs + the unfused blocks' inner tensors
         const auto logits = e.read_tensor(d->model.output, n);
         int agree = 0;
         for (int i = 0; i < n; ++i) agree += argmax(&logits[i * c], c) == argmax(&g.logits[i * c], c);
@@ -303,7 +296,7 @@ TEST_CASE("INT8 stem fused into the first block matches the separate stem", "[cu
         const auto ref = make("i8.block." + tile);      // stem kernel + block kernel
         const auto fused = make("i8.block.stem." + tile); // one kernel; the other blocks run as convs
         CHECK(fused->materialized(block1_out));
-        if (kStage1) CHECK_FALSE(fused->materialized(stem_out));
+        CHECK_FALSE(fused->materialized(stem_out));
         CHECK(ref->materialized(stem_out));
         const auto a = ref->read_tensor(block1_out, n), b = fused->read_tensor(block1_out, n);
         // The fused stem rounds its input to fp16 for the MMA: a stem value next to a rounding boundary moves by
@@ -367,7 +360,7 @@ TEST_CASE("INT8 conv2 with the shortcut fused in matches the separate shortcut",
     for (const std::string tile : {"64x64.w32.s3.z", "64x128.w32.s3.z", "128x64.w32.s3.z", "128x128.w64.s3.z", "64x64.w32.s3",
                                    "64x128.w32.s3"}) {
         const auto e = make("i8.mma.sc." + tile, true); // other convs fall back to the plain i8.mma tiles
-        if (kStage1) CHECK(e->steps() == ref->steps() - 1);
+        CHECK(e->steps() == ref->steps() - 1);
         CHECK_FALSE(e->materialized(sc_out));
         bool used = false;
         for (const auto &ch : e->choices()) used = used || ch.variant.rfind("i8.mma.sc." + tile, 0) == 0; // ".s3" also matches ".s3.z"
@@ -390,7 +383,6 @@ TEST_CASE("INT8 conv2 with the shortcut fused in matches the separate shortcut",
 TEST_CASE("INT8 engine with fp16 input equals the fp32-input engine", "[cuda][engine][int8][fusion]") {
     const auto *d = data();
     if (!d) SKIP("no converted model in " + kDir.string());
-    if (d->model.tensors[d->model.input].channels != 2) SKIP("fp16 input needs the stem fused into block 1 (2 input channels)");
     const auto &g = d->golden;
     const int c = static_cast<int>(g.classes);
     constexpr std::uint32_t S = 2, M = 128, W = 1024;

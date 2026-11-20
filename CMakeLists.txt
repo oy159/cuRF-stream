@@ -60,10 +60,7 @@ target_compile_options(curf_warnings INTERFACE
 find_package(Threads REQUIRED)
 
 add_library(curf_core
-    src/adsb/decode.cpp
     src/engine/model.cpp
-    src/reference/extraction.cpp
-    src/reference/dsss_lock.cpp
     src/reference/channelizer.cpp
     src/reference/unpack.cpp
     src/runtime/host_ring.cpp
@@ -91,10 +88,6 @@ endif()
 
 if(CURF_HAVE_CUDA)
     add_library(curf_cuda
-        src/kernels/adsb.cu
-        src/kernels/extraction.cu
-        src/kernels/extraction_bank.cu
-        src/kernels/dsss_lock.cu
         src/kernels/unpack.cu
         src/kernels/psd.cu
         src/kernels/channelizer.cu
@@ -106,8 +99,8 @@ if(CURF_HAVE_CUDA)
         src/kernels/block_int8.cu
         src/engine/engine.cpp
         src/runtime/pipeline.cpp
-        src/runtime/classifier.cu
-        src/runtime/signal_stage.cu)
+        src/runtime/burst_classifier.cu
+        src/runtime/classifier.cu)
     target_include_directories(curf_cuda PUBLIC include)
     target_link_libraries(curf_cuda PUBLIC curf_core CUDA::cudart CUDA::cufft PRIVATE curf_warnings)
     if(TARGET CUDA::nvtx3)

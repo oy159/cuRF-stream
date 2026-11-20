@@ -10,12 +10,9 @@ endif()
 include(Catch)
 
 # Converted model + golden activations (model/convert.py); tests that need them skip when absent.
-set(CURF_MODEL_DIR "${PROJECT_SOURCE_DIR}/model/artifacts/run2/export" CACHE PATH "Directory with amc.curf / amc.golden")
+set(CURF_MODEL_DIR "${PROJECT_SOURCE_DIR}/model/artifacts/run1/export" CACHE PATH "Directory with amc.curf / amc.golden")
 
 add_executable(curf_tests_cpu
-    test_adsb.cpp
-    test_extraction.cpp
-    test_dsss_lock.cpp
     test_reference.cpp
     test_sources.cpp
     test_host_ring.cpp
@@ -26,18 +23,12 @@ catch_discover_tests(curf_tests_cpu TEST_PREFIX "cpu.")
 
 if(CURF_HAVE_CUDA)
     add_executable(curf_tests_cuda
-        test_adsb_cuda.cpp
-        test_extraction_cuda.cpp
-        test_extraction_bank_cuda.cpp
-        test_dsss_lock_cuda.cpp
-        test_signal_stage_cuda.cpp
         test_unpack_cuda.cpp
         test_pipeline_cuda.cpp
         test_engine_cuda.cpp
         test_channelizer_cuda.cpp
         test_windows_cuda.cpp)
     target_link_libraries(curf_tests_cuda PRIVATE curf_cuda curf_warnings Catch2::Catch2WithMain)
-    set(CURF_S2_MODEL_DIR "${PROJECT_SOURCE_DIR}/model/artifacts/s2_run4/export" CACHE PATH "Directory with s2.curf (stage 2)")
-    target_compile_definitions(curf_tests_cuda PRIVATE CURF_MODEL_DIR="${CURF_MODEL_DIR}" CURF_S2_MODEL_DIR="${CURF_S2_MODEL_DIR}")
+    target_compile_definitions(curf_tests_cuda PRIVATE CURF_MODEL_DIR="${CURF_MODEL_DIR}")
     catch_discover_tests(curf_tests_cuda TEST_PREFIX "cuda." DISCOVERY_TIMEOUT 60)
 endif()

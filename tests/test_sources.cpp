@@ -110,20 +110,6 @@ TEST_CASE("file source replays a capture, optionally looping", "[source]") {
             REQUIRE(std::equal(data.begin() + k * fb, data.begin() + (k + 1) * fb,
                                gen.period().begin() + (k % 4096) * fb));
     }
-    SECTION("paced replay loops on the sample clock and can restart") {
-        auto fmt = gen.format(); fmt.sample_rate = 1e6;
-        FileSource src({path, fmt, true, true});
-        src.start();
-        const auto t0 = std::chrono::steady_clock::now();
-        const auto data = read_all(src, 20000, 5000);
-        CHECK(data.size() == 20000 * fb);
-        const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-        CHECK(elapsed >= .019); CHECK(elapsed < .5);
-        src.start();
-        std::vector<std::uint8_t> first(fb * 1000);
-        CHECK(src.read(first, 100).first_sample == 0);
-        CHECK(std::equal(first.begin(), first.end(), gen.period().begin()));
-    }
     std::filesystem::remove(path);
 }
 
