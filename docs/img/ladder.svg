@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="508" viewBox="0 0 1200 508" role="img" aria-label="推理引擎优化阶梯">
+<title>推理引擎优化阶梯</title>
+<style>text{font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Noto Sans CJK SC', 'Microsoft YaHei', sans-serif;} .mono{font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;}</style>
+<rect width="1200" height="508" rx="14" fill="#0d1117"/>
+<text x="32" y="46" font-size="22" fill="#e6edf3" text-anchor="start" font-weight="700">推理引擎优化阶梯</text>
+<text x="32" y="72" font-size="13" fill="#8b949e" text-anchor="start" font-weight="400">batch 512 · CUDA Graph · 冷机 · 窗口/秒（对数轴）</text>
+<line x1="330.0" y1="86" x2="330.0" y2="452" stroke="#30363d"/>
+<text x="330.0" y="472" font-size="12" fill="#8b949e" text-anchor="middle" font-weight="400" class="mono">1k</text>
+<line x1="606.7" y1="86" x2="606.7" y2="452" stroke="#30363d"/>
+<text x="606.7038432624867" y="472" font-size="12" fill="#8b949e" text-anchor="middle" font-weight="400" class="mono">10k</text>
+<line x1="883.4" y1="86" x2="883.4" y2="452" stroke="#30363d"/>
+<text x="883.4076865249733" y="472" font-size="12" fill="#8b949e" text-anchor="middle" font-weight="400" class="mono">100k</text>
+<text x="316" y="117" font-size="14" fill="#e6edf3" text-anchor="end" font-weight="400">1. naive</text>
+<rect x="330" y="100" width="29.4" height="24" rx="4" fill="#8b949e" opacity="0.85"/>
+<text x="369.3834293922789" y="117" font-size="13" fill="#e6edf3" text-anchor="start" font-weight="600" class="mono">1,277</text>
+<text x="316" y="157" font-size="14" fill="#e6edf3" text-anchor="end" font-weight="400">2. shared memory 分块</text>
+<rect x="330" y="140" width="336.9" height="24" rx="4" fill="#8b949e" opacity="0.85"/>
+<text x="676.9043337523484" y="157" font-size="13" fill="#e6edf3" text-anchor="start" font-weight="600" class="mono">16,503</text>
+<text x="316" y="197" font-size="14" fill="#e6edf3" text-anchor="end" font-weight="400">3. WMMA Tensor Core</text>
+<rect x="330" y="180" width="526.5" height="24" rx="4" fill="#58a6ff" opacity="0.85"/>
+<text x="866.500648172096" y="197" font-size="13" fill="#58a6ff" text-anchor="start" font-weight="600" class="mono">79,939</text>
+<text x="316" y="237" font-size="14" fill="#e6edf3" text-anchor="end" font-weight="400">4. + epilogue 融合</text>
+<rect x="330" y="220" width="594.6" height="24" rx="4" fill="#58a6ff" opacity="0.85"/>
+<text x="934.5675726174256" y="237" font-size="13" fill="#58a6ff" text-anchor="start" font-weight="600" class="mono">140,848</text>
+<text x="316" y="277" font-size="14" fill="#e6edf3" text-anchor="end" font-weight="400">5. cp.async + ldmatrix + mma.sync</text>
+<rect x="330" y="260" width="622.3" height="24" rx="4" fill="#58a6ff" opacity="0.85"/>
+<text x="962.3428717098913" y="277" font-size="13" fill="#58a6ff" text-anchor="start" font-weight="600" class="mono">177,472</text>
+<text x="316" y="317" font-size="14" fill="#e6edf3" text-anchor="end" font-weight="400">6–8. + GAP / stem / 整块融合</text>
+<rect x="330" y="300" width="650.3" height="24" rx="4" fill="#76b900" opacity="0.85"/>
+<text x="990.3462619835384" y="317" font-size="13" fill="#76b900" text-anchor="start" font-weight="600" class="mono">224,044</text>
+<text x="316" y="357" font-size="14" fill="#e6edf3" text-anchor="end" font-weight="400">8'. + swizzle · fragment 双缓冲</text>
+<rect x="330" y="340" width="653.6" height="24" rx="4" fill="#76b900" opacity="0.85"/>
+<text x="993.6036200393503" y="357" font-size="13" fill="#76b900" text-anchor="start" font-weight="600" class="mono">230,200</text>
+<text x="316" y="397" font-size="14" fill="#e6edf3" text-anchor="end" font-weight="400">9. INT8 + 融合块</text>
+<rect x="330" y="380" width="691.3" height="24" rx="4" fill="#f0883e" opacity="0.85"/>
+<text x="1031.292131896814" y="397" font-size="13" fill="#f0883e" text-anchor="start" font-weight="600" class="mono">300,000–315,000</text>
+<text x="316" y="437" font-size="14" fill="#e6edf3" text-anchor="end" font-weight="400">10. + stem / shortcut / head 融合</text>
+<rect x="330" y="420" width="701.5" height="24" rx="4" fill="#f0883e" opacity="0.85"/>
+<text x="1041.525626816619" y="437" font-size="13" fill="#f0883e" text-anchor="start" font-weight="600" class="mono">343,000</text>
+<rect x="330" y="483" width="12" height="12" rx="2" fill="#8b949e"/>
+<text x="348" y="494" font-size="12" fill="#8b949e" text-anchor="start" font-weight="400">CUDA core</text>
+<rect x="433.5" y="483" width="12" height="12" rx="2" fill="#58a6ff"/>
+<text x="451.5" y="494" font-size="12" fill="#8b949e" text-anchor="start" font-weight="400">Tensor Core FP16</text>
+<rect x="589.5" y="483" width="12" height="12" rx="2" fill="#76b900"/>
+<text x="607.5" y="494" font-size="12" fill="#8b949e" text-anchor="start" font-weight="400">融合 FP16</text>
+<rect x="691.0" y="483" width="12" height="12" rx="2" fill="#f0883e"/>
+<text x="709.0" y="494" font-size="12" fill="#8b949e" text-anchor="start" font-weight="400">INT8</text>
+<text x="1168" y="494" font-size="14" fill="#f0883e" text-anchor="end" font-weight="700">naive → INT8 最终版 ≈ 270×</text>
+</svg>
